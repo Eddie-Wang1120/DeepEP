@@ -25,6 +25,27 @@
 #define TORCH_EXTENSION_NAME deep_ep_cpp
 #endif
 
+#ifndef GLOBALS_H
+#define GLOBALS_H
+
+class GlobalState {
+public:
+    static GlobalState& instance() {
+        static GlobalState inst;
+        return inst;
+    }
+    
+    int64_t counter;
+
+private:
+    GlobalState() : counter(0) {}
+    GlobalState(const GlobalState&) = delete;
+    GlobalState& operator=(const GlobalState&) = delete;
+};
+
+#endif
+
+
 namespace shared_memory {
 
 union MemHandleInner {
