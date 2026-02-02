@@ -38,6 +38,26 @@ namespace internode {
 nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
 nvshmem_team_config_t cpu_rdma_team_config;
 
+#ifndef GLOBALS_H
+#define GLOBALS_H
+
+class GlobalState {
+public:
+    static GlobalState& instance() {
+        static GlobalState inst;
+        return inst;
+    }
+    
+    int64_t counter;
+
+private:
+    GlobalState() : counter(0) {}
+    GlobalState(const GlobalState&) = delete;
+    GlobalState& operator=(const GlobalState&) = delete;
+};
+
+#endif
+
 std::vector<uint8_t> get_unique_id() {
     nvshmemx_uniqueid_t unique_id;
     nvshmemx_get_uniqueid(&unique_id);
@@ -92,7 +112,12 @@ void finalize() {
         nvshmem_team_destroy(cpu_rdma_team);
         cpu_rdma_team = NVSHMEM_TEAM_INVALID;
     }
-    nvshmem_finalize();
+
+    GlobalState::instance().counter++;
+    if (GlobalState::instance().counter > 1) {
+        nvshmem_finalize();
+    }
+    // nvshmem_finalize();
 }
 #endif
 

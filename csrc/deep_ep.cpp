@@ -322,12 +322,7 @@ void Buffer::destroy() {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
         }
-        // internode::finalize();
-
-        GlobalState::instance().counter++;
-        if (GlobalState::instance().counter > 1) {
-            internode::finalize();
-        }
+        internode::finalize();
     }
 #endif
 
