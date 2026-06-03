@@ -347,4 +347,43 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
+// MegaKernel: Fused dispatch + compute + combine
+namespace megakernel {
+
+struct MegaKernelState;
+
+MegaKernelState* allocate_megakernel_state(
+    int max_recv_tokens,
+    int hidden_dim,
+    int intermediate_dim,
+    int num_local_experts,
+    int num_ranks,
+    int rank,
+    const __nv_bfloat16* W_gate,
+    const __nv_bfloat16* W_up,
+    const __nv_bfloat16* W_down,
+    int total_dispatch_tasks,
+    int total_combine_tasks,
+    int num_tokens,
+    int num_topk,
+    __nv_bfloat16* output_ptr,
+    const float* topk_weights_ptr,
+    float* output_accum_ptr);
+
+void free_megakernel_state(MegaKernelState* device_state);
+
+void launch_megakernel(
+    const __nv_bfloat16* input_tokens,
+    const int* expert_assignments,
+    int num_tokens,
+    int num_topk,
+    MegaKernelState* state,
+    void* rdma_buffer_ptr,
+    int num_dispatch_sms,
+    int num_combine_sms,
+    int total_sms,
+    cudaStream_t stream);
+
+}  // namespace megakernel
+
 }  // namespace deep_ep

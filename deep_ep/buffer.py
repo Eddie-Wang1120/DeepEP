@@ -702,3 +702,28 @@ class Buffer:
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+
+    def megakernel_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                           W_gate: torch.Tensor, W_up: torch.Tensor, W_down: torch.Tensor,
+                           num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
+                           total_sms: int = 148) -> torch.Tensor:
+        """
+        Fused MoE MegaKernel: dispatch + TensorCore GEMM + SwiGLU + combine in a single persistent kernel.
+
+        Arguments:
+            x: input tokens [num_tokens, hidden], bf16
+            topk_idx: expert assignments [num_tokens, topk], int32
+            topk_weights: routing weights [num_tokens, topk], float32
+            W_gate: gate weights [num_local_experts, intermediate, hidden], bf16
+            W_up: up weights [num_local_experts, intermediate, hidden], bf16
+            W_down: down weights [num_local_experts, hidden, intermediate], bf16
+            num_experts: total number of experts across all ranks
+            num_dispatch_sms: number of SMs for dispatch phase (unused, reserved)
+            num_combine_sms: number of SMs for combine phase (unused, reserved)
+            total_sms: total SMs to launch (should match GPU SM count)
+
+        Returns:
+            output: [num_tokens, hidden], bf16
+        """
+        return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gate, W_up, W_down,
+                                              num_experts, num_dispatch_sms, num_combine_sms, total_sms)

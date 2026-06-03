@@ -295,6 +295,19 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+
+    // MegaKernel: fused dispatch + tensorcore GEMM + SwiGLU + combine
+    torch::Tensor megakernel_forward(
+        const torch::Tensor& x,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& W_gate,
+        const torch::Tensor& W_up,
+        const torch::Tensor& W_down,
+        int num_experts,
+        int num_dispatch_sms,
+        int num_combine_sms,
+        int total_sms);
 };
 
 }  // namespace deep_ep

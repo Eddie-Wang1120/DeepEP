@@ -1841,6 +1841,95 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
+torch::Tensor Buffer::megakernel_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& W_gate,
+    const torch::Tensor& W_up,
+    const torch::Tensor& W_down,
+    int num_experts,
+    int num_dispatch_sms,
+    int num_combine_sms,
+    int total_sms) {
+
+    // Input validation
+    EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(W_gate.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(W_up.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+
+    int num_tokens = x.size(0);
+    int hidden_dim = x.size(1);
+    int num_topk = topk_idx.size(1);
+    int intermediate_dim = W_gate.size(1);  // [num_experts, intermediate, hidden]
+    int num_local_experts = num_experts / num_ranks;
+
+    // Allocate output: same shape as input [num_tokens, hidden]
+    auto output = torch::zeros_like(x);
+
+    // Allocate float32 accumulator (avoids launching a separate bf16 conversion kernel)
+    auto output_accum = torch::zeros({num_tokens, hidden_dim}, x.options().dtype(torch::kFloat32));
+
+    // Check CUDA state before megakernel operations
+    AT_CUDA_CHECK(cudaGetLastError());
+
+    // Max tokens this rank might receive (over-allocate for safety)
+    int max_recv_tokens = num_tokens * num_topk;  // worst case: all tokens route here
+
+    // Allocate MegaKernel state
+    auto* state = megakernel::allocate_megakernel_state(
+        max_recv_tokens,
+        hidden_dim,
+        intermediate_dim,
+        num_local_experts,
+        num_ranks,
+        rank,
+        reinterpret_cast<const __nv_bfloat16*>(W_gate.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(W_up.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
+        num_tokens * num_topk,  // total_dispatch_tasks
+        num_tokens * num_topk,  // total_combine_tasks
+        num_tokens,
+        num_topk,
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        reinterpret_cast<const float*>(topk_weights.data_ptr()),
+        output_accum.data_ptr<float>()
+    );
+
+    // Check after state allocation
+    AT_CUDA_CHECK(cudaGetLastError());
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Launch the fused megakernel
+    megakernel::launch_megakernel(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<const int*>(topk_idx.data_ptr()),
+        num_tokens,
+        num_topk,
+        state,
+        rdma_buffer_ptr,  // RDMA buffer for internode communication
+        num_dispatch_sms,
+        num_combine_sms,
+        total_sms,
+        stream);
+
+    // Check after kernel launch (before sync)
+    AT_CUDA_CHECK(cudaGetLastError());
+
+    // Synchronize to ensure completion
+    AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Free state
+    megakernel::free_megakernel_state(state);
+
+    // Convert float32 accumulator to bf16 using PyTorch (no custom kernel needed)
+    return output_accum.to(torch::kBFloat16);
+}
+
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1885,7 +1974,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
+        .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer)
+        .def("megakernel_forward", &deep_ep::Buffer::megakernel_forward,
+             py::arg("x"),
+             py::arg("topk_idx"),
+             py::arg("topk_weights"),
+             py::arg("W_gate"),
+             py::arg("W_up"),
+             py::arg("W_down"),
+             py::arg("num_experts"),
+             py::arg("num_dispatch_sms") = 24,
+             py::arg("num_combine_sms") = 24,
+             py::arg("total_sms") = 148);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
