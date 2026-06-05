@@ -7,6 +7,7 @@
 #include <torch/python.h>
 
 #include <chrono>
+#include <algorithm>
 #include <memory>
 
 #include "kernels/api.cuh"
@@ -1852,82 +1853,194 @@ torch::Tensor Buffer::megakernel_forward(
     int num_dispatch_sms,
     int num_combine_sms,
     int total_sms) {
+#ifndef DISABLE_NVSHMEM
+
+    printf("jinheng debug: enter this v0\n");
+
+    pybind11::gil_scoped_release release;
 
     // Input validation
     EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_gate.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_up.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
 
-    int num_tokens = x.size(0);
-    int hidden_dim = x.size(1);
-    int num_topk = topk_idx.size(1);
-    int intermediate_dim = W_gate.size(1);  // [num_experts, intermediate, hidden]
-    int num_local_experts = num_experts / num_ranks;
+    const int num_tokens = x.size(0);
+    const int hidden_dim = x.size(1);
+    const int hidden_int4 = hidden_dim * x.element_size() / sizeof(int4);
+    const int num_topk = topk_idx.size(1);
+    const int intermediate_dim = W_gate.size(1);  // [num_experts, intermediate, hidden]
+    const int num_local_experts = num_experts / num_ranks;
 
-    // Allocate output: same shape as input [num_tokens, hidden]
-    auto output = torch::zeros_like(x);
+    printf("jinheng debug: num_tokens: %d, hidden_dim: %d, num_experts: %d, num_dispatch_sms: %d, total_sms: %d\n", num_tokens, hidden_dim, num_experts, num_dispatch_sms, total_sms);
+    printf("jinheng debug: num_ranks: %d, num_local_experts: %d, hidden_int4: %d, num_topk: %d, intermediate_dim: %d\n", num_ranks, num_local_experts, hidden_int4, num_topk, intermediate_dim);
 
-    // Allocate float32 accumulator (avoids launching a separate bf16 conversion kernel)
-    auto output_accum = torch::zeros({num_tokens, hidden_dim}, x.options().dtype(torch::kFloat32));
 
-    // Check CUDA state before megakernel operations
-    AT_CUDA_CHECK(cudaGetLastError());
+    // SM allocation: dispatch -> combine -> forwarder -> compute
+    // Forwarder SMs = NUM_MAX_NVL_PEERS (one per NVL destination)
+    const int num_forwarder_sms = NUM_MAX_NVL_PEERS;
+    const int num_compute_sms = total_sms - num_dispatch_sms - num_combine_sms - num_forwarder_sms;
+    EP_HOST_ASSERT(num_compute_sms > 0);
+    EP_HOST_ASSERT(num_combine_sms % 2 == 0);
 
-    // Max tokens this rank might receive (over-allocate for safety)
-    int max_recv_tokens = num_tokens * num_topk;  // worst case: all tokens route here
+    // Config for buffer sizing (use default matching internode dispatch)
+    const int num_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
+    const int num_max_rdma_chunked_send_tokens = 8;
+    const int num_max_rdma_chunked_recv_tokens = 256;
+    const int num_max_nvl_chunked_send_tokens = 8;
+    const int num_max_nvl_chunked_recv_tokens = 256;
 
-    // Allocate MegaKernel state
-    auto* state = megakernel::allocate_megakernel_state(
-        max_recv_tokens,
-        hidden_dim,
-        intermediate_dim,
-        num_local_experts,
-        num_ranks,
-        rank,
-        reinterpret_cast<const __nv_bfloat16*>(W_gate.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(W_up.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
-        num_tokens * num_topk,  // total_dispatch_tasks
-        num_tokens * num_topk,  // total_combine_tasks
-        num_tokens,
-        num_topk,
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        reinterpret_cast<const float*>(topk_weights.data_ptr()),
-        output_accum.data_ptr<float>()
-    );
-
-    // Check after state allocation
-    AT_CUDA_CHECK(cudaGetLastError());
+    // Step 1: Compute dispatch layout
+    auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto num_tokens_per_expert_t = torch::empty({num_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, torch::dtype(torch::kBool).device(torch::kCUDA));
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Launch the fused megakernel
-    megakernel::launch_megakernel(
-        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-        reinterpret_cast<const int*>(topk_idx.data_ptr()),
-        num_tokens,
-        num_topk,
-        state,
-        rdma_buffer_ptr,  // RDMA buffer for internode communication
-        num_dispatch_sms,
-        num_combine_sms,
-        total_sms,
-        stream);
+    layout::get_dispatch_layout(
+        topk_idx.data_ptr<topk_idx_t>(),
+        num_tokens_per_rank.data_ptr<int>(),
+        num_tokens_per_rdma_rank.data_ptr<int>(),
+        num_tokens_per_expert_t.data_ptr<int>(),
+        is_token_in_rank.data_ptr<bool>(),
+        num_tokens, num_topk, num_ranks, num_experts, stream);
 
-    // Check after kernel launch (before sync)
+    printf("jinheng debug: enter this v1\n");
+
+    // Step 2: notify_dispatch — exchange metadata via NVSHMEM
+    auto rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto recv_gbl_rank_prefix_sum = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+    *moe_recv_counter = -1;
+    *moe_recv_rdma_counter = -1;
+    for (int i = 0; i < num_local_experts; ++i)
+        moe_recv_expert_counter[i] = -1;
+
+    internode::notify_dispatch(
+        num_tokens_per_rank.data_ptr<int>(),
+        moe_recv_counter_mapped,
+        num_ranks,
+        num_tokens_per_rdma_rank.data_ptr<int>(),
+        moe_recv_rdma_counter_mapped,
+        num_tokens_per_expert_t.data_ptr<int>(),
+        moe_recv_expert_counter_mapped,
+        num_experts,
+        is_token_in_rank.data_ptr<bool>(),
+        num_tokens,
+        0,  // num_worst_tokens
+        num_channels,
+        hidden_int4,
+        0,  // num_scales (BF16, no FP8)
+        num_topk + 1,  // MK-v7 uses num_topk+1 int slots (src_token_idx + topk_idx)
+        1,  // expert_alignment
+        rdma_channel_prefix_matrix.data_ptr<int>(),
+        recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        gbl_channel_prefix_matrix.data_ptr<int>(),
+        recv_gbl_rank_prefix_sum.data_ptr<int>(),
+        rdma_buffer_ptr,
+        num_max_rdma_chunked_recv_tokens,
+        buffer_ptrs_gpu,
+        num_max_nvl_chunked_recv_tokens,
+        barrier_signal_ptrs_gpu,
+        rank,
+        stream,
+        num_rdma_bytes,
+        num_nvl_bytes,
+        low_latency_mode);
+
+    // Busy-wait for metadata exchange to complete
+    auto wait_start = std::chrono::steady_clock::now();
+    while (*moe_recv_counter == -1) {
+        auto elapsed = std::chrono::steady_clock::now() - wait_start;
+        EP_HOST_ASSERT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 30);
+    }
+
+    printf("jinheng debug: enter this v2\n");
+
+    // Step 3: Allocate and launch megakernel v7
+    const int max_total_recv_tokens = *moe_recv_counter;
+    // Per-expert budget: evenly distribute received tokens across local experts, with 2x headroom
+    const int max_tokens_per_expert = max_total_recv_tokens > 0
+        ? std::max(1, (max_total_recv_tokens * 2 + num_local_experts - 1) / num_local_experts)
+        : 1;
+
     AT_CUDA_CHECK(cudaGetLastError());
 
-    // Synchronize to ensure completion
+    auto* state = megakernel::allocate_megakernel_state_v7(
+        reinterpret_cast<const int4*>(x.data_ptr()),
+        nullptr,  // x_scales (BF16 mode, no scales)
+        reinterpret_cast<const topk_idx_t*>(topk_idx.data_ptr()),
+        topk_weights.data_ptr<float>(),
+        is_token_in_rank.data_ptr<bool>(),
+        rdma_channel_prefix_matrix.data_ptr<int>(),
+        recv_rdma_rank_prefix_sum.data_ptr<int>(),
+        gbl_channel_prefix_matrix.data_ptr<int>(),
+        recv_gbl_rank_prefix_sum.data_ptr<int>(),
+        rdma_buffer_ptr,
+        buffer_ptrs_gpu,
+        num_tokens,
+        hidden_dim,
+        intermediate_dim,
+        0,  // num_scales (BF16)
+        num_topk,
+        num_experts,
+        num_local_experts,
+        num_ranks,
+        rank,
+        0,  // scale_token_stride
+        0,  // scale_hidden_stride
+        num_max_rdma_chunked_send_tokens,
+        num_max_rdma_chunked_recv_tokens,
+        num_max_nvl_chunked_send_tokens,
+        num_max_nvl_chunked_recv_tokens,
+        reinterpret_cast<const __nv_bfloat16*>(W_gate.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(W_up.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
+        num_dispatch_sms,
+        num_forwarder_sms,
+        num_compute_sms,
+        num_combine_sms,
+        max_tokens_per_expert,
+        max_total_recv_tokens > 0 ? max_total_recv_tokens : 1,
+        num_rdma_bytes,
+        num_nvl_bytes);
+
+    printf("jinheng debug: enter this v3\n");
+
+    AT_CUDA_CHECK(cudaGetLastError());
+
+    // Compute shared memory size
+    // Forwarder needs TMA buffers: each of NUM_MAX_NVL_PEERS slots needs 16KB (matching internode.cu dispatch)
+    int smem_size = NUM_MAX_NVL_PEERS * 16384;
+    megakernel::launch_megakernel_v7(state, total_sms, smem_size, stream);
+
+    printf("jinheng debug: enter this v4\n");
+
+    AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Free state
-    megakernel::free_megakernel_state(state);
+    // Get output_accum pointer and wrap as tensor
+    float* output_accum_ptr = megakernel::get_output_accum_ptr(state);
+    auto output_accum = torch::from_blob(
+        output_accum_ptr,
+        {num_tokens, hidden_dim},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
 
-    // Convert float32 accumulator to bf16 using PyTorch (no custom kernel needed)
-    return output_accum.to(torch::kBFloat16);
+    // Copy to a new tensor before freeing state
+    auto result = output_accum.clone().to(torch::kBFloat16);
+
+    megakernel::free_megakernel_state_v7(state);
+
+    return result;
+#else
+    EP_HOST_ASSERT(false && "megakernel_forward requires NVSHMEM support");
+    return torch::Tensor();
+#endif
 }
 
 }  // namespace deep_ep

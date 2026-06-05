@@ -347,41 +347,58 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
-// MegaKernel: Fused dispatch + compute + combine
+// MegaKernel v7: Fused dispatch + compute + combine (persistent kernel)
 namespace megakernel {
 
 struct MegaKernelState;
 
-MegaKernelState* allocate_megakernel_state(
-    int max_recv_tokens,
+MegaKernelState* allocate_megakernel_state_v7(
+    const int4* x,
+    const float* x_scales,
+    const topk_idx_t* topk_idx,
+    const float* topk_weights,
+    const bool* is_token_in_rank,
+    const int* rdma_channel_prefix_matrix,
+    const int* recv_rdma_rank_prefix_sum,
+    const int* gbl_channel_prefix_matrix,
+    const int* recv_gbl_rank_prefix_sum,
+    void* rdma_buffer_ptr,
+    void** buffer_ptrs,
+    int num_tokens,
     int hidden_dim,
     int intermediate_dim,
+    int num_scales,
+    int num_topk,
+    int num_experts,
     int num_local_experts,
     int num_ranks,
     int rank,
+    int scale_token_stride,
+    int scale_hidden_stride,
+    int num_max_rdma_chunked_send_tokens,
+    int num_max_rdma_chunked_recv_tokens,
+    int num_max_nvl_chunked_send_tokens,
+    int num_max_nvl_chunked_recv_tokens,
     const __nv_bfloat16* W_gate,
     const __nv_bfloat16* W_up,
     const __nv_bfloat16* W_down,
-    int total_dispatch_tasks,
-    int total_combine_tasks,
-    int num_tokens,
-    int num_topk,
-    __nv_bfloat16* output_ptr,
-    const float* topk_weights_ptr,
-    float* output_accum_ptr);
-
-void free_megakernel_state(MegaKernelState* device_state);
-
-void launch_megakernel(
-    const __nv_bfloat16* input_tokens,
-    const int* expert_assignments,
-    int num_tokens,
-    int num_topk,
-    MegaKernelState* state,
-    void* rdma_buffer_ptr,
     int num_dispatch_sms,
+    int num_forwarder_sms,
+    int num_compute_sms,
     int num_combine_sms,
+    int max_tokens_per_expert,
+    int max_total_recv_tokens,
+    int64_t num_rdma_bytes,
+    int64_t num_nvl_bytes);
+
+void free_megakernel_state_v7(MegaKernelState* device_state);
+
+float* get_output_accum_ptr(MegaKernelState* device_state);
+
+void launch_megakernel_v7(
+    MegaKernelState* device_state,
     int total_sms,
+    int smem_size,
     cudaStream_t stream);
 
 }  // namespace megakernel
