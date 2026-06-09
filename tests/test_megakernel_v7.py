@@ -184,7 +184,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
     num_nodes = num_ranks // num_local_ranks
 
     # Configuration
-    num_tokens = 10
+    num_tokens = 256
     hidden = 256
     intermediate = 256
     experts_per_rank = 8

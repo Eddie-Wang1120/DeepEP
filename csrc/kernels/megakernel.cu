@@ -1344,11 +1344,9 @@ __device__ void combine_worker_v2(
                            state->rank, gbl_expert, expert_id, slot, recv_token_idx, topk_slot, route_weight, h0);
                 }
 #endif
-                // Weighted accumulation: same recv_token_idx may have multiple local experts
+                // Write compute output directly (no weighting) — DeepEP combine will reduce across ranks
                 for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-                    float accum = __bfloat162float(state->scatter_output[recv_token_idx * hidden + h]);
-                    float value = __bfloat162float(state->compute_output[dest_offset * hidden + h]);
-                    state->scatter_output[recv_token_idx * hidden + h] = __float2bfloat16(accum + route_weight * value);
+                    state->scatter_output[recv_token_idx * hidden + h] = state->compute_output[dest_offset * hidden + h];
                 }
 
                 // Populate topk weights and src_meta for combine
