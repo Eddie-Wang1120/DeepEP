@@ -2088,15 +2088,17 @@ torch::Tensor Buffer::megakernel_forward(
     AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Get output_accum pointer and wrap as tensor
-    float* output_accum_ptr = megakernel::get_output_accum_ptr(state);
-    auto output_accum = torch::from_blob(
-        output_accum_ptr,
-        {num_tokens, hidden_dim},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    printf("jinheng debug: after v0 startup v2");
 
-    // Copy to a new tensor before freeing state
-    auto result = output_accum.clone().to(torch::kBFloat16);
+    // Get combined_x directly (bf16, no extra copy/convert)
+    void* combined_x_ptr = megakernel::get_combined_x_ptr(state);
+    auto combined_x_tensor = torch::from_blob(
+        combined_x_ptr,
+        {num_tokens, hidden_dim},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+
+    // Clone before freeing state
+    auto result = combined_x_tensor.clone();
 
     megakernel::free_megakernel_state_v7(state);
 

@@ -680,6 +680,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
 
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                printf("[DEEPEP][DISPATCH-SEND] rank=%d token=%lld num_topk_ranks=%d ch=%d rdma=%d nvl=%d expert=%d topk0_w=%f h0=%f\n",
+                       rank, token_idx, num_topk_ranks, channel_id, rdma_rank, nvl_rank,
+                       (int)ld_nc_global(topk_idx + token_idx * num_topk),
+                       ld_nc_global(topk_weights + token_idx * num_topk),
+                       __bfloat162float(reinterpret_cast<const nv_bfloat16*>(x + token_idx * hidden_int4)[0]));
+            }
+#endif
+
             // Copy `x` into symmetric send buffer
             auto st_broadcast = [=](const int key, const int4& value) {
                 #pragma unroll
@@ -964,6 +974,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
+#ifdef MK_TOKEN_TRACE
+                if (lane_id == 0 && is_in_dst_nvl_rank) {
+                    auto fwd_topk_idx_ptr = reinterpret_cast<int*>(shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta));
+                    auto fwd_topk_w_ptr = reinterpret_cast<float*>(fwd_topk_idx_ptr + num_topk);
+                    printf("[DEEPEP][DISPATCH-FWD] rank=%d src_rdma=%d dst_nvl=%d slot=%d ch=%d expert=%d topk0_w=%f h0=%f\n",
+                           rank, src_rdma_rank, dst_nvl_rank, rdma_slot_idx, channel_id,
+                           ld_nc_global(fwd_topk_idx_ptr), ld_nc_global(fwd_topk_w_ptr),
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(shifted)[0]));
+                }
+#endif
                 if (lane_id == src_rdma_rank) {
                     auto cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
                     rdma_nvl_token_idx += is_in_dst_nvl_rank;
@@ -1178,6 +1198,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     st_na_global(recv_topk_idx + recv_idx, idx_value);
                     st_na_global(recv_topk_weights + recv_idx, weight_value);
                 }
+#ifdef MK_TOKEN_TRACE
+                if (lane_id == 0) {
+                    auto topk_data_ptr = reinterpret_cast<int*>(shifted);
+                    auto weight_data_ptr = reinterpret_cast<float*>(shifted + sizeof(int) * num_topk);
+                    printf("[DEEPEP][DISPATCH-RECV] rank=%d recv_token_idx=%lld expert=%d topk_slot=0 route_weight=%f src_rdma=%d src_nvl=%d ch=%d h0=%f\n",
+                           rank, recv_token_idx, ld_nc_global(topk_data_ptr),
+                           ld_nc_global(weight_data_ptr), (int)meta.src_rdma_rank, src_nvl_rank, channel_id,
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(tma_buffer)[0]));
+                }
+#endif
 
                 // Wait TMA to be finished
                 tma_store_wait<0>();
@@ -1905,6 +1935,15 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                         *reinterpret_cast<float*>(tma_buffer + hidden_bytes + sizeof(SourceMeta) + lane_id * sizeof(float)) =
                             ld_nc_global(topk_weights + token_idx * num_topk + lane_id);
 
+#ifdef MK_TOKEN_TRACE
+                    if (lane_id == 0) {
+                        printf("[DEEPEP][COMBINE-NVL-SEND] rank=%d token=%lld dst_nvl=%d src_rdma=%d ch=%d topk0_w=%f h0=%f\n",
+                               rank, (long long)token_idx, dst_nvl_rank, current_rdma_idx, channel_id,
+                               ld_nc_global(topk_weights + token_idx * num_topk),
+                               __bfloat162float(reinterpret_cast<const nv_bfloat16*>(x + token_idx * hidden_int4)[0]));
+                    }
+#endif
+
                     // Issue TMA store
                     tma_store_fence();
                     __syncwarp();
@@ -2083,6 +2122,14 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                                      hidden_bytes + sizeof(SourceMeta)) +
                                             topk_idx);
                     };
+#ifdef MK_TOKEN_TRACE
+                    if (lane_id == 0) {
+                        printf("[DEEPEP][COMBINE-NVL-FWD] rank=%d token=%lld dst_rdma=%d head=%d ch=%d topk0_w=%f h0=%f\n",
+                               rank, (long long)token_idx, dst_rdma_rank, expected_head, channel_id,
+                               recv_tw_fn(0, expected_head >= 0 ? expected_head % num_max_nvl_chunked_recv_tokens_per_rdma : 0, 0),
+                               expected_head >= 0 ? __bfloat162float(reinterpret_cast<nv_bfloat16*>(const_cast<int4*>(get_addr_fn(0, expected_head % num_max_nvl_chunked_recv_tokens_per_rdma, 0)))[0]) : 0.f);
+                    }
+#endif
                     combine_token<NUM_MAX_NVL_PEERS, false, dtype_t, NUM_MAX_NVL_PEERS, true, kNumStages, kNumTMALoadBytes>(
                         expected_head >= 0,
                         expected_head,
@@ -2214,12 +2261,51 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     recv_tw_fn,
                     nullptr,
                     dummy_tma_phases);
+#ifdef MK_TOKEN_TRACE
+                if (lane_id == 0) {
+                    printf("[DEEPEP][COMBINE-RDMA-RECV] rank=%d token=%lld head=%d ch=%d rdma=%d nvl=%d topk0_w=%f h0=%f\n",
+                           rank, (long long)token_idx, expected_head, channel_id, rdma_rank, nvl_rank,
+                           ld_nc_global(combined_topk_weights + token_idx * num_topk),
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(combined_x + token_idx * hidden_int4)[0]));
+                }
+#endif
             }
 
             // Retired
             __syncwarp();
             if (elect_one_sync())
                 rdma_receiver_retired[warp_id] = true;
+
+#ifdef MK_TOKEN_TRACE
+            // Print all combined tokens after all RDMA receivers retire
+            // __syncthreads();
+            // __syncwarp();
+            // if (lane_id == 0 && warp_id == 0) {
+            //     for (int t = 0; t < num_combined_tokens; ++t) {
+            //         auto* xptr = reinterpret_cast<nv_bfloat16*>(combined_x + t * hidden_int4);
+            //         int hdim = hidden_int4 * 8;
+            //         for (int h = 0; h < hdim; h += 8) {
+            //             int end = min(h + 8, hdim);
+            //             printf("[DEEPEP][COMBINE-FINAL] rank=%d token=%d h[%d:%d]=%f,%f,%f,%f,%f,%f,%f,%f\n",
+            //                    rank, t, h, end,
+            //                    __bfloat162float(xptr[h+0]), h+1<end ? __bfloat162float(xptr[h+1]) : 0.f,
+            //                    h+2<end ? __bfloat162float(xptr[h+2]) : 0.f, h+3<end ? __bfloat162float(xptr[h+3]) : 0.f,
+            //                    h+4<end ? __bfloat162float(xptr[h+4]) : 0.f, h+5<end ? __bfloat162float(xptr[h+5]) : 0.f,
+            //                    h+6<end ? __bfloat162float(xptr[h+6]) : 0.f, h+7<end ? __bfloat162float(xptr[h+7]) : 0.f);
+            //         }
+            //         if (num_topk == 2)
+            //             printf("[DEEPEP][COMBINE-FINAL] rank=%d token=%d topk_w=[%f,%f]\n",
+            //                    rank, t,
+            //                    ld_nc_global(combined_topk_weights + t * num_topk),
+            //                    ld_nc_global(combined_topk_weights + t * num_topk + 1));
+            //         else
+            //             printf("[DEEPEP][COMBINE-FINAL] rank=%d token=%d topk_w=[%f]\n",
+            //                    rank, t,
+            //                    ld_nc_global(combined_topk_weights + t * num_topk));
+            //     }
+            // }
+            // __syncthreads();
+#endif
         } else {
             // Coordinator
             // Sync shared memory status

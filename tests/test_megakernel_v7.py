@@ -24,6 +24,58 @@ import deep_ep
 from utils import init_dist, calc_diff, create_grouped_scores
 
 
+def print_bitwise_mismatches(baseline_output, megakernel_output, rank, hidden_states=None, topk_idx=None, topk_weights=None, max_print=None):
+    """Print every element whose raw BF16 bit pattern differs."""
+    if baseline_output.shape != megakernel_output.shape:
+        print(f'[Rank {rank}] BITWISE shape mismatch: baseline={baseline_output.shape}, megakernel={megakernel_output.shape}', flush=True)
+        return
+
+    baseline_contig = baseline_output.detach().contiguous()
+    megakernel_contig = megakernel_output.detach().contiguous()
+    baseline_bits = baseline_contig.view(torch.int16).flatten()
+    megakernel_bits = megakernel_contig.view(torch.int16).flatten()
+    mismatch_flat = (baseline_bits != megakernel_bits).nonzero(as_tuple=True)[0]
+    mismatch_count = mismatch_flat.numel()
+
+    print(f'[Rank {rank}] BITWISE mismatch_count={mismatch_count} / {baseline_bits.numel()}', flush=True)
+    if mismatch_count == 0:
+        return
+
+    hidden = baseline_output.shape[-1]
+    limit = mismatch_count if max_print is None else min(mismatch_count, max_print)
+    baseline_values = baseline_contig.flatten()
+    megakernel_values = megakernel_contig.flatten()
+    printed_tokens = set()
+    for i in range(limit):
+        flat_idx = int(mismatch_flat[i].item())
+        token_idx = flat_idx // hidden
+        hidden_idx = flat_idx % hidden
+        baseline_bit = int(baseline_bits[flat_idx].item()) & 0xffff
+        megakernel_bit = int(megakernel_bits[flat_idx].item()) & 0xffff
+        baseline_value = float(baseline_values[flat_idx].float().item())
+        megakernel_value = float(megakernel_values[flat_idx].float().item())
+        print(
+            f'[Rank {rank}] BITWISE-MISMATCH flat={flat_idx} token={token_idx} hidden={hidden_idx} '
+            f'baseline={baseline_value} megakernel={megakernel_value} '
+            f'baseline_bf16=0x{baseline_bit:04x} megakernel_bf16=0x{megakernel_bit:04x}',
+            flush=True)
+
+        if token_idx not in printed_tokens:
+            printed_tokens.add(token_idx)
+            if topk_idx is not None:
+                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_idx={topk_idx[token_idx].detach().cpu().tolist()}', flush=True)
+            if topk_weights is not None:
+                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_weights={topk_weights[token_idx].detach().cpu().float().tolist()}', flush=True)
+            if hidden_states is not None:
+                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states={hidden_states[token_idx].detach().cpu().float().tolist()}', flush=True)
+                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states_bf16_hex={[hex(int(v) & 0xffff) for v in hidden_states[token_idx].detach().contiguous().view(torch.int16).cpu().tolist()]}', flush=True)
+            print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} baseline_output={baseline_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
+            print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} megakernel_output={megakernel_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
+
+    if limit < mismatch_count:
+        print(f'[Rank {rank}] BITWISE mismatch print truncated: printed={limit}, total={mismatch_count}', flush=True)
+
+
 def moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights, W_gate, W_up, W_down, experts_per_rank):
     """
     Compute MoE expert forward on received tokens (baseline path).
@@ -132,7 +184,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
     num_nodes = num_ranks // num_local_ranks
 
     # Configuration
-    num_tokens = 256
+    num_tokens = 10
     hidden = 256
     intermediate = 256
     experts_per_rank = 8
@@ -214,12 +266,20 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
         print(f'  baseline norm: {baseline_output.float().norm().item():.4f}')
         print(f'  megakernel norm: {megakernel_output.float().norm().item():.4f}')
 
-        if diff < 1e-2 and cos_sim > 0.99:
+        bitwise_equal = torch.equal(baseline_output, megakernel_output)
+        print(f'  bitwise_equal: {bitwise_equal}')
+
+        if bitwise_equal:
             print(f'  PASSED')
         else:
-            print(f'  FAILED - precision mismatch')
+            print(f'  FAILED - bitwise precision mismatch')
             print(f'  baseline[:5]:    {baseline_output[0, :5].float().tolist()}')
             print(f'  megakernel[:5]:  {megakernel_output[0, :5].float().tolist()}')
+            print_bitwise_mismatches(
+                baseline_output, megakernel_output, rank,
+                hidden_states=x,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights)
 
     return diff, max_abs_diff, cos_sim
 

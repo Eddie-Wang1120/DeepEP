@@ -396,6 +396,8 @@ void free_megakernel_state_v7(MegaKernelState* device_state);
 
 float* get_output_accum_ptr(MegaKernelState* device_state);
 
+void* get_combined_x_ptr(MegaKernelState* device_state);
+
 void launch_megakernel_v7(
     MegaKernelState* device_state,
     int total_sms,

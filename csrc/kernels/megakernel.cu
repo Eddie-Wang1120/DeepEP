@@ -30,6 +30,10 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <limits>
+#ifdef MK_PERF_TRACE
+#include <vector>
+#include <cstdio>
+#endif
 
 namespace deep_ep {
 namespace megakernel {
@@ -195,6 +199,11 @@ struct MegaKernelState {
 
     // --- Dispatch SM config ---
     int num_dispatch_channels;        // = num_dispatch_sms / 2 (even/odd SM pairing)
+
+#ifdef MK_PERF_TRACE
+    // Per-SM timing: [total_sms * 2] — enter_ts at [sm_id*2], exit_ts at [sm_id*2+1]
+    int64_t* perf_ts;
+#endif
 };
 
 // ============================================================================
@@ -515,6 +524,18 @@ __device__ void dispatch_worker_v2(
                 }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
 
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                int gbl_expert = (int)ld_nc_global(topk_idx + token_idx * num_topk);
+                int lcl_expert = gbl_expert - state->rank * (num_experts / num_ranks);
+                printf("[MK-TOKEN][DISPATCH-SEND] rank=%d token=%lld num_topk_ranks=%d ch=%d rdma=%d nvl=%d expert=%d local_expert=%d topk0_w=%f h0=%f\n",
+                       state->rank, token_idx, num_topk_ranks, channel_id, rdma_rank, nvl_rank,
+                       gbl_expert, lcl_expert,
+                       ld_nc_global(topk_weights + token_idx * num_topk + 0),
+                       __bfloat162float(reinterpret_cast<const nv_bfloat16*>(x + token_idx * hidden_int4)[0]));
+            }
+#endif
+
             // Copy x
             auto st_broadcast = [=](const int key, const int4& value) {
                 #pragma unroll
@@ -751,6 +772,18 @@ __device__ void dispatch_worker_v2(
                 auto src_meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
                 lane_id == src_rdma_rank ? (num_tokens_to_recv_from_rdma -= 1) : 0;
                 bool is_in_dst_nvl_rank = src_meta.is_token_in_nvl_rank(dst_nvl_rank);
+#ifdef MK_TOKEN_TRACE
+                if (lane_id == 0 && is_in_dst_nvl_rank) {
+                    auto fwd_topk_idx_ptr = reinterpret_cast<int*>(shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta));
+                    auto fwd_topk_w_ptr = reinterpret_cast<float*>(fwd_topk_idx_ptr + num_topk);
+                    int gbl_expert = ld_nc_global(fwd_topk_idx_ptr);
+                    int lcl_expert = gbl_expert - state->rank * (num_experts / num_ranks);
+                    printf("[MK-TOKEN][DISPATCH-FWD] rank=%d src_rdma=%d dst_nvl=%d slot=%d ch=%d expert=%d local_expert=%d topk0_w=%f h0=%f\n",
+                           state->rank, src_rdma_rank, dst_nvl_rank, rdma_slot_idx, channel_id,
+                           gbl_expert, lcl_expert, ld_nc_global(fwd_topk_w_ptr),
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(shifted)[0]));
+                }
+#endif
                 if (lane_id == src_rdma_rank) {
                     auto cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
                     rdma_nvl_token_idx += is_in_dst_nvl_rank;
@@ -927,8 +960,24 @@ __device__ void dispatch_worker_v2(
 
                     int dest_offset = local_expert_id * state->max_tokens_per_expert + slot;
                     auto* dst_data = state->recv_tokens + dest_offset * state->hidden_dim;
+                    float route_w = ld_nc_global(weight_data_ptr + topk_slot);
                     for (int h = lane_id; h < state->hidden_dim; h += 32)
                         dst_data[h] = src_data[h];
+                    if (lane_id == 0) {
+                        state->recv_token_source_info[dest_offset * 2] = static_cast<int>(recv_token_idx);
+                        state->recv_token_source_info[dest_offset * 2 + 1] = topk_slot;
+                        state->recv_token_route_weights[dest_offset] = route_w;
+                        state->recv_src_meta[dest_offset] = meta;
+                        atomicAdd(&state->expert_recv_count[local_expert_id], 1);
+                    }
+#ifdef MK_TOKEN_TRACE
+                    if (lane_id == 0) {
+                        printf("[MK-TOKEN][DISPATCH-RECV] rank=%d recv_token_idx=%lld expert=%d local_expert=%d slot=%d topk_slot=%d route_weight=%f src_rdma=%d src_nvl=%d ch=%d h0=%f\n",
+                               state->rank, recv_token_idx, expert_id, local_expert_id, slot, topk_slot, route_w,
+                               (int)meta.src_rdma_rank, src_nvl_rank, channel_id,
+                               __bfloat162float(src_data[0]));
+                    }
+#endif
                     __syncwarp();
                 }
 
@@ -1065,6 +1114,25 @@ __device__ void compute_worker(
             __nv_bfloat16* up_out = gate_out + batch_size * intermediate;
             __nv_bfloat16* output = state->compute_output + base_offset * hidden;
 
+#ifdef MK_TOKEN_TRACE
+            if (thread_id == 0) {
+                int local_expert_begin = state->rank * (state->num_experts / state->num_ranks);
+                int gbl_expert = local_expert_begin + expert_id;
+                for (int i = 0; i < batch_size; ++i) {
+                    int src_tok = state->recv_token_source_info[(base_offset + i) * 2];
+                    int src_topk = state->recv_token_source_info[(base_offset + i) * 2 + 1];
+                    float rw = state->recv_token_route_weights[base_offset + i];
+                    float hidden_h0 = __bfloat162float(input[i * hidden]);
+                    float w_gate_h0 = __bfloat162float(state->W_gate[expert_id * intermediate * hidden]);
+                    float w_up_h0 = __bfloat162float(state->W_up[expert_id * intermediate * hidden]);
+                    float w_down_h0 = __bfloat162float(state->W_down[expert_id * hidden * intermediate]);
+                    printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d local_expert=%d slot=%d src_token=%d topk_slot=%d route_weight=%f hidden_h0=%f w_gate_h0=%f w_up_h0=%f w_down_h0=%f batch=%d\n",
+                           state->rank, sm_id, gbl_expert, expert_id, computed_so_far + i, src_tok, src_topk, rw,
+                           hidden_h0, w_gate_h0, w_up_h0, w_down_h0, batch_size);
+                }
+            }
+#endif
+
             const __nv_bfloat16* w_gate = state->W_gate + expert_id * intermediate * hidden;
             const __nv_bfloat16* w_up = state->W_up + expert_id * intermediate * hidden;
             const __nv_bfloat16* w_down = state->W_down + expert_id * hidden * intermediate;
@@ -1083,9 +1151,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            device_gemm_bf16(input, w_gate, gate_out,
-                             batch_size, hidden, intermediate,
-                             warp_id, num_warps, smem_wmma_buf);
+            // device_gemm_bf16(input, w_gate, gate_out,
+            //                  batch_size, hidden, intermediate,
+            //                  warp_id, num_warps, smem_wmma_buf);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1109,9 +1177,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            device_gemm_bf16(input, w_up, up_out,
-                             batch_size, hidden, intermediate,
-                             warp_id, num_warps, smem_wmma_buf);
+            // device_gemm_bf16(input, w_up, up_out,
+            //                  batch_size, hidden, intermediate,
+            //                  warp_id, num_warps, smem_wmma_buf);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1134,9 +1202,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            device_swiglu(gate_out, up_out, gate_out,
-                          batch_size * intermediate,
-                          thread_id, num_threads);
+            // device_swiglu(gate_out, up_out, gate_out,
+            //               batch_size * intermediate,
+            //               thread_id, num_threads);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1160,9 +1228,11 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            device_gemm_bf16(gate_out, w_down, output,
-                             batch_size, intermediate, hidden,
-                             warp_id, num_warps, smem_wmma_buf);
+            // device_gemm_bf16(gate_out, w_down, output,
+            //                  batch_size, intermediate, hidden,
+            //                  warp_id, num_warps, smem_wmma_buf);
+            for (int idx = thread_id; idx < batch_size * hidden; idx += num_threads)
+                output[idx] = input[idx];
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1265,19 +1335,28 @@ __device__ void combine_worker_v2(
                     continue;
 
                 float route_weight = state->recv_token_route_weights[dest_offset];
+#ifdef MK_TOKEN_TRACE
+                if (threadIdx.x == 0) {
+                    int local_expert_begin = state->rank * (state->num_experts / state->num_ranks);
+                    int gbl_expert = local_expert_begin + expert_id;
+                    float h0 = __bfloat162float(state->compute_output[dest_offset * hidden]);
+                    printf("[MK-TOKEN][COMBINE-SCATTER] rank=%d expert=%d local_expert=%d slot=%d recv_token_idx=%d topk_slot=%d route_weight=%f h0=%f\n",
+                           state->rank, gbl_expert, expert_id, slot, recv_token_idx, topk_slot, route_weight, h0);
+                }
+#endif
+                // Weighted accumulation: same recv_token_idx may have multiple local experts
                 for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
                     float accum = __bfloat162float(state->scatter_output[recv_token_idx * hidden + h]);
                     float value = __bfloat162float(state->compute_output[dest_offset * hidden + h]);
                     state->scatter_output[recv_token_idx * hidden + h] = __float2bfloat16(accum + route_weight * value);
                 }
 
-                // if (threadIdx.x == 0) {
-                //     state->scatter_topk_weights[recv_token_idx * num_topk + topk_slot] = route_weight;
-                //     state->scatter_src_meta[recv_token_idx] = state->recv_src_meta[dest_offset];
-                //     printf("[MK-TRACE][COMBINE][SCATTER] rank=%d block=%d combine_sm=%d expert_id=%d dest_offset=%d recv_token=%d topk_slot=%d route_weight=%f src_rdma_rank=%d\n",
-                //            state->rank, blockIdx.x, combine_sm_idx, expert_id, dest_offset, recv_token_idx, topk_slot,
-                //            route_weight, state->recv_src_meta[dest_offset].src_rdma_rank);
-                // }
+                // Populate topk weights and src_meta for combine
+                if (threadIdx.x == 0) {
+                    state->scatter_topk_weights[recv_token_idx * num_topk + topk_slot] = route_weight;
+                    state->scatter_src_meta[recv_token_idx] = state->recv_src_meta[dest_offset];
+                }
+
                 __syncthreads();
             }
         }
@@ -1633,6 +1712,16 @@ __device__ void combine_worker_v2(
                         *reinterpret_cast<float*>(tma_buffer + hidden_bytes + sizeof(SourceMeta) + lane_id * sizeof(float)) =
                             ld_nc_global(topk_weights + token_idx * num_topk + lane_id);
 
+#ifdef MK_TOKEN_TRACE
+                    if (lane_id == 0) {
+                        auto* hptr = reinterpret_cast<nv_bfloat16*>(const_cast<int4*>(x + token_idx * hidden_int4));
+                        printf("[MK-TOKEN][COMBINE-NVL-SEND] rank=%d token=%lld dst_nvl=%d src_rdma=%d ch=%d topk0_w=%f h0=%f\n",
+                               state->rank, (long long)token_idx, dst_nvl_rank, current_rdma_idx, channel_id,
+                               ld_nc_global(topk_weights + token_idx * num_topk),
+                               __bfloat162float(hptr[0]));
+                    }
+#endif
+
                     tma_store_fence();
                     __syncwarp();
                     if (elect_one_sync())
@@ -1852,6 +1941,15 @@ __device__ void combine_worker_v2(
                                                                      hidden_bytes + sizeof(SourceMeta)) +
                                             topk_idx);
                     };
+#ifdef MK_TOKEN_TRACE
+                    if (lane_id == 0) {
+                        auto* hptr = reinterpret_cast<nv_bfloat16*>(const_cast<int4*>(get_addr_fn(0, expected_head >= 0 ? expected_head % num_max_nvl_chunked_recv_tokens_per_rdma : 0, 0)));
+                        printf("[MK-TOKEN][COMBINE-NVL-FWD] rank=%d token=%d dst_rdma=%d head=%d ch=%d topk0_w=%f h0=%f\n",
+                               state->rank, token_idx, dst_rdma_rank, expected_head, channel_id,
+                               recv_tw_fn(0, expected_head >= 0 ? expected_head % num_max_nvl_chunked_recv_tokens_per_rdma : 0, 0),
+                               expected_head >= 0 ? __bfloat162float(hptr[0]) : 0.f);
+                    }
+#endif
                     combine_token<NUM_MAX_NVL_PEERS, false, dtype_t, NUM_MAX_NVL_PEERS, true, kNumStages, kNumTMALoadBytes>(
                         expected_head >= 0,
                         expected_head,
@@ -1992,14 +2090,6 @@ __device__ void combine_worker_v2(
                                         topk_idx);
                 };
                 uint32_t dummy_tma_phases[2];
-                // if (lane_id == 0) {
-                //     printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d token=%lld expected_head=%d hidden_int4=%d hidden_bytes=%d num_topk=%d rdma_recv_buffer0=%p rdma_recv_buffer1=%p output_combined_x=%p output_topk_weights=%p\n",
-                //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
-                //            expected_head, (int)hidden_int4, (int)hidden_bytes, num_topk,
-                //            rdma_channel_data.recv_buffer(0), rdma_channel_data.recv_buffer(1),
-                //            combined_x + token_idx * hidden_int4,
-                //            combined_topk_weights + token_idx * num_topk);
-                // }
                 combine_token<kNumRDMARanks_C, true, dtype_t, kNumTopkRDMARanks_C, false, 2>(
                     expected_head >= 0,
                     expected_head,
@@ -2020,6 +2110,55 @@ __device__ void combine_worker_v2(
                 //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
                 //            combined_x + token_idx * hidden_int4, combined_topk_weights + token_idx * num_topk);
                 // }
+#ifdef MK_TOKEN_TRACE
+                // __syncthreads();
+                // __syncwarp();
+                // if (lane_id == 0 && warp_id == 0) {
+                //     int num_combined = state->combine_num_combined_tokens;
+                //     int ntopk = state->num_topk;
+                //     int hdim = state->hidden_dim;
+                //     printf("[MK-TOKEN][COMBINE-FINAL] rank=%d num_combined_tokens=%d\n", state->rank, num_combined);
+                //     for (int t = 0; t < num_combined; ++t) {
+                //         auto* xptr = reinterpret_cast<nv_bfloat16*>(combined_x + t * hidden_int4);
+                //         // Print hidden in chunks of 8 per line to keep each printf atomic
+                //         for (int h = 0; h < hdim; h += 8) {
+                //             int end = min(h + 8, hdim);
+                //             if (h == 0)
+                //                 printf("[MK-TOKEN][COMBINE-FINAL] rank=%d token=%d h[%d:%d]=%f,%f,%f,%f,%f,%f,%f,%f\n",
+                //                        state->rank, t, h, end,
+                //                        __bfloat162float(xptr[h+0]), h+1<end ? __bfloat162float(xptr[h+1]) : 0.f,
+                //                        h+2<end ? __bfloat162float(xptr[h+2]) : 0.f, h+3<end ? __bfloat162float(xptr[h+3]) : 0.f,
+                //                        h+4<end ? __bfloat162float(xptr[h+4]) : 0.f, h+5<end ? __bfloat162float(xptr[h+5]) : 0.f,
+                //                        h+6<end ? __bfloat162float(xptr[h+6]) : 0.f, h+7<end ? __bfloat162float(xptr[h+7]) : 0.f);
+                //             else
+                //                 printf("[MK-TOKEN][COMBINE-FINAL] rank=%d token=%d h[%d:%d]=%f,%f,%f,%f,%f,%f,%f,%f\n",
+                //                        state->rank, t, h, end,
+                //                        __bfloat162float(xptr[h+0]), h+1<end ? __bfloat162float(xptr[h+1]) : 0.f,
+                //                        h+2<end ? __bfloat162float(xptr[h+2]) : 0.f, h+3<end ? __bfloat162float(xptr[h+3]) : 0.f,
+                //                        h+4<end ? __bfloat162float(xptr[h+4]) : 0.f, h+5<end ? __bfloat162float(xptr[h+5]) : 0.f,
+                //                        h+6<end ? __bfloat162float(xptr[h+6]) : 0.f, h+7<end ? __bfloat162float(xptr[h+7]) : 0.f);
+                //         }
+                //         // topk_weights in one line
+                //         if (ntopk == 2)
+                //             printf("[MK-TOKEN][COMBINE-FINAL] rank=%d token=%d topk_w=[%f,%f]\n",
+                //                    state->rank, t,
+                //                    ld_nc_global(combined_topk_weights + t * ntopk),
+                //                    ld_nc_global(combined_topk_weights + t * ntopk + 1));
+                //         else
+                //             printf("[MK-TOKEN][COMBINE-FINAL] rank=%d token=%d topk_w=[%f]\n",
+                //                    state->rank, t,
+                //                    ld_nc_global(combined_topk_weights + t * ntopk));
+                //     }
+                // }
+                // __syncthreads();
+
+                if (lane_id == 0) {
+                    printf("[MK-TOKEN][COMBINE-RDMA-RECV] rank=%d token=%lld head=%d ch=%d rdma=%d nvl=%d topk0_w=%f h0=%f\n",
+                           state->rank, (long long)token_idx, expected_head, channel_id, rdma_rank, nvl_rank,
+                           ld_nc_global(combined_topk_weights + token_idx * num_topk),
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(combined_x + token_idx * hidden_int4)[0]));
+                }
+#endif
             }
 
             __syncwarp();
@@ -2130,32 +2269,33 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
 
     switch (role) {
         case SmRole::kDispatch:
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][DISPATCH-START] rank=%d block=%d role_idx=%d\n", state->rank, sm_id, role_idx);
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2] = clock64();
+#endif
             dispatch_worker_v2(sm_id, role_idx, state);
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][DISPATCH-END] rank=%d block=%d role_idx=%d dispatch_done=%d dispatch_done_count=%d\n",
-            //            state->rank, sm_id, role_idx, ld_volatile_global(state->dispatch_done), ld_volatile_global(state->dispatch_done_count));
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2 + 1] = clock64();
+#endif
             break;
 
         case SmRole::kCombine:
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][COMBINE-START] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
-            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2] = clock64();
+#endif
             combine_worker_v2(role_idx, state);
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][COMBINE-END] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
-            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2 + 1] = clock64();
+#endif
             break;
 
         case SmRole::kCompute:
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][COMPUTE-START] rank=%d block=%d role_idx=%d num_compute_sms=%d\n",
-            //            state->rank, sm_id, role_idx, num_compute_sms);
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2] = clock64();
+#endif
             compute_worker(sm_id, role_idx, num_compute_sms, state, smem_wmma_buf);
-            // if (threadIdx.x == 0)
-            //     printf("[MK-TRACE][KERNEL][COMPUTE-END] rank=%d block=%d role_idx=%d compute_done_count=%d\n",
-            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count));
+#ifdef MK_PERF_TRACE
+            if (threadIdx.x == 0) state->perf_ts[sm_id * 2 + 1] = clock64();
+#endif
             break;
 
         default:
@@ -2166,6 +2306,10 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
 // ============================================================================
 // Host-Side Launch
 // ============================================================================
+
+#ifdef MK_PERF_TRACE
+static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms);
+#endif
 
 void launch_megakernel_v7(
     MegaKernelState* device_state,
@@ -2217,11 +2361,51 @@ void launch_megakernel_v7(
     printf("jinheng debug: after v1 startup");
 
 #endif
+
+#ifdef MK_PERF_TRACE
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    dump_perf_trace_perfetto(device_state, total_sms);
+#endif
 }
 
-// ============================================================================
-// Host-Side State Allocation and Full Launch (v7)
-// ============================================================================
+#ifdef MK_PERF_TRACE
+static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms) {
+    MegaKernelState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+
+    int num_dispatch_sms = host_state.num_dispatch_sms;
+    int num_combine_sms = host_state.num_combine_sms;
+
+    std::vector<int64_t> ts(total_sms * 2);
+    CUDA_CHECK(cudaMemcpy(ts.data(), host_state.perf_ts, total_sms * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d.json", host_state.rank);
+    FILE* f = fopen(filename, "w");
+    if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
+
+    fprintf(f, "[\n");
+    bool first = true;
+    for (int i = 0; i < total_sms; ++i) {
+        int64_t enter_ts = ts[i * 2], exit_ts = ts[i * 2 + 1];
+        if (enter_ts == 0 && exit_ts == 0) continue;
+        const char* name;
+        if (i < num_dispatch_sms) name = "dispatch_sm";
+        else if (i < num_dispatch_sms + num_combine_sms) name = "combine_sm";
+        else name = "compute_sm";
+        int64_t dur = exit_ts > enter_ts ? exit_ts - enter_ts : 0;
+        if (!first) fprintf(f, ",\n");
+        fprintf(f, "{\"name\":\"%s\",\"cat\":\"kernel\",\"ph\":\"X\",\"ts\":%lld,\"dur\":%lld,"
+                   "\"pid\":%d,\"tid\":%d,\"args\":{\"sm_id\":%d}}",
+                name, (long long)(enter_ts / 1000), (long long)(dur / 1000),
+                host_state.rank, i, i);
+        first = false;
+    }
+    fprintf(f, "\n]\n");
+    fclose(f);
+    printf("[MK-PERF] Perfetto trace written to %s (%d SMs)\n", filename, total_sms);
+}
+#endif
 
 MegaKernelState* allocate_megakernel_state_v7(
     // --- Dispatch input data (from PyTorch tensors) ---
@@ -2475,6 +2659,14 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Combine infrastructure
     void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
 
+#ifdef MK_PERF_TRACE
+    int64_t* perf_ts;
+    int perf_total_sms = num_dispatch_sms + num_combine_sms + num_compute_sms;
+    CUDA_CHECK(cudaMalloc(&perf_ts, perf_total_sms * 2 * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(perf_ts, 0, perf_total_sms * 2 * sizeof(int64_t)));
+    host_state.perf_ts = perf_ts;
+#endif
+
     host_state.combine_rdma_buffer_ptr = combine_rdma_ptr;
     host_state.combine_buffer_ptrs = combine_buffer_ptrs;
     host_state.combine_x = reinterpret_cast<const int4*>(scatter_output);  // combine sends compute results in recv_token_idx namespace
@@ -2547,6 +2739,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.send_nvl_head));
     CUDA_CHECK(cudaFree(host_state.recv_rdma_channel_prefix_matrix));
     CUDA_CHECK(cudaFree(host_state.recv_gbl_channel_prefix_matrix));
+#ifdef MK_PERF_TRACE
+    CUDA_CHECK(cudaFree(host_state.perf_ts));
+#endif
     CUDA_CHECK(cudaFree(device_state));
 }
 
@@ -2554,6 +2749,12 @@ float* get_output_accum_ptr(MegaKernelState* device_state) {
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     return host_state.output_accum;
+}
+
+void* get_combined_x_ptr(MegaKernelState* device_state) {
+    MegaKernelState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    return host_state.combined_x;
 }
 
 }  // namespace megakernel

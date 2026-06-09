@@ -92,6 +92,16 @@ if __name__ == '__main__':
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
+    # MegaKernel performance tracing (Perfetto JSON output per SM)
+    if int(os.getenv('MK_PERF_TRACE', 0)):
+        cxx_flags.append('-DMK_PERF_TRACE')
+        nvcc_flags.append('-DMK_PERF_TRACE')
+
+    # MegaKernel token path tracing (printf-based full token lifecycle)
+    if int(os.getenv('MK_TOKEN_TRACE', 0)):
+        cxx_flags.append('-DMK_TOKEN_TRACE')
+        nvcc_flags.append('-DMK_TOKEN_TRACE')
+
     # cxx_flags.append("TORCH_USE_CUDA_DSA")
 
     # Put them together
