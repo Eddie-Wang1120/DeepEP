@@ -50,6 +50,11 @@ if __name__ == '__main__':
     else:
         sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
+        # CCCL (libcudacxx) headers needed by nvshmem_tensor.h for cuda/std/tuple
+        cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+        cccl_include = os.path.join(cuda_home, 'include', 'cccl')
+        if os.path.isdir(cccl_include):
+            include_dirs.append(cccl_include)
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
@@ -86,6 +91,8 @@ if __name__ == '__main__':
         topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+
+    # cxx_flags.append("TORCH_USE_CUDA_DSA")
 
     # Put them together
     extra_compile_args = {

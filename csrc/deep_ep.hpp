@@ -59,10 +59,14 @@ private:
     int low_latency_buffer_idx = 0;
     bool low_latency_mode = false;
 
-    // NVLink Buffer
+    // NVLink Buffer (dispatch)
     int64_t num_nvl_bytes;
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
+
+    // NVLink Buffer (combine)
+    void* combine_buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    void** combine_buffer_ptrs_gpu = nullptr;
 
     // NVSHMEM Buffer
     int64_t num_rdma_bytes;
@@ -91,9 +95,13 @@ private:
     // After `destroy()` be called, this flag will be true
     bool destroyed = false;
 
-    // Barrier signals
+    // Barrier signals (dispatch)
     int* barrier_signal_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     int** barrier_signal_ptrs_gpu = nullptr;
+
+    // Barrier signals (combine)
+    int* combine_barrier_signal_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    int** combine_barrier_signal_ptrs_gpu = nullptr;
 
     // Workspace
     void* workspace = nullptr;

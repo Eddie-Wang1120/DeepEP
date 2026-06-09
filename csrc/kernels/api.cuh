@@ -364,6 +364,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     const int* recv_gbl_rank_prefix_sum,
     void* rdma_buffer_ptr,
     void** buffer_ptrs,
+    void** combine_buffer_ptrs,
     int num_tokens,
     int hidden_dim,
     int intermediate_dim,

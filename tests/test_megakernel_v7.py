@@ -60,6 +60,8 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
+    buffer.set_num_sms(24)
+
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
             x=x,
@@ -75,11 +77,11 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     if local_rank == 0:
         print(f'[Rank {rank}] Baseline dispatch done: recv_x shape={recv_x.shape}', flush=True)
 
-    expert_out = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
-                                      W_gate, W_up, W_down, experts_per_rank)
+    # expert_out = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
+    #                                   W_gate, W_up, W_down, experts_per_rank)
 
     combined_x, combined_topk_weights, event = buffer.combine(
-        x=expert_out,
+        x=recv_x,
         handle=handle,
         topk_weights=recv_topk_weights,
         config=config
@@ -163,7 +165,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
     W_down = torch.randn(experts_per_rank, hidden, intermediate, dtype=torch.bfloat16, device='cuda') * 0.02
 
     # Config for dispatch/combine (baseline path)
-    config_num_sms = 56
+    config_num_sms = 24
     config = deep_ep.Config(config_num_sms, 8, 512, 16, 128)
 
     # --- Path A: Baseline (DeepEP dispatch + PyTorch compute + DeepEP combine) ---

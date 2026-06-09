@@ -502,8 +502,25 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
 }
 
 template <int kNumRanks, bool kSyncOnly = false>
-__forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
+__forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank, const char* phase = "unknown") {
     auto thread_id = static_cast<int>(threadIdx.x);
+    auto block_id = static_cast<int>(blockIdx.x);
+    auto enter_clock = clock64();
+
+    if (thread_id == 0) {
+        printf("[BARRIER][ENTER] phase=%s grid_block=%d local_rank=%d kNumRanks=%d sync_only=%d blockDim=%d tag=%d signals=%p self_row=%p\n",
+               phase, block_id, rank, kNumRanks, static_cast<int>(kSyncOnly), static_cast<int>(blockDim.x), FINISHED_SUM_TAG,
+               barrier_signal_ptrs, barrier_signal_ptrs ? barrier_signal_ptrs[rank] : nullptr);
+        if (barrier_signal_ptrs) {
+            #pragma unroll
+            for (int i = 0; i < kNumRanks; ++i) {
+                int value = ld_volatile_global(barrier_signal_ptrs[rank] + i);
+                printf("[BARRIER][ENTER-ROW] phase=%s grid_block=%d local_rank=%d col=%d value=%d addr=%p peer_row=%p peer_col_addr=%p\n",
+                       phase, block_id, rank, i, value, barrier_signal_ptrs[rank] + i,
+                       barrier_signal_ptrs[i], barrier_signal_ptrs[i] + rank);
+            }
+        }
+    }
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
@@ -513,22 +530,52 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 
     // Add self-ranks, sub other ranks
     if (thread_id < kNumRanks) {
+        int before_self = ld_volatile_global(barrier_signal_ptrs[rank] + thread_id);
+        int before_peer = ld_volatile_global(barrier_signal_ptrs[thread_id] + rank);
         atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
         atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+        int after_self = ld_volatile_global(barrier_signal_ptrs[rank] + thread_id);
+        int after_peer = ld_volatile_global(barrier_signal_ptrs[thread_id] + rank);
+        printf("[BARRIER][ATOMICS] phase=%s grid_block=%d local_rank=%d lane=%d self_addr=%p peer_addr=%p self_before=%d self_after=%d peer_before=%d peer_after=%d\n",
+               phase, block_id, rank, thread_id, barrier_signal_ptrs[rank] + thread_id, barrier_signal_ptrs[thread_id] + rank,
+               before_self, after_self, before_peer, after_peer);
     }
     EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
 
     // Check timeout
     auto start_time = clock64();
+    int last_value = 0x7fffffff;
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        if (thread_id < kNumRanks && value != last_value) {
+            printf("[BARRIER][POLL] phase=%s grid_block=%d local_rank=%d lane=%d value=%d elapsed=%llu addr=%p\n",
+                   phase, block_id, rank, thread_id, value, static_cast<unsigned long long>(clock64() - start_time),
+                   barrier_signal_ptrs[rank] + thread_id);
+            last_value = value;
+        }
         if (__all_sync(0xffffffff, value <= 0))
             break;
 
         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
-            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
+            printf("DeepEP timeout check failed: phase = %s, block = %d, rank = %d, thread = %d, value = %d, elapsed = %llu)\n",
+                   phase, block_id, rank, thread_id, value, static_cast<unsigned long long>(clock64() - start_time));
+            if (thread_id == 0) {
+                #pragma unroll
+                for (int row = 0; row < kNumRanks; ++row) {
+                    #pragma unroll
+                    for (int col = 0; col < kNumRanks; ++col) {
+                        int matrix_value = ld_volatile_global(barrier_signal_ptrs[row] + col);
+                        printf("[BARRIER][TIMEOUT-MATRIX] phase=%s block=%d waiter_rank=%d row=%d col=%d value=%d addr=%p\n",
+                               phase, block_id, rank, row, col, matrix_value, barrier_signal_ptrs[row] + col);
+                    }
+                }
+            }
             trap();
         }
+    }
+    if (thread_id == 0) {
+        printf("[BARRIER][EXIT] phase=%s grid_block=%d local_rank=%d elapsed_total=%llu\n",
+               phase, block_id, rank, static_cast<unsigned long long>(clock64() - enter_clock));
     }
     __syncthreads();
 }

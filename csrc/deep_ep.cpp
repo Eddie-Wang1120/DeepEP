@@ -179,19 +179,30 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(ceil_div<int64_t>(num_rdma_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
 
     if (num_nvl_bytes > 0) {
-        // Local IPC: alloc local memory and set local IPC handles
-        shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
-                                       num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
+        // Memory layout per rank:
+        // [nvl_data | barrier_signals | buffer_ptrs | barrier_signal_ptrs |
+        //  combine_nvl_data | combine_barrier_signals | combine_buffer_ptrs | combine_barrier_signal_ptrs]
+        int64_t per_half = num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes;
+        shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank], 2 * per_half);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
-        buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
-        // Set barrier signals
-        barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
-        barrier_signal_ptrs_gpu =
-            reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
+        auto base = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]);
+
+        // Dispatch region
+        barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(base + num_nvl_bytes);
+        buffer_ptrs_gpu = reinterpret_cast<void**>(base + num_nvl_bytes + barrier_signal_bytes);
+        barrier_signal_ptrs_gpu = reinterpret_cast<int**>(base + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
+
+        // Combine region
+        auto combine_base = base + per_half;
+        combine_buffer_ptrs[nvl_rank] = combine_base;
+        combine_barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(combine_base + num_nvl_bytes);
+        combine_buffer_ptrs_gpu = reinterpret_cast<void**>(combine_base + num_nvl_bytes + barrier_signal_bytes);
+        combine_barrier_signal_ptrs_gpu = reinterpret_cast<int**>(combine_base + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
+        CUDA_CHECK(cudaMemsetAsync(combine_barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
 
     // Create 32 MiB workspace
@@ -284,8 +295,9 @@ void Buffer::destroy() {
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (num_nvl_bytes > 0) {
-        // Barrier
+        // Barrier (both dispatch and combine)
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
+        intranode::barrier(combine_barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
@@ -329,10 +341,18 @@ void Buffer::sync(const std::vector<int>& device_ids,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
+    printf("jinheng debug: enter sync\n");
+
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
         EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
+
+        int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
+        int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
+        int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
+        int64_t per_half = num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes;
+
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
@@ -340,7 +360,11 @@ void Buffer::sync(const std::vector<int>& device_ids,
             if (offset + i != rank) {
                 std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
+                // Dispatch barrier signal
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
+                // Combine pointers
+                combine_buffer_ptrs[i] = static_cast<uint8_t*>(buffer_ptrs[i]) + per_half;
+                combine_barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + per_half + num_nvl_bytes);
             } else {
                 EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
             }
@@ -349,6 +373,8 @@ void Buffer::sync(const std::vector<int>& device_ids,
         // Copy all buffer and barrier signal pointers to GPU
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(combine_buffer_ptrs_gpu, combine_buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(combine_barrier_signal_ptrs_gpu, combine_barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -1921,6 +1947,17 @@ torch::Tensor Buffer::megakernel_forward(
     for (int i = 0; i < num_local_experts; ++i)
         moe_recv_expert_counter[i] = -1;
 
+    printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
+           rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
+           num_tokens, hidden_int4, num_topk, num_experts, num_local_experts, rdma_buffer_ptr,
+           buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
+           moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
+    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p rdma_cpm=%p recv_rdma_prefix=%p gbl_cpm=%p recv_gbl_prefix=%p\n",
+           rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
+           num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
+           rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
+           gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
+
     internode::notify_dispatch(
         num_tokens_per_rank.data_ptr<int>(),
         moe_recv_counter_mapped,
@@ -1953,12 +1990,27 @@ torch::Tensor Buffer::megakernel_forward(
         num_nvl_bytes,
         low_latency_mode);
 
+    printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
+           rank, *moe_recv_counter, *moe_recv_rdma_counter);
+
     // Busy-wait for metadata exchange to complete
     auto wait_start = std::chrono::steady_clock::now();
+    int last_logged_recv_counter = *moe_recv_counter;
     while (*moe_recv_counter == -1) {
+        if (*moe_recv_counter != last_logged_recv_counter) {
+            printf("[MK-HOST][NOTIFY-DISPATCH][WAIT] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
+                   rank, *moe_recv_counter, *moe_recv_rdma_counter);
+            last_logged_recv_counter = *moe_recv_counter;
+        }
         auto elapsed = std::chrono::steady_clock::now() - wait_start;
         EP_HOST_ASSERT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 30);
     }
+
+    printf("[MK-HOST][NOTIFY-DISPATCH][DONE] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d local_expert_counts=[",
+           rank, *moe_recv_counter, *moe_recv_rdma_counter);
+    for (int i = 0; i < num_local_experts; ++i)
+        printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
+    printf("]\n");
 
     printf("jinheng debug: enter this v2\n");
 
@@ -1969,7 +2021,14 @@ torch::Tensor Buffer::megakernel_forward(
         ? std::max(1, (max_total_recv_tokens * 2 + num_local_experts - 1) / num_local_experts)
         : 1;
 
+    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d num_forwarder_sms=%d num_compute_sms=%d total_sms=%d\n",
+           rank, max_total_recv_tokens, max_tokens_per_expert,
+           static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
+           num_dispatch_sms, num_combine_sms, num_forwarder_sms, num_compute_sms, total_sms);
+
     AT_CUDA_CHECK(cudaGetLastError());
+
+    printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
 
     auto* state = megakernel::allocate_megakernel_state_v7(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -1983,6 +2042,7 @@ torch::Tensor Buffer::megakernel_forward(
         recv_gbl_rank_prefix_sum.data_ptr<int>(),
         rdma_buffer_ptr,
         buffer_ptrs_gpu,
+        combine_buffer_ptrs_gpu,
         num_tokens,
         hidden_dim,
         intermediate_dim,
@@ -2010,14 +2070,18 @@ torch::Tensor Buffer::megakernel_forward(
         num_rdma_bytes,
         num_nvl_bytes);
 
+    printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
     printf("jinheng debug: enter this v3\n");
 
     AT_CUDA_CHECK(cudaGetLastError());
 
     // Compute shared memory size
-    // Forwarder needs TMA buffers: each of NUM_MAX_NVL_PEERS slots needs 16KB (matching internode.cu dispatch)
-    int smem_size = NUM_MAX_NVL_PEERS * 16384;
+    // Match internode.cu dispatch/combine dynamic shared memory requirements.
+    int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
+    printf("[MK-HOST][KERNEL][BEFORE] rank=%d state=%p total_sms=%d smem_size=%d stream=%p\n",
+           rank, state, total_sms, smem_size, stream.stream());
     megakernel::launch_megakernel_v7(state, total_sms, smem_size, stream);
+    printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
 
     printf("jinheng debug: enter this v4\n");
 
