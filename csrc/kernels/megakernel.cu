@@ -297,9 +297,9 @@ __device__ void dispatch_worker_v2(
     using namespace internode;
 
     // printf("enter dispatch worker v2\n");
-    if (threadIdx.x == 0) {
-        printf("sm_id: %d, dispatch_sm_idx: %d\n", sm_id, dispatch_sm_idx);
-    }
+    // if (threadIdx.x == 0) {
+    //     printf("sm_id: %d, dispatch_sm_idx: %d\n", sm_id, dispatch_sm_idx);
+    // }
 
     const auto num_sms = state->num_dispatch_sms;
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
@@ -1037,28 +1037,28 @@ __device__ void compute_worker(
             //            state->compute_output + base_offset * hidden,
             //            state->recv_token_source_info + base_offset * 2);
 
-            if (thread_id == 0) {
-                // for (int i = 0; i < batch_size; ++i) {
-                //     int source_token = state->recv_token_source_info[(base_offset + i) * 2];
-                //     int source_topk_slot = state->recv_token_source_info[(base_offset + i) * 2 + 1];
-                //     if (source_token >= 0) {
-                //         printf("[MK-TRACE][COMPUTE][BATCH-START] rank=%d block=%d sm=%d compute_sm=%d compute_sm_count=%d expert_id=%d base_offset=%d batch_index=%d dest_offset=%d source_token=%d source_topk_slot=%d arrived=%d ready_tokens=%d computed_so_far=%d batch_size=%d hidden=%d intermediate=%d input=%p gate_out=%p output=%p\n",
-                //                state->rank, blockIdx.x, sm_id, compute_sm_idx, num_compute_sms, expert_id,
-                //                base_offset, i, base_offset + i, source_token, source_topk_slot, arrived, ready_tokens,
-                //                computed_so_far, batch_size, hidden, intermediate,
-                //                state->recv_tokens + (base_offset + i) * hidden,
-                //                state->gemm_workspace + (base_offset + i) * intermediate * 2,
-                //                state->compute_output + (base_offset + i) * hidden);
-                //     }
-                // }
-                size_t max_bytes = (size_t)state->num_local_experts * state->max_tokens_per_expert * state->hidden_dim;
-                size_t used_bytes = (size_t)(base_offset + batch_size) * state->hidden_dim;
-                if (used_bytes > max_bytes) {
-                    printf("OOB: expert=%d, max_tpe=%d, computed_so_far=%d, batch=%d, base_offset=%d, used=%zu, max=%zu\n",
-                        expert_id, max_tpe, computed_so_far, batch_size, base_offset, used_bytes * sizeof(__nv_bfloat16), max_bytes * sizeof(__nv_bfloat16));
-                    trap();
-                }
-            }
+            // if (thread_id == 0) {
+            //     // for (int i = 0; i < batch_size; ++i) {
+            //     //     int source_token = state->recv_token_source_info[(base_offset + i) * 2];
+            //     //     int source_topk_slot = state->recv_token_source_info[(base_offset + i) * 2 + 1];
+            //     //     if (source_token >= 0) {
+            //     //         printf("[MK-TRACE][COMPUTE][BATCH-START] rank=%d block=%d sm=%d compute_sm=%d compute_sm_count=%d expert_id=%d base_offset=%d batch_index=%d dest_offset=%d source_token=%d source_topk_slot=%d arrived=%d ready_tokens=%d computed_so_far=%d batch_size=%d hidden=%d intermediate=%d input=%p gate_out=%p output=%p\n",
+            //     //                state->rank, blockIdx.x, sm_id, compute_sm_idx, num_compute_sms, expert_id,
+            //     //                base_offset, i, base_offset + i, source_token, source_topk_slot, arrived, ready_tokens,
+            //     //                computed_so_far, batch_size, hidden, intermediate,
+            //     //                state->recv_tokens + (base_offset + i) * hidden,
+            //     //                state->gemm_workspace + (base_offset + i) * intermediate * 2,
+            //     //                state->compute_output + (base_offset + i) * hidden);
+            //     //     }
+            //     // }
+            //     size_t max_bytes = (size_t)state->num_local_experts * state->max_tokens_per_expert * state->hidden_dim;
+            //     size_t used_bytes = (size_t)(base_offset + batch_size) * state->hidden_dim;
+            //     if (used_bytes > max_bytes) {
+            //         printf("OOB: expert=%d, max_tpe=%d, computed_so_far=%d, batch=%d, base_offset=%d, used=%zu, max=%zu\n",
+            //             expert_id, max_tpe, computed_so_far, batch_size, base_offset, used_bytes * sizeof(__nv_bfloat16), max_bytes * sizeof(__nv_bfloat16));
+            //         trap();
+            //     }
+            // }
 
             const __nv_bfloat16* input = state->recv_tokens + base_offset * hidden;
             __nv_bfloat16* gate_out = state->gemm_workspace + base_offset * intermediate * 2;
@@ -1083,9 +1083,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            // device_gemm_bf16(input, w_gate, gate_out,
-            //                  batch_size, hidden, intermediate,
-            //                  warp_id, num_warps, smem_wmma_buf);
+            device_gemm_bf16(input, w_gate, gate_out,
+                             batch_size, hidden, intermediate,
+                             warp_id, num_warps, smem_wmma_buf);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1109,9 +1109,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            // device_gemm_bf16(input, w_up, up_out,
-            //                  batch_size, hidden, intermediate,
-            //                  warp_id, num_warps, smem_wmma_buf);
+            device_gemm_bf16(input, w_up, up_out,
+                             batch_size, hidden, intermediate,
+                             warp_id, num_warps, smem_wmma_buf);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1134,9 +1134,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            // device_swiglu(gate_out, up_out, gate_out,
-            //               batch_size * intermediate,
-            //               thread_id, num_threads);
+            device_swiglu(gate_out, up_out, gate_out,
+                          batch_size * intermediate,
+                          thread_id, num_threads);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1160,9 +1160,9 @@ __device__ void compute_worker(
                     // }
                 }
             }
-            // device_gemm_bf16(gate_out, w_down, output,
-            //                  batch_size, intermediate, hidden,
-            //                  warp_id, num_warps, smem_wmma_buf);
+            device_gemm_bf16(gate_out, w_down, output,
+                             batch_size, intermediate, hidden,
+                             warp_id, num_warps, smem_wmma_buf);
             __syncthreads();
             if (thread_id == 0) {
                 for (int i = 0; i < batch_size; ++i) {
@@ -1210,11 +1210,11 @@ __device__ void combine_worker_v2(
 
     // Wait until ALL experts have finished compute (combine needs all data ready)
     if (threadIdx.x == 0) {
-        if (combine_sm_idx == 0)
-            printf("[MK-DIAG][COMBINE][WAIT-ENTER] rank=%d block=%d combine_sm=%d num_local_experts=%d compute_done_count=%d compute_done_base=%p recv_count_base=%p output=%p source_meta=%p\n",
-                   state->rank, blockIdx.x, combine_sm_idx, state->num_local_experts,
-                   atomicAdd(state->compute_done_count, 0), state->expert_compute_done,
-                   state->expert_recv_count, state->combine_x, state->combine_src_meta);
+        // if (combine_sm_idx == 0)
+        //     printf("[MK-DIAG][COMBINE][WAIT-ENTER] rank=%d block=%d combine_sm=%d num_local_experts=%d compute_done_count=%d compute_done_base=%p recv_count_base=%p output=%p source_meta=%p\n",
+        //            state->rank, blockIdx.x, combine_sm_idx, state->num_local_experts,
+        //            atomicAdd(state->compute_done_count, 0), state->expert_compute_done,
+        //            state->expert_recv_count, state->combine_x, state->combine_src_meta);
         for (int e = 0; e < state->num_local_experts; ++e) {
             auto start_time = clock64();
             while (ld_acquire_sys_global(&state->expert_compute_done[e]) == 0) {
@@ -1229,15 +1229,15 @@ __device__ void combine_worker_v2(
                 }
                 __nanosleep(100);
             }
-            if (combine_sm_idx == 0)
-                printf("[MK-DIAG][COMBINE][WAIT-DONE-EXPERT] rank=%d block=%d combine_sm=%d expert=%d recv_count=%d compute_done_count=%d done_addr=%p\n",
-                       state->rank, blockIdx.x, combine_sm_idx, e,
-                       atomicAdd(&state->expert_recv_count[e], 0),
-                       atomicAdd(state->compute_done_count, 0), &state->expert_compute_done[e]);
+            // if (combine_sm_idx == 0)
+            //     printf("[MK-DIAG][COMBINE][WAIT-DONE-EXPERT] rank=%d block=%d combine_sm=%d expert=%d recv_count=%d compute_done_count=%d done_addr=%p\n",
+            //            state->rank, blockIdx.x, combine_sm_idx, e,
+            //            atomicAdd(&state->expert_recv_count[e], 0),
+            //            atomicAdd(state->compute_done_count, 0), &state->expert_compute_done[e]);
         }
-        if (combine_sm_idx == 0)
-            printf("[MK-DIAG][COMBINE][WAIT-EXIT] rank=%d block=%d combine_sm=%d compute_done_count=%d\n",
-                   state->rank, blockIdx.x, combine_sm_idx, atomicAdd(state->compute_done_count, 0));
+        // if (combine_sm_idx == 0)
+        //     printf("[MK-DIAG][COMBINE][WAIT-EXIT] rank=%d block=%d combine_sm=%d compute_done_count=%d\n",
+        //            state->rank, blockIdx.x, combine_sm_idx, atomicAdd(state->compute_done_count, 0));
     }
     __syncthreads();
 
@@ -1271,13 +1271,13 @@ __device__ void combine_worker_v2(
                     state->scatter_output[recv_token_idx * hidden + h] = __float2bfloat16(accum + route_weight * value);
                 }
 
-                if (threadIdx.x == 0) {
-                    state->scatter_topk_weights[recv_token_idx * num_topk + topk_slot] = route_weight;
-                    state->scatter_src_meta[recv_token_idx] = state->recv_src_meta[dest_offset];
-                    printf("[MK-TRACE][COMBINE][SCATTER] rank=%d block=%d combine_sm=%d expert_id=%d dest_offset=%d recv_token=%d topk_slot=%d route_weight=%f src_rdma_rank=%d\n",
-                           state->rank, blockIdx.x, combine_sm_idx, expert_id, dest_offset, recv_token_idx, topk_slot,
-                           route_weight, state->recv_src_meta[dest_offset].src_rdma_rank);
-                }
+                // if (threadIdx.x == 0) {
+                //     state->scatter_topk_weights[recv_token_idx * num_topk + topk_slot] = route_weight;
+                //     state->scatter_src_meta[recv_token_idx] = state->recv_src_meta[dest_offset];
+                //     printf("[MK-TRACE][COMBINE][SCATTER] rank=%d block=%d combine_sm=%d expert_id=%d dest_offset=%d recv_token=%d topk_slot=%d route_weight=%f src_rdma_rank=%d\n",
+                //            state->rank, blockIdx.x, combine_sm_idx, expert_id, dest_offset, recv_token_idx, topk_slot,
+                //            route_weight, state->recv_src_meta[dest_offset].src_rdma_rank);
+                // }
                 __syncthreads();
             }
         }
@@ -1312,22 +1312,22 @@ __device__ void combine_worker_v2(
         const int* rdma_channel_prefix_matrix = state->combine_rdma_channel_prefix_matrix;
         const int* rdma_rank_prefix_sum = state->combine_rdma_rank_prefix_sum;
 
-        if (threadIdx.x == 0) {
-            printf("[MK-DIAG][COMBINE][RECV-RDMA-PREFIX-MATRIX] rank=%d rdma_rank=%d block=%d combine_sm=%d num_rdma_ranks=%d num_channels=%d matrix_ptr=%p\n",
-                   state->rank, rdma_rank, blockIdx.x, combine_sm_idx, kNumRDMARanks_C, num_channels,
-                   rdma_channel_prefix_matrix);
-            for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks_C; ++dst_rdma_rank) {
-                for (int channel = 0; channel < num_channels; ++channel) {
-                    int value = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel];
-                    int prev = channel == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel - 1];
-                    int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-                    printf("[MK-DIAG][COMBINE][RECV-RDMA-PREFIX-MATRIX][CELL] rank=%d rdma_rank=%d dst_rdma_rank=%d channel=%d prefix=%d prev=%d local_range=[%d,%d) shift=%d global_range=[%d,%d) cell_addr=%p\n",
-                           state->rank, rdma_rank, dst_rdma_rank, channel, value, prev, prev, value, shift,
-                           prev + shift, value + shift,
-                           rdma_channel_prefix_matrix + dst_rdma_rank * num_channels + channel);
-                }
-            }
-        }
+        // if (threadIdx.x == 0) {
+        //     printf("[MK-DIAG][COMBINE][RECV-RDMA-PREFIX-MATRIX] rank=%d rdma_rank=%d block=%d combine_sm=%d num_rdma_ranks=%d num_channels=%d matrix_ptr=%p\n",
+        //            state->rank, rdma_rank, blockIdx.x, combine_sm_idx, kNumRDMARanks_C, num_channels,
+        //            rdma_channel_prefix_matrix);
+        //     for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks_C; ++dst_rdma_rank) {
+        //         for (int channel = 0; channel < num_channels; ++channel) {
+        //             int value = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel];
+        //             int prev = channel == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel - 1];
+        //             int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+        //             printf("[MK-DIAG][COMBINE][RECV-RDMA-PREFIX-MATRIX][CELL] rank=%d rdma_rank=%d dst_rdma_rank=%d channel=%d prefix=%d prev=%d local_range=[%d,%d) shift=%d global_range=[%d,%d) cell_addr=%p\n",
+        //                    state->rank, rdma_rank, dst_rdma_rank, channel, value, prev, prev, value, shift,
+        //                    prev + shift, value + shift,
+        //                    rdma_channel_prefix_matrix + dst_rdma_rank * num_channels + channel);
+        //         }
+        //     }
+        // }
 
         for (int lane = threadIdx.x; lane < kNumRDMARanks_C * num_channels; lane += blockDim.x) {
             int rdma_lane = lane / num_channels;
@@ -1345,9 +1345,9 @@ __device__ void combine_worker_v2(
                 st_na_global(dst_head_ptr, normalized_head);
                 if (current_head >= 0)
                     last_head = current_head;
-                printf("[MK-DIAG][COMBINE][RDMA-HEAD-NORM] rank=%d rdma_rank=%d block=%d lane=%d rdma_lane=%d channel=%d token=%d token_range=[%d,%d) src_head=%d normalized_head=%d last_head_after=%d src_addr=%p dst_addr=%p\n",
-                       state->rank, rdma_rank, blockIdx.x, threadIdx.x, rdma_lane, channel, token_idx,
-                       token_start_idx, token_end_idx, current_head, normalized_head, last_head, src_head_ptr, dst_head_ptr);
+                // printf("[MK-DIAG][COMBINE][RDMA-HEAD-NORM] rank=%d rdma_rank=%d block=%d lane=%d rdma_lane=%d channel=%d token=%d token_range=[%d,%d) src_head=%d normalized_head=%d last_head_after=%d src_addr=%p dst_addr=%p\n",
+                //        state->rank, rdma_rank, blockIdx.x, threadIdx.x, rdma_lane, channel, token_idx,
+                //        token_start_idx, token_end_idx, current_head, normalized_head, last_head, src_head_ptr, dst_head_ptr);
             }
         }
 
@@ -1370,17 +1370,17 @@ __device__ void combine_worker_v2(
                 st_na_global(dst_head_ptr, normalized_head);
                 if (current_head >= 0)
                     last_head = current_head;
-                printf("[MK-DIAG][COMBINE][NVL-HEAD-NORM] rank=%d rdma_rank=%d block=%d lane=%d dst_rdma_rank=%d dst_nvl_rank=%d channel=%d token=%d token_range=[%d,%d) shift=%d src_head=%d normalized_head=%d last_head_after=%d src_addr=%p dst_addr=%p\n",
-                       state->rank, rdma_rank, blockIdx.x, threadIdx.x, dst_rdma_rank, dst_nvl_rank, channel, token_idx,
-                       token_start_idx, token_end_idx, shift, current_head, normalized_head, last_head, src_head_ptr, dst_head_ptr);
+                // printf("[MK-DIAG][COMBINE][NVL-HEAD-NORM] rank=%d rdma_rank=%d block=%d lane=%d dst_rdma_rank=%d dst_nvl_rank=%d channel=%d token=%d token_range=[%d,%d) shift=%d src_head=%d normalized_head=%d last_head_after=%d src_addr=%p dst_addr=%p\n",
+                //        state->rank, rdma_rank, blockIdx.x, threadIdx.x, dst_rdma_rank, dst_nvl_rank, channel, token_idx,
+                //        token_start_idx, token_end_idx, shift, current_head, normalized_head, last_head, src_head_ptr, dst_head_ptr);
             }
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            printf("[MK-DIAG][COMBINE][NOTIFY-DONE] rank=%d block=%d combine_sm=%d num_combined_tokens=%d num_tokens=%d num_channels=%d rdma_rank=%d rdma_prefix=%p rdma_rank_prefix=%p gbl_prefix=%p rdma_head_src=%p rdma_head_work=%p nvl_head_src=%p nvl_head_work=%p\n",
-                   state->rank, blockIdx.x, combine_sm_idx, num_combined_tokens, num_tokens, num_channels, rdma_rank,
-                   rdma_channel_prefix_matrix, rdma_rank_prefix_sum, state->combine_gbl_channel_prefix_matrix,
-                   combined_rdma_head_src, combined_rdma_head_mut, combined_nvl_head_src, combined_nvl_head_mut);
+            // printf("[MK-DIAG][COMBINE][NOTIFY-DONE] rank=%d block=%d combine_sm=%d num_combined_tokens=%d num_tokens=%d num_channels=%d rdma_rank=%d rdma_prefix=%p rdma_rank_prefix=%p gbl_prefix=%p rdma_head_src=%p rdma_head_work=%p nvl_head_src=%p nvl_head_work=%p\n",
+            //        state->rank, blockIdx.x, combine_sm_idx, num_combined_tokens, num_tokens, num_channels, rdma_rank,
+            //        rdma_channel_prefix_matrix, rdma_rank_prefix_sum, state->combine_gbl_channel_prefix_matrix,
+            //        combined_rdma_head_src, combined_rdma_head_mut, combined_nvl_head_src, combined_nvl_head_mut);
             st_release_sys_global(state->combine_notify_done, 1);
         }
     } else if (threadIdx.x == 0) {
@@ -1425,23 +1425,23 @@ __device__ void combine_worker_v2(
     const auto nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
 
     // DEBUG: Entry log (once per SM, thread 0 only)
-    if (thread_id == 0) {
-        printf("[MK-DIAG][COMBINE][SM-ENTRY] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d is_forwarder_sm=%d num_tokens=%d num_combined_tokens=%d num_channels=%d hidden=%d hidden_int4=%d hidden_bytes=%d num_topk=%d num_bytes_per_token=%d num_dispatch_sms=%d num_combine_sms=%d num_compute_sms=%d\n",
-               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, is_forwarder_sm,
-               state->combine_num_tokens, state->combine_num_combined_tokens, num_channels, hidden,
-               (int)hidden_int4, (int)hidden_bytes, num_topk, (int)num_bytes_per_token,
-               state->num_dispatch_sms, state->num_combine_sms, state->num_compute_sms);
-        if (sm_id == 0) {
-            printf("MK combine BUFS: rdma_buffer_ptr=%p, buffer_ptrs=%p, buffer_ptrs[0]=%p\n",
-                   state->combine_rdma_buffer_ptr, state->combine_buffer_ptrs,
-                   state->combine_buffer_ptrs ? state->combine_buffer_ptrs[0] : nullptr);
-            printf("MK combine SIZING: rdma_send=%d, rdma_recv=%d, nvl_send=%d, nvl_recv=%d\n",
-                   state->num_max_combine_rdma_chunked_send_tokens,
-                   state->num_max_combine_rdma_chunked_recv_tokens,
-                   state->num_max_combine_nvl_chunked_send_tokens,
-                   state->num_max_combine_nvl_chunked_recv_tokens);
-        }
-    }
+    // if (thread_id == 0) {
+    //     printf("[MK-DIAG][COMBINE][SM-ENTRY] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d is_forwarder_sm=%d num_tokens=%d num_combined_tokens=%d num_channels=%d hidden=%d hidden_int4=%d hidden_bytes=%d num_topk=%d num_bytes_per_token=%d num_dispatch_sms=%d num_combine_sms=%d num_compute_sms=%d\n",
+    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, is_forwarder_sm,
+    //            state->combine_num_tokens, state->combine_num_combined_tokens, num_channels, hidden,
+    //            (int)hidden_int4, (int)hidden_bytes, num_topk, (int)num_bytes_per_token,
+    //            state->num_dispatch_sms, state->num_combine_sms, state->num_compute_sms);
+    //     if (sm_id == 0) {
+    //         printf("MK combine BUFS: rdma_buffer_ptr=%p, buffer_ptrs=%p, buffer_ptrs[0]=%p\n",
+    //                state->combine_rdma_buffer_ptr, state->combine_buffer_ptrs,
+    //                state->combine_buffer_ptrs ? state->combine_buffer_ptrs[0] : nullptr);
+    //         printf("MK combine SIZING: rdma_send=%d, rdma_recv=%d, nvl_send=%d, nvl_recv=%d\n",
+    //                state->num_max_combine_rdma_chunked_send_tokens,
+    //                state->num_max_combine_rdma_chunked_recv_tokens,
+    //                state->num_max_combine_nvl_chunked_send_tokens,
+    //                state->num_max_combine_nvl_chunked_recv_tokens);
+    //     }
+    // }
 
     // Role assignment (same as DeepEP combine kernel)
     auto role_meta = [=]() -> std::pair<WarpRole, int> {
@@ -1467,14 +1467,14 @@ __device__ void combine_worker_v2(
     auto warp_role = role_meta.first;
     auto warp_id = role_meta.second;
 
-    if (channel_id == 4 && lane_id == 0 && warp_role == WarpRole::kNVLAndRDMAForwarder) {
-        const int physical_warp_id = thread_id / 32;
-        const int dst_rdma_rank_dbg = warp_id / kNumWarpsPerForwarder_C;
-        const int sub_warp_id_dbg = warp_id % kNumWarpsPerForwarder_C;
-        printf("[MK-TRACE][COMBINE][FWD-ROLE-CH4] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d physical_warp=%d logical_warp=%d dst_rdma_rank=%d sub_warp=%d\n",
-               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, physical_warp_id, warp_id,
-               dst_rdma_rank_dbg, sub_warp_id_dbg);
-    }
+    // if (channel_id == 4 && lane_id == 0 && warp_role == WarpRole::kNVLAndRDMAForwarder) {
+    //     const int physical_warp_id = thread_id / 32;
+    //     const int dst_rdma_rank_dbg = warp_id / kNumWarpsPerForwarder_C;
+    //     const int sub_warp_id_dbg = warp_id % kNumWarpsPerForwarder_C;
+    //     printf("[MK-TRACE][COMBINE][FWD-ROLE-CH4] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d physical_warp=%d logical_warp=%d dst_rdma_rank=%d sub_warp=%d\n",
+    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, physical_warp_id, warp_id,
+    //            dst_rdma_rank_dbg, sub_warp_id_dbg);
+    // }
 
     const int num_max_rdma_chunked_send_tokens = state->num_max_combine_rdma_chunked_send_tokens;
     const int num_max_rdma_chunked_recv_tokens = state->num_max_combine_rdma_chunked_recv_tokens;
@@ -1531,11 +1531,11 @@ __device__ void combine_worker_v2(
             int prefix_idx = (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_channels + channel_id;
             token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
             token_end_idx = (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
-            printf("[MK-DIAG][COMBINE][NVL-SENDER][LANE-RANGE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d lane=%d src_rdma_lane=%d prefix_idx=%d token_range=[%d,%d) count=%d gbl_prefix_addr=%p nvl_x_base=%p nvl_head_ptr=%p nvl_tail_ptr=%p\n",
-                   state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank,
-                   lane_id, lane_id, prefix_idx, token_start_idx, token_end_idx, token_end_idx - token_start_idx,
-                   gbl_channel_prefix_matrix + prefix_idx, nvl_channel_x.buffer(), nvl_channel_head.buffer() + lane_id,
-                   nvl_channel_tail.buffer() + lane_id);
+            // printf("[MK-DIAG][COMBINE][NVL-SENDER][LANE-RANGE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d lane=%d src_rdma_lane=%d prefix_idx=%d token_range=[%d,%d) count=%d gbl_prefix_addr=%p nvl_x_base=%p nvl_head_ptr=%p nvl_tail_ptr=%p\n",
+            //        state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank,
+            //        lane_id, lane_id, prefix_idx, token_start_idx, token_end_idx, token_end_idx - token_start_idx,
+            //        gbl_channel_prefix_matrix + prefix_idx, nvl_channel_x.buffer(), nvl_channel_head.buffer() + lane_id,
+            //        nvl_channel_tail.buffer() + lane_id);
         }
         __syncwarp();
 
@@ -1547,9 +1547,9 @@ __device__ void combine_worker_v2(
             // Warp-reduce to get total tasks
             for (int offset = 16; offset > 0; offset >>= 1)
                 my_range += __shfl_down_sync(0xffffffff, my_range, offset);
-            if (lane_id == 0 && channel_id == 0)
-                printf("MK combine NVL sender: sm=%d, ch=%d, dst_nvl=%d, total_tasks=%d\n",
-                       sm_id, channel_id, dst_nvl_rank, my_range);
+            // if (lane_id == 0 && channel_id == 0)
+            //     printf("MK combine NVL sender: sm=%d, ch=%d, dst_nvl=%d, total_tasks=%d\n",
+            //            sm_id, channel_id, dst_nvl_rank, my_range);
         }
         __syncwarp();
 
@@ -1612,12 +1612,12 @@ __device__ void combine_worker_v2(
 
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    if (lane_id == 0) {
-                        printf("[MK-TRACE][COMBINE][NVL-SENDER][SEND] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d current_rdma_idx=%d token=%lld dst_slot=%d shifted_x=%p shifted_buffer=%p src_meta_addr=%p topk_weights_addr=%p tma_buffer=%p hidden_int4=%d num_topk=%d\n",
-                               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank, current_rdma_idx,
-                               (long long)token_idx, dst_slot_idx, shifted_x, shifted_x_buffers, src_meta + token_idx,
-                               topk_weights + token_idx * num_topk, tma_buffer, (int)hidden_int4, num_topk);
-                    }
+                    // if (lane_id == 0) {
+                    //     printf("[MK-TRACE][COMBINE][NVL-SENDER][SEND] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d current_rdma_idx=%d token=%lld dst_slot=%d shifted_x=%p shifted_buffer=%p src_meta_addr=%p topk_weights_addr=%p tma_buffer=%p hidden_int4=%d num_topk=%d\n",
+                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank, current_rdma_idx,
+                    //            (long long)token_idx, dst_slot_idx, shifted_x, shifted_x_buffers, src_meta + token_idx,
+                    //            topk_weights + token_idx * num_topk, tma_buffer, (int)hidden_int4, num_topk);
+                    // }
                     tma_store_wait<0>();
                     if (elect_one_sync()) {
                         tma_load_1d(tma_buffer, shifted_x, tma_mbarrier, hidden_bytes);
@@ -1727,12 +1727,12 @@ __device__ void combine_worker_v2(
             combined_nvl_head += num_tokens_prefix * NUM_MAX_NVL_PEERS;
 
             // DEBUG: Forwarder entry
-            if (lane_id == 0 && sub_warp_id == 0 && channel_id == 0)
-                printf("MK combine FWD: sm=%d, warp=%d, dst_rdma=%d, num_tokens_to_combine=%d, "
-                       "num_tokens_prefix=%d, rdma_head_buf=%p, rdma_tail_buf=%p\n",
-                       sm_id, warp_id, dst_rdma_rank, num_tokens_to_combine, num_tokens_prefix,
-                       (void*)rdma_channel_head.buffer(dst_rdma_rank),
-                       (void*)rdma_channel_tail.buffer(rdma_rank));
+            // if (lane_id == 0 && sub_warp_id == 0 && channel_id == 0)
+            //     printf("MK combine FWD: sm=%d, warp=%d, dst_rdma=%d, num_tokens_to_combine=%d, "
+            //            "num_tokens_prefix=%d, rdma_head_buf=%p, rdma_tail_buf=%p\n",
+            //            sm_id, warp_id, dst_rdma_rank, num_tokens_to_combine, num_tokens_prefix,
+            //            (void*)rdma_channel_head.buffer(dst_rdma_rank),
+            //            (void*)rdma_channel_tail.buffer(rdma_rank));
             // if (lane_id == 0 && channel_id == 4) {
             //     int prefix_end = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
             //     int prefix_begin = channel_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
@@ -1809,16 +1809,16 @@ __device__ void combine_worker_v2(
                                           : (forwarder_nvl_head[warp_id][lane_id] = expected_head);
                     }
 
-                    if (channel_id == 4 && lane_id < NUM_MAX_NVL_PEERS && (dst_rdma_rank == 0 || (num_tokens_prefix + token_idx) >= 88 && (num_tokens_prefix + token_idx) <= 110)) {
-                        int global_token_idx = num_tokens_prefix + token_idx;
-                        int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
-                        printf("[MK-TRACE][COMBINE][FWD-NVL-PLAN-CH4] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d lane=%d src_nvl_rank=%d local_token=%d global_token=%d expected_head=%d encoded_progress=%d cached_tail=%d nvl_head_addr=%p nvl_tail_addr=%p nvl_x_base=%p send_buffer=%p\n",
-                               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                               dst_rdma_rank, sub_warp_id, lane_id, lane_id, token_idx, global_token_idx,
-                               expected_head, encoded_progress, cached_nvl_channel_tail_idx,
-                               combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id,
-                               nvl_channel_tail.buffer(lane_id), nvl_channel_x.buffer(lane_id), send_buffer);
-                    }
+                    // if (channel_id == 4 && lane_id < NUM_MAX_NVL_PEERS && (dst_rdma_rank == 0 || (num_tokens_prefix + token_idx) >= 88 && (num_tokens_prefix + token_idx) <= 110)) {
+                    //     int global_token_idx = num_tokens_prefix + token_idx;
+                    //     int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
+                    //     printf("[MK-TRACE][COMBINE][FWD-NVL-PLAN-CH4] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d lane=%d src_nvl_rank=%d local_token=%d global_token=%d expected_head=%d encoded_progress=%d cached_tail=%d nvl_head_addr=%p nvl_tail_addr=%p nvl_x_base=%p send_buffer=%p\n",
+                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
+                    //            dst_rdma_rank, sub_warp_id, lane_id, lane_id, token_idx, global_token_idx,
+                    //            expected_head, encoded_progress, cached_nvl_channel_tail_idx,
+                    //            combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id,
+                    //            nvl_channel_tail.buffer(lane_id), nvl_channel_x.buffer(lane_id), send_buffer);
+                    // }
                     start_time = clock64();
                     while (cached_nvl_channel_tail_idx <= expected_head) {
                         cached_nvl_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
@@ -1836,13 +1836,13 @@ __device__ void combine_worker_v2(
                     // Combine current token
                     auto rdma_slot_idx = token_idx % num_max_rdma_chunked_recv_tokens;
                     void* shifted = send_buffer + rdma_slot_idx * num_bytes_per_token;
-                    if (lane_id == 0) {
-                        int global_token_idx = num_tokens_prefix + token_idx;
-                        printf("[MK-TRACE][COMBINE][FWD][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d local_token=%d global_token=%d rdma_slot=%d shifted=%p send_buffer=%p num_bytes_per_token=%d hidden_int4=%d hidden_bytes=%d num_topk=%d\n",
-                               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                               dst_rdma_rank, sub_warp_id, token_idx, global_token_idx, (int)rdma_slot_idx,
-                               shifted, send_buffer, (int)num_bytes_per_token, (int)hidden_int4, (int)hidden_bytes, num_topk);
-                    }
+                    // if (lane_id == 0) {
+                    //     int global_token_idx = num_tokens_prefix + token_idx;
+                    //     printf("[MK-TRACE][COMBINE][FWD][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d local_token=%d global_token=%d rdma_slot=%d shifted=%p send_buffer=%p num_bytes_per_token=%d hidden_int4=%d hidden_bytes=%d num_topk=%d\n",
+                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
+                    //            dst_rdma_rank, sub_warp_id, token_idx, global_token_idx, (int)rdma_slot_idx,
+                    //            shifted, send_buffer, (int)num_bytes_per_token, (int)hidden_int4, (int)hidden_bytes, num_topk);
+                    // }
                     auto get_addr_fn = [&](int src_nvl_rank, int slot_idx, int hidden_int4_idx) -> int4* {
                         return reinterpret_cast<int4*>(nvl_channel_x.buffer(src_nvl_rank) + slot_idx * num_bytes_per_token) +
                             hidden_int4_idx;
@@ -1882,15 +1882,15 @@ __device__ void combine_worker_v2(
                         reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token);
                     const auto src_ptr =
                         reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_token);
-                    if (lane_id == 0) {
-                        printf("[MK-DIAG][COMBINE][FWD][RDMA-ISSUE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d translated_dst_rank=%d local_copy=%d token_chunk=[%d,%d) global_token_chunk=[%d,%d) rdma_slot_start=%d num_chunked_tokens=%d num_bytes_per_msg=%llu src_ptr=0x%llx dst_ptr=0x%llx rdma_tail_local_ptr=%p tail_add=%d\n",
-                               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                               dst_rdma_rank, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), dst_rdma_rank == rdma_rank,
-                               token_start_idx, token_end_idx, num_tokens_prefix + token_start_idx,
-                               num_tokens_prefix + token_end_idx, (int)rdma_slot_idx, num_chunked_tokens,
-                               (unsigned long long)num_bytes_per_msg, (unsigned long long)src_ptr, (unsigned long long)dst_ptr, rdma_channel_tail.buffer(rdma_rank),
-                               num_chunked_tokens);
-                    }
+                    // if (lane_id == 0) {
+                    //     printf("[MK-DIAG][COMBINE][FWD][RDMA-ISSUE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d translated_dst_rank=%d local_copy=%d token_chunk=[%d,%d) global_token_chunk=[%d,%d) rdma_slot_start=%d num_chunked_tokens=%d num_bytes_per_msg=%llu src_ptr=0x%llx dst_ptr=0x%llx rdma_tail_local_ptr=%p tail_add=%d\n",
+                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
+                    //            dst_rdma_rank, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), dst_rdma_rank == rdma_rank,
+                    //            token_start_idx, token_end_idx, num_tokens_prefix + token_start_idx,
+                    //            num_tokens_prefix + token_end_idx, (int)rdma_slot_idx, num_chunked_tokens,
+                    //            (unsigned long long)num_bytes_per_msg, (unsigned long long)src_ptr, (unsigned long long)dst_ptr, rdma_channel_tail.buffer(rdma_rank),
+                    //            num_chunked_tokens);
+                    // }
                     if (dst_rdma_rank != rdma_rank) {
                         nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr,
                                                           src_ptr,
@@ -1905,10 +1905,10 @@ __device__ void combine_worker_v2(
 
                     __syncwarp();
                     if (elect_one_sync()) {
-                        printf("[MK-DIAG][COMBINE][FWD][RDMA-TAIL-ADD] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d translated_dst_rank=%d local_copy=%d tail_ptr=%p add=%d token_chunk=[%d,%d)\n",
-                               state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                               dst_rdma_rank, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), dst_rdma_rank == rdma_rank,
-                               rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens, token_start_idx, token_end_idx);
+                        // printf("[MK-DIAG][COMBINE][FWD][RDMA-TAIL-ADD] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d translated_dst_rank=%d local_copy=%d tail_ptr=%p add=%d token_chunk=[%d,%d)\n",
+                        //        state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
+                        //        dst_rdma_rank, translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), dst_rdma_rank == rdma_rank,
+                        //        rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens, token_start_idx, token_end_idx);
                         nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                         num_chunked_tokens,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
@@ -1933,28 +1933,28 @@ __device__ void combine_worker_v2(
             // printf("combine receiver: sm_id: %d num_tokens: %d num_channels: %d channel_id: %d token_start_idx: %d, token_end_idx: %d\n", sm_id, num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
             // DEBUG: RDMA receiver entry
-            if (lane_id < kNumRDMARanks_C)
-                printf("[MK-DIAG][COMBINE][RDMA-RECEIVER][ENTRY] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d lane=%d token_range=[%d,%d) num_combined_tokens=%d rdma_tail_ptr=%p rdma_head_ptr=%p rdma_recv_buffer=%p combined_rdma_head_base=%p combined_x_base=%p combined_topk_weights_base=%p\n",
-                       state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, lane_id,
-                       token_start_idx, token_end_idx, num_combined_tokens, rdma_channel_tail.buffer(lane_id),
-                       rdma_channel_head.buffer(lane_id), rdma_channel_data.recv_buffer(lane_id), combined_rdma_head,
-                       combined_x, combined_topk_weights);
+            // if (lane_id < kNumRDMARanks_C)
+            //     printf("[MK-DIAG][COMBINE][RDMA-RECEIVER][ENTRY] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d lane=%d token_range=[%d,%d) num_combined_tokens=%d rdma_tail_ptr=%p rdma_head_ptr=%p rdma_recv_buffer=%p combined_rdma_head_base=%p combined_x_base=%p combined_topk_weights_base=%p\n",
+            //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, lane_id,
+            //            token_start_idx, token_end_idx, num_combined_tokens, rdma_channel_tail.buffer(lane_id),
+            //            rdma_channel_head.buffer(lane_id), rdma_channel_data.recv_buffer(lane_id), combined_rdma_head,
+            //            combined_x, combined_topk_weights);
 
             int cached_channel_tail_idx = 0;
             for (int64_t token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumRDMAReceivers_C) {
                 int expected_head = -1;
                 if (lane_id < kNumRDMARanks_C) {
                     expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
-                    int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
-                    int tail_snapshot = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-                    printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][PLAN] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d lane=%d token=%lld token_range=[%d,%d) expected_head=%d encoded_progress=%d cached_tail=%d tail_snapshot=%d ready=%d combined_rdma_head_addr=%p combined_x=%p combined_topk_weights=%p rdma_tail_addr=%p rdma_recv_buffer=%p\n",
-                           state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, lane_id, (long long)token_idx,
-                           token_start_idx, token_end_idx, expected_head, encoded_progress, cached_channel_tail_idx,
-                           tail_snapshot, tail_snapshot > expected_head,
-                           combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id,
-                           combined_x + token_idx * hidden_int4,
-                           combined_topk_weights + token_idx * num_topk,
-                           rdma_channel_tail.buffer(lane_id), rdma_channel_data.recv_buffer(lane_id));
+                    // int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
+                    // int tail_snapshot = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+                    // printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][PLAN] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d lane=%d token=%lld token_range=[%d,%d) expected_head=%d encoded_progress=%d cached_tail=%d tail_snapshot=%d ready=%d combined_rdma_head_addr=%p combined_x=%p combined_topk_weights=%p rdma_tail_addr=%p rdma_recv_buffer=%p\n",
+                    //        state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, lane_id, (long long)token_idx,
+                    //        token_start_idx, token_end_idx, expected_head, encoded_progress, cached_channel_tail_idx,
+                    //        tail_snapshot, tail_snapshot > expected_head,
+                    //        combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id,
+                    //        combined_x + token_idx * hidden_int4,
+                    //        combined_topk_weights + token_idx * num_topk,
+                    //        rdma_channel_tail.buffer(lane_id), rdma_channel_data.recv_buffer(lane_id));
                     (expected_head < 0) ? (rdma_receiver_rdma_head[warp_id][lane_id] = -expected_head - 1)
                                         : (rdma_receiver_rdma_head[warp_id][lane_id] = expected_head);
                 }
@@ -1992,14 +1992,14 @@ __device__ void combine_worker_v2(
                                         topk_idx);
                 };
                 uint32_t dummy_tma_phases[2];
-                if (lane_id == 0) {
-                    printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d token=%lld expected_head=%d hidden_int4=%d hidden_bytes=%d num_topk=%d rdma_recv_buffer0=%p rdma_recv_buffer1=%p output_combined_x=%p output_topk_weights=%p\n",
-                           state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
-                           expected_head, (int)hidden_int4, (int)hidden_bytes, num_topk,
-                           rdma_channel_data.recv_buffer(0), rdma_channel_data.recv_buffer(1),
-                           combined_x + token_idx * hidden_int4,
-                           combined_topk_weights + token_idx * num_topk);
-                }
+                // if (lane_id == 0) {
+                //     printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d token=%lld expected_head=%d hidden_int4=%d hidden_bytes=%d num_topk=%d rdma_recv_buffer0=%p rdma_recv_buffer1=%p output_combined_x=%p output_topk_weights=%p\n",
+                //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
+                //            expected_head, (int)hidden_int4, (int)hidden_bytes, num_topk,
+                //            rdma_channel_data.recv_buffer(0), rdma_channel_data.recv_buffer(1),
+                //            combined_x + token_idx * hidden_int4,
+                //            combined_topk_weights + token_idx * num_topk);
+                // }
                 combine_token<kNumRDMARanks_C, true, dtype_t, kNumTopkRDMARanks_C, false, 2>(
                     expected_head >= 0,
                     expected_head,
@@ -2015,11 +2015,11 @@ __device__ void combine_worker_v2(
                     recv_tw_fn,
                     nullptr,
                     dummy_tma_phases);
-                if (lane_id == 0) {
-                    printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][COMBINE-DONE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d token=%lld output_combined_x=%p output_topk_weights=%p\n",
-                           state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
-                           combined_x + token_idx * hidden_int4, combined_topk_weights + token_idx * num_topk);
-                }
+                // if (lane_id == 0) {
+                //     printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][COMBINE-DONE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d token=%lld output_combined_x=%p output_topk_weights=%p\n",
+                //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
+                //            combined_x + token_idx * hidden_int4, combined_topk_weights + token_idx * num_topk);
+                // }
             }
 
             __syncwarp();
@@ -2088,16 +2088,16 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
     const int num_combine_sms = state->num_combine_sms;
     const int num_compute_sms = state->num_compute_sms;
 
-    if (threadIdx.x == 0) {
-        int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
-        int nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
-        printf("[MK-TRACE][KERNEL][ENTRY] block=%d blocks=%d rank=%d rdma_rank=%d nvl_rank=%d dispatch_sms=%d combine_sms=%d compute_sms=%d num_tokens=%d num_topk=%d hidden_dim=%d intermediate_dim=%d num_experts=%d num_local_experts=%d max_tokens_per_expert=%d expected_dispatch_done=%d state=%p rdma_buffer=%p combine_rdma_buffer=%p buffer_ptrs=%p combine_buffer_ptrs=%p\n",
-               sm_id, gridDim.x, state->rank, rdma_rank, nvl_rank, num_dispatch_sms, num_combine_sms, num_compute_sms,
-               state->num_tokens, state->num_topk, state->hidden_dim, state->intermediate_dim,
-               state->num_experts, state->num_local_experts, state->max_tokens_per_expert,
-               state->expected_dispatch_done_count, state, state->rdma_buffer_ptr, state->combine_rdma_buffer_ptr,
-               state->buffer_ptrs, state->combine_buffer_ptrs);
-    }
+    // if (threadIdx.x == 0) {
+    //     int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
+    //     int nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
+    //     printf("[MK-TRACE][KERNEL][ENTRY] block=%d blocks=%d rank=%d rdma_rank=%d nvl_rank=%d dispatch_sms=%d combine_sms=%d compute_sms=%d num_tokens=%d num_topk=%d hidden_dim=%d intermediate_dim=%d num_experts=%d num_local_experts=%d max_tokens_per_expert=%d expected_dispatch_done=%d state=%p rdma_buffer=%p combine_rdma_buffer=%p buffer_ptrs=%p combine_buffer_ptrs=%p\n",
+    //            sm_id, gridDim.x, state->rank, rdma_rank, nvl_rank, num_dispatch_sms, num_combine_sms, num_compute_sms,
+    //            state->num_tokens, state->num_topk, state->hidden_dim, state->intermediate_dim,
+    //            state->num_experts, state->num_local_experts, state->max_tokens_per_expert,
+    //            state->expected_dispatch_done_count, state, state->rdma_buffer_ptr, state->combine_rdma_buffer_ptr,
+    //            state->buffer_ptrs, state->combine_buffer_ptrs);
+    // }
 
     // Reuse dynamic shared memory for WMMA output on compute SMs.
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -2119,43 +2119,43 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
         role_idx = sm_id - num_dispatch_sms - num_combine_sms;
     }
 
-    if (threadIdx.x == 0) {
-        printf("[MK-TRACE][KERNEL][ROLE] rank=%d block=%d role=%d role_idx=%d dispatch_sms=%d combine_sms=%d compute_sms=%d layout=[dispatch:0-%d combine:%d-%d compute:%d-%d] dispatch_done=%d dispatch_done_count=%d compute_done_count=%d scatter_done=%d\n",
-               state->rank, sm_id, static_cast<int>(role), role_idx, num_dispatch_sms, num_combine_sms, num_compute_sms,
-               num_dispatch_sms - 1, num_dispatch_sms, num_dispatch_sms + num_combine_sms - 1,
-               num_dispatch_sms + num_combine_sms, gridDim.x - 1,
-               ld_volatile_global(state->dispatch_done), ld_volatile_global(state->dispatch_done_count),
-               ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
-    }
+    // if (threadIdx.x == 0) {
+    //     printf("[MK-TRACE][KERNEL][ROLE] rank=%d block=%d role=%d role_idx=%d dispatch_sms=%d combine_sms=%d compute_sms=%d layout=[dispatch:0-%d combine:%d-%d compute:%d-%d] dispatch_done=%d dispatch_done_count=%d compute_done_count=%d scatter_done=%d\n",
+    //            state->rank, sm_id, static_cast<int>(role), role_idx, num_dispatch_sms, num_combine_sms, num_compute_sms,
+    //            num_dispatch_sms - 1, num_dispatch_sms, num_dispatch_sms + num_combine_sms - 1,
+    //            num_dispatch_sms + num_combine_sms, gridDim.x - 1,
+    //            ld_volatile_global(state->dispatch_done), ld_volatile_global(state->dispatch_done_count),
+    //            ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
+    // }
 
     switch (role) {
         case SmRole::kDispatch:
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][DISPATCH-START] rank=%d block=%d role_idx=%d\n", state->rank, sm_id, role_idx);
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][DISPATCH-START] rank=%d block=%d role_idx=%d\n", state->rank, sm_id, role_idx);
             dispatch_worker_v2(sm_id, role_idx, state);
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][DISPATCH-END] rank=%d block=%d role_idx=%d dispatch_done=%d dispatch_done_count=%d\n",
-                       state->rank, sm_id, role_idx, ld_volatile_global(state->dispatch_done), ld_volatile_global(state->dispatch_done_count));
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][DISPATCH-END] rank=%d block=%d role_idx=%d dispatch_done=%d dispatch_done_count=%d\n",
+            //            state->rank, sm_id, role_idx, ld_volatile_global(state->dispatch_done), ld_volatile_global(state->dispatch_done_count));
             break;
 
         case SmRole::kCombine:
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][COMBINE-START] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
-                       state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][COMBINE-START] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
+            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
             combine_worker_v2(role_idx, state);
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][COMBINE-END] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
-                       state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][COMBINE-END] rank=%d block=%d role_idx=%d compute_done_count=%d scatter_done=%d\n",
+            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count), ld_volatile_global(state->scatter_done));
             break;
 
         case SmRole::kCompute:
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][COMPUTE-START] rank=%d block=%d role_idx=%d num_compute_sms=%d\n",
-                       state->rank, sm_id, role_idx, num_compute_sms);
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][COMPUTE-START] rank=%d block=%d role_idx=%d num_compute_sms=%d\n",
+            //            state->rank, sm_id, role_idx, num_compute_sms);
             compute_worker(sm_id, role_idx, num_compute_sms, state, smem_wmma_buf);
-            if (threadIdx.x == 0)
-                printf("[MK-TRACE][KERNEL][COMPUTE-END] rank=%d block=%d role_idx=%d compute_done_count=%d\n",
-                       state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count));
+            // if (threadIdx.x == 0)
+            //     printf("[MK-TRACE][KERNEL][COMPUTE-END] rank=%d block=%d role_idx=%d compute_done_count=%d\n",
+            //            state->rank, sm_id, role_idx, ld_volatile_global(state->compute_done_count));
             break;
 
         default:
