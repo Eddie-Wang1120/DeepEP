@@ -102,6 +102,10 @@ if __name__ == '__main__':
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
 
+    if int(os.getenv('ENABLE_FAST_DEBUG', 0)):
+        cxx_flags.append('-DENABLE_FAST_DEBUG')
+        nvcc_flags.append('-DENABLE_FAST_DEBUG')
+
     # cxx_flags.append("TORCH_USE_CUDA_DSA")
 
     # Put them together

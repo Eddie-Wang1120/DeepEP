@@ -1911,12 +1911,17 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(num_compute_sms > 0);
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
 
-    // Config for buffer sizing (use default matching internode dispatch)
+    // Config for buffer sizing, aligned with tests/test_megakernel_v7.py DeepEP config
     const int num_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
     const int num_max_rdma_chunked_send_tokens = 8;
     const int num_max_rdma_chunked_recv_tokens = 256;
     const int num_max_nvl_chunked_send_tokens = 8;
     const int num_max_nvl_chunked_recv_tokens = 256;
+
+    // const int num_max_rdma_chunked_send_tokens = 16;
+    // const int num_max_rdma_chunked_recv_tokens = 128;
+    // const int num_max_nvl_chunked_send_tokens = 8;
+    // const int num_max_nvl_chunked_recv_tokens = 512;
 
     // Step 1: Compute dispatch layout
     auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -2017,9 +2022,8 @@ torch::Tensor Buffer::megakernel_forward(
     // Step 3: Allocate and launch megakernel v7
     const int max_total_recv_tokens = *moe_recv_counter;
     // Per-expert budget: evenly distribute received tokens across local experts, with 2x headroom
-    const int max_tokens_per_expert = max_total_recv_tokens > 0
-        ? std::max(1, (max_total_recv_tokens * 2 + num_local_experts - 1) / num_local_experts)
-        : 1;
+    // Worst case: all tokens route to one expert (each token can appear num_topk times)
+    const int max_tokens_per_expert = std::max(1, max_total_recv_tokens * num_topk);
 
     printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d num_forwarder_sms=%d num_compute_sms=%d total_sms=%d\n",
            rank, max_total_recv_tokens, max_tokens_per_expert,
