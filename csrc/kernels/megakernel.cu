@@ -99,6 +99,8 @@ struct MegaKernelState {
     int* send_nvl_head;              // For combine NVL tracking
     int* recv_rdma_channel_prefix_matrix;   // Written by forwarder
     int* recv_gbl_channel_prefix_matrix;    // Written by NVL receiver
+    int* recv_rdma_channel_token_count;     // [num_rdma_ranks * num_channels] per-channel token count (non-cumulative)
+    int* recv_gbl_channel_token_count;      // [num_ranks * num_channels] per-channel token count (non-cumulative)
 
     // --- Dispatch dimensions ---
     int num_tokens;                   // Total tokens to dispatch
@@ -172,6 +174,8 @@ struct MegaKernelState {
     const int* combine_rdma_channel_prefix_matrix;
     const int* combine_rdma_rank_prefix_sum;
     const int* combine_gbl_channel_prefix_matrix;
+    const int* combine_gbl_channel_token_count;      // [num_ranks * num_channels] non-cumulative per-channel count
+    const int* combine_rdma_channel_token_count;     // [num_rdma_ranks * num_channels] non-cumulative per-channel count
     int combine_num_tokens;                   // num tokens for combine (= tokens received by this rank)
     int combine_num_combined_tokens;          // num combined tokens (= original dispatch num_tokens)
     int combine_hidden;                       // hidden dim in dtype units
@@ -198,12 +202,16 @@ struct MegaKernelState {
     int num_combine_sms_total;        // Total combine SMs (alias for num_combine_sms above)
     int num_compute_sms;
 
+    // --- Per-channel overlap signaling ---
+    int* channel_dispatch_done;       // [num_dispatch_channels] atomicAdd counter, reaches NUM_MAX_NVL_PEERS when channel done
+    int* channel_normalized;          // [num_combine_channels] set to 1 after head normalization completes for that channel
+
     // --- Dispatch SM config ---
     int num_dispatch_channels;        // = num_dispatch_sms / 2 (even/odd SM pairing)
 
 #ifdef MK_PERF_TRACE
     // Per-SM phase timing for fine-grained overlap visualization
-    // Layout: perf_phase_ts[sm_id * MK_PERF_NUM_PHASES + phase_id] = clock64()
+    // Layout: perf_phase_ts[sm_id * MK_PERF_NUM_PHASES + phase_id] = globaltimer_ns()
     // Phases per role:
     //   Dispatch: 0=enter, 1=exit
     //   Compute:  0=enter, 1=first_batch_start, 2=exit
@@ -711,6 +719,9 @@ __device__ void dispatch_worker_v2(
                     // printf("lane_id: %d, src_rdma_channel_prefix: %d, src_rdma_channel_prefix_1: %d, num_tokens_to_recv_from_rdma: %d num_channels: %d channel_id: %d\n", lane_id, src_rdma_channel_prefix, src_rdma_channel_prefix_1, num_tokens_to_recv_from_rdma, num_channels, channel_id);
                     // }
                     recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
+                    // Save per-channel token count (non-cumulative) for combine Forwarder
+                    state->recv_rdma_channel_token_count[lane_id * num_channels + channel_id] = num_tokens_to_recv_from_rdma;
+                    __threadfence_system();  // Ensure prefix_matrix and token_count visible before NVL Receiver signals done
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
                     break;
@@ -796,6 +807,11 @@ __device__ void dispatch_worker_v2(
                     auto cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
                     rdma_nvl_token_idx += is_in_dst_nvl_rank;
                     send_nvl_head[i * NUM_MAX_NVL_PEERS] = cached_head;
+                    // if (cached_head >= 0) {
+                    //     printf("[MK-DEBUG][DISPATCH-NVL-HEAD-WRITE] rank=%d ch=%d dst_nvl=%d token_global_idx=%d peer_offset=%d cached_head=%d\n",
+                    //            state->rank, channel_id, dst_nvl_rank, (int)(send_nvl_head - state->send_nvl_head) / NUM_MAX_NVL_PEERS + i,
+                    //            i, cached_head);
+                    // }
                 }
                 if (not is_in_dst_nvl_rank)
                     continue;
@@ -834,8 +850,9 @@ __device__ void dispatch_worker_v2(
 
         // Retired
         __syncwarp();
-        if (elect_one_sync())
+        if (elect_one_sync()) {
             forward_channel_retired[dst_nvl_rank] = true;
+        }
 
     // ========== kForwarderCoordinator ==========
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
@@ -908,6 +925,19 @@ __device__ void dispatch_worker_v2(
         // Save for combine usage
         if (lane_id < kNumRDMARanks)
             recv_gbl_channel_prefix_matrix[(lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id] = total_offset;
+        // Save per-channel token count (non-cumulative) for combine NVL Sender
+        if (lane_id < kNumRDMARanks) {
+            int idx = (lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id;
+            int count = end_offset - start_offset;
+            state->recv_gbl_channel_token_count[idx] = count;
+        }
+        // DIAG: log what we write into gbl_channel_prefix_matrix and token count
+        if (lane_id < kNumRDMARanks) {
+            int idx = (lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id;
+            int count = end_offset - start_offset;
+            // printf("[MK-DIAG][DISPATCH-GBL-PREFIX-WRITE] rank=%d ch=%d src_nvl=%d lane(rdma)=%d idx=%d total_offset=%d token_count=%d\n",
+            //        state->rank, channel_id, src_nvl_rank, lane_id, idx, total_offset, count);
+        }
         __syncwarp();
 
         // printf("NVLReceivers: num_tokens_to_recv: %d\n", num_tokens_to_recv);
@@ -1010,9 +1040,12 @@ __device__ void dispatch_worker_v2(
         }
 
         // Signal dispatch done after all NVL receiver warps on this rank have finished.
+        // This is the correct location: NVL Receiver writes gbl_channel_prefix_matrix and
+        // gbl_channel_token_count (L929-934), so it must be the one to signal channel_dispatch_done.
         __syncwarp();
         if (lane_id == 0) {
-            __threadfence_system();  // Ensure all expert_recv_count writes are visible before signaling done
+            __threadfence_system();  // Ensure prefix/count writes visible before signaling
+            atomicAdd(&state->channel_dispatch_done[channel_id], 1);
             int done_count = atomicAdd(state->dispatch_done_count, 1) + 1;
             if (done_count == state->expected_dispatch_done_count)
                 st_release_sys_global(state->dispatch_done, 1);
@@ -1037,10 +1070,10 @@ __device__ void compute_worker(
     constexpr int COMPUTE_BATCH_SIZE = 10;
 
     // Each compute SM handles a subset of experts (round-robin)
-#ifdef MK_TOKEN_TRACE
-    if (thread_id == 0)
-        printf("[MK-TOKEN][COMPUTE-WORKER] rank=%d sm=%d num_local_experts=%d compute_sm_idx=%d num_compute_sms=%d\n", state->rank, sm_id, num_local_experts, compute_sm_idx, num_compute_sms);
-#endif
+// #ifdef MK_TOKEN_TRACE
+//     if (thread_id == 0)
+//         printf("[MK-TOKEN][COMPUTE-WORKER] rank=%d sm=%d num_local_experts=%d compute_sm_idx=%d num_compute_sms=%d\n", state->rank, sm_id, num_local_experts, compute_sm_idx, num_compute_sms);
+// #endif
 
     for (int expert_id = compute_sm_idx; expert_id < num_local_experts; expert_id += num_compute_sms) {
         int computed_so_far = 0;
@@ -1082,7 +1115,7 @@ __device__ void compute_worker(
 
 #ifdef MK_PERF_TRACE
             if (computed_so_far == 0 && expert_id == compute_sm_idx && thread_id == 0 && sm_id < state->perf_total_sms)
-                state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = clock64();
+                state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
 #endif
 
             // Simulate compute with sleep (~100us per batch)
@@ -1139,116 +1172,47 @@ __device__ void combine_worker_v2(
     const int num_tokens = state->combine_num_tokens;
     const int num_combined_tokens = state->combine_num_combined_tokens;
     const int num_channels = state->num_combine_channels;
+    EP_DEVICE_ASSERT(num_channels == state->num_dispatch_channels);  // must match for per-channel overlap
     const int num_ranks = state->num_ranks;
     constexpr int kNumRDMARanks_C = MK_NUM_RDMA_RANKS;
     const int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
 
-    // Phase 1: Head normalization can start as soon as dispatch is done (does not depend on compute)
-    // Wait for dispatch_done first
-    if (threadIdx.x == 0) {
-        auto start_time = clock64();
-        while (ld_acquire_sys_global(state->dispatch_done) == 0) {
-            if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                printf("MK combine dispatch_done wait timeout, rank=%d block=%d combine_sm=%d\n",
-                       state->rank, blockIdx.x, combine_sm_idx);
-                trap();
-            }
-            __nanosleep(100);
-        }
-    }
-    __syncthreads();
+    // ---- Overlap design (v2: per-channel compute-combine overlap) ----
+    // Per-channel pipeline: dispatch(ch) -> normalize(ch) -> combine(ch)
+    // Sender SM (even): warp0 does head normalization after channel's dispatch is done,
+    //                   then signals channel_normalized. All warps then proceed.
+    // Forwarder SM (odd): waits channel_normalized, then uses normalized heads.
 
-#ifdef MK_PERF_TRACE
-    {
-        int perf_sm_id = state->num_dispatch_sms + combine_sm_idx;
-        if (threadIdx.x == 0 && perf_sm_id < state->perf_total_sms)
-            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = clock64();
-    }
-#endif
+    // DEBUG: very first entry point (unconditional, one per SM)
+    // if (threadIdx.x == 0)
+    //     printf("[MK-DEBUG][COMBINE-ENTRY] rank=%d block=%d combine_sm=%d is_forwarder_sm=%d\n",
+    //            state->rank, blockIdx.x, combine_sm_idx, combine_sm_idx % 2 == 1);
 
-    // Head normalization (only depends on dispatch outputs, not compute)
-    if (combine_sm_idx == 0) {
-        const int* combined_rdma_head_src = state->combined_rdma_head;
-        const int* combined_nvl_head_src = state->combined_nvl_head;
-        int* combined_rdma_head_mut = state->combine_rdma_head_work;
-        int* combined_nvl_head_mut = state->combine_nvl_head_work;
-        const int* rdma_channel_prefix_matrix = state->combine_rdma_channel_prefix_matrix;
-        const int* rdma_rank_prefix_sum = state->combine_rdma_rank_prefix_sum;
-
-        for (int lane = threadIdx.x; lane < kNumRDMARanks_C * num_channels; lane += blockDim.x) {
-            int rdma_lane = lane / num_channels;
-            int channel = lane % num_channels;
-            int token_start_idx = 0, token_end_idx = 0;
-            get_channel_task_range(num_combined_tokens, num_channels, channel, token_start_idx, token_end_idx);
-
-            int last_head = 1 << 25;
-            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                const int* src_head_ptr = combined_rdma_head_src + token_idx * kNumRDMARanks_C + rdma_lane;
-                int* dst_head_ptr = combined_rdma_head_mut + token_idx * kNumRDMARanks_C + rdma_lane;
-                int current_head = ld_nc_global(src_head_ptr);
-                int normalized_head = current_head < 0 ? -last_head - 1 : current_head;
-                st_na_global(dst_head_ptr, normalized_head);
-                if (current_head >= 0)
-                    last_head = current_head;
-            }
-        }
-
-        for (int linear = threadIdx.x; linear < kNumRDMARanks_C * num_channels * NUM_MAX_NVL_PEERS; linear += blockDim.x) {
-            int dst_nvl_rank = linear % NUM_MAX_NVL_PEERS;
-            int channel = (linear / NUM_MAX_NVL_PEERS) % num_channels;
-            int dst_rdma_rank = linear / (NUM_MAX_NVL_PEERS * num_channels);
-            int token_start_idx = channel == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel - 1];
-            int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel];
-            int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-            token_start_idx += shift;
-            token_end_idx += shift;
-
-            int last_head = 1 << 25;
-            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                const int* src_head_ptr = combined_nvl_head_src + token_idx * NUM_MAX_NVL_PEERS + dst_nvl_rank;
-                int* dst_head_ptr = combined_nvl_head_mut + token_idx * NUM_MAX_NVL_PEERS + dst_nvl_rank;
-                int current_head = ld_nc_global(src_head_ptr);
-                int normalized_head = current_head < 0 ? -last_head - 1 : current_head;
-                st_na_global(dst_head_ptr, normalized_head);
-                if (current_head >= 0)
-                    last_head = current_head;
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0)
-            st_release_sys_global(state->combine_notify_done, 1);
-    } else if (threadIdx.x == 0) {
-        auto start_time = clock64();
-        while (ld_acquire_sys_global(state->combine_notify_done) == 0) {
-            if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
-                printf("MK combine notify wait timeout, rank=%d block=%d combine_sm=%d notify_done=%d\n",
-                       state->rank, blockIdx.x, combine_sm_idx, ld_volatile_global(state->combine_notify_done));
-                trap();
-            }
-            __nanosleep(100);
-        }
-    }
-    __syncthreads();
-
-#ifdef MK_PERF_TRACE
-    {
-        int perf_sm_id = state->num_dispatch_sms + combine_sm_idx;
-        if (threadIdx.x == 0 && perf_sm_id < state->perf_total_sms)
-            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = clock64();
-    }
-#endif
-
-    // Per-token readiness is now checked by NVL sender inline; no need for global barrier.
-    // Signal scatter_done for compatibility
-    if (combine_sm_idx == 0 && threadIdx.x == 0)
+    // Signal scatter_done immediately for compatibility (no longer gated on head normalization)
+    if (combine_sm_idx == 1 && threadIdx.x == 0)
         st_release_sys_global(state->scatter_done, 1);
-    __syncthreads();
 
 #ifdef MK_PERF_TRACE
     {
         int perf_sm_id = state->num_dispatch_sms + combine_sm_idx;
         if (threadIdx.x == 0 && perf_sm_id < state->perf_total_sms)
-            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 3] = clock64();
+            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
+    }
+#endif
+
+#ifdef MK_PERF_TRACE
+    {
+        int perf_sm_id = state->num_dispatch_sms + combine_sm_idx;
+        if (threadIdx.x == 0 && perf_sm_id < state->perf_total_sms)
+            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = globaltimer_ns();
+    }
+#endif
+
+#ifdef MK_PERF_TRACE
+    {
+        int perf_sm_id = state->num_dispatch_sms + combine_sm_idx;
+        if (threadIdx.x == 0 && perf_sm_id < state->perf_total_sms)
+            state->perf_phase_ts[perf_sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 3] = globaltimer_ns();
     }
 #endif
 
@@ -1280,7 +1244,10 @@ __device__ void combine_worker_v2(
 
     const auto nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
 
-    // DEBUG: Entry log (once per SM, thread 0 only)
+    // DIAG: Combine entry (once per kernel for sm=0)
+    // if (thread_id == 0 && sm_id == 0)
+    //     printf("[MK-DIAG][COMBINE-ENTRY] rank=%d num_tokens(recv)=%d num_combined_tokens(orig)=%d num_channels=%d num_ranks=%d\n",
+    //            state->rank, num_tokens, num_combined_tokens, num_channels, num_ranks);
     // if (thread_id == 0) {
     //     printf("[MK-DIAG][COMBINE][SM-ENTRY] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d is_forwarder_sm=%d num_tokens=%d num_combined_tokens=%d num_channels=%d hidden=%d hidden_int4=%d hidden_bytes=%d num_topk=%d num_bytes_per_token=%d num_dispatch_sms=%d num_combine_sms=%d num_compute_sms=%d\n",
     //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, is_forwarder_sm,
@@ -1343,14 +1310,101 @@ __device__ void combine_worker_v2(
     float* combined_topk_weights = state->combined_topk_weights;
     const int4* x = reinterpret_cast<const int4*>(state->combine_x);
     const float* topk_weights = state->combine_topk_weights;
-    const int* combined_rdma_head = state->combine_rdma_head_work;
-    int* combined_nvl_head = state->combine_nvl_head_work;
+    const int* combined_rdma_head = state->combined_rdma_head;     // Will be normalized in-place
+    int* combined_nvl_head = state->combined_nvl_head;             // Will be normalized in-place
     const SourceMeta* src_meta = reinterpret_cast<const SourceMeta*>(state->combine_src_meta);
     const int* rdma_channel_prefix_matrix = state->combine_rdma_channel_prefix_matrix;
     const int* rdma_rank_prefix_sum = state->combine_rdma_rank_prefix_sum;
     const int* gbl_channel_prefix_matrix = state->combine_gbl_channel_prefix_matrix;
     void* rdma_buffer_ptr = state->combine_rdma_buffer_ptr;
     void** buffer_ptrs = state->combine_buffer_ptrs;
+
+    // --- Per-channel head normalization (done by Coordinator on Sender SM) ---
+    // All warps on this SM wait for channel_normalized[channel_id] before proceeding
+    // except the Coordinator on the Sender SM which performs the normalization.
+    if (!is_forwarder_sm && warp_role == WarpRole::kCoordinator) {
+        // Step 1: Wait for this channel's dispatch to complete
+        if (lane_id == 0) {
+            auto start_time = clock64();
+            while (ld_acquire_sys_global(&state->channel_dispatch_done[channel_id]) < NUM_MAX_NVL_PEERS) {
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("MK combine normalizer timeout waiting for channel_dispatch_done[%d], got %d\n",
+                           channel_id, ld_acquire_sys_global(&state->channel_dispatch_done[channel_id]));
+                    trap();
+                }
+                __nanosleep(32);
+            }
+        }
+        __syncwarp();
+
+        // Step 2: Normalize combined_rdma_head for this channel's token range
+        {
+            int token_start_idx, token_end_idx;
+            get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+            if (lane_id < kNumRDMARanks_C) {
+                int last_head = 1 << 25;
+                for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                    auto current_head = ld_acquire_sys_global(
+                        const_cast<int*>(combined_rdma_head) + token_idx * kNumRDMARanks_C + lane_id);
+                    if (current_head < 0) {
+                        const_cast<int*>(combined_rdma_head)[token_idx * kNumRDMARanks_C + lane_id] = -last_head - 1;
+                    } else {
+                        last_head = current_head;
+                    }
+                }
+            }
+        }
+        __syncwarp();
+
+        // Step 3: Normalize combined_nvl_head per dst_rdma_rank for this channel
+        {
+            for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks_C; ++dst_rdma_rank) {
+                // Use per-channel token count to avoid cross-channel read of rdma_channel_prefix_matrix[ch-1]
+                int rdma_prefix_end = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+                int token_count = state->combine_rdma_channel_token_count[dst_rdma_rank * num_channels + channel_id];
+                int token_start_idx = rdma_prefix_end - token_count;
+                int token_end_idx = rdma_prefix_end;
+                int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+                token_start_idx += shift;
+                token_end_idx += shift;
+
+                if (lane_id < NUM_MAX_NVL_PEERS) {
+                    int last_head = 1 << 25;
+                    for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                        auto current_head = ld_acquire_sys_global(
+                            combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+                        if (current_head < 0) {
+                            combined_nvl_head[token_idx * NUM_MAX_NVL_PEERS + lane_id] = -last_head - 1;
+                        } else {
+                            last_head = current_head;
+                        }
+                    }
+                }
+                __syncwarp();
+            }
+        }
+
+        // Step 4: Signal normalization complete
+        __threadfence_system();
+        if (lane_id == 0)
+            st_release_sys_global(&state->channel_normalized[channel_id], 1);
+    }
+
+    // All warps (except the sender-SM coordinator that just signaled) wait for normalization
+    if (warp_role != WarpRole::kCoordinator || is_forwarder_sm) {
+        if (lane_id == 0) {
+            auto start_time = clock64();
+            while (ld_acquire_sys_global(&state->channel_normalized[channel_id]) == 0) {
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    printf("MK combine warp timeout waiting for channel_normalized[%d], role=%d\n",
+                           channel_id, (int)warp_role);
+                    trap();
+                }
+                __nanosleep(32);
+            }
+        }
+        __syncwarp();
+    }
 
     if (warp_role == WarpRole::kNVLSender) {
         // ========== NVL Sender (direct port from internode.cu L1784-1922) ==========
@@ -1381,17 +1435,16 @@ __device__ void combine_worker_v2(
         }
         __syncwarp();
 
-        // Get tasks for each RDMA lane
+        // Get tasks for each RDMA lane — use per-channel token count to avoid cross-channel dependency
         int token_start_idx = 0, token_end_idx = 0;
         if (lane_id < kNumRDMARanks_C) {
             int prefix_idx = (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_channels + channel_id;
             token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
-            token_end_idx = (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
-            // printf("[MK-DIAG][COMBINE][NVL-SENDER][LANE-RANGE] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d lane=%d src_rdma_lane=%d prefix_idx=%d token_range=[%d,%d) count=%d gbl_prefix_addr=%p nvl_x_base=%p nvl_head_ptr=%p nvl_tail_ptr=%p\n",
-            //        state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank,
-            //        lane_id, lane_id, prefix_idx, token_start_idx, token_end_idx, token_end_idx - token_start_idx,
-            //        gbl_channel_prefix_matrix + prefix_idx, nvl_channel_x.buffer(), nvl_channel_head.buffer() + lane_id,
-            //        nvl_channel_tail.buffer() + lane_id);
+            int count = state->combine_gbl_channel_token_count[prefix_idx];
+            token_end_idx = token_start_idx + count;
+            // printf("[MK-DIAG][NVL-SENDER-TASK] rank=%d ch=%d dst_nvl=%d lane=%d prefix_idx=%d token_range=[%d,%d) count=%d num_tokens=%d gbl_prefix=%d\n",
+            //        state->rank, channel_id, dst_nvl_rank, lane_id, prefix_idx,
+            //        token_start_idx, token_end_idx, count, num_tokens, gbl_channel_prefix_matrix[prefix_idx]);
         }
         __syncwarp();
 
@@ -1461,11 +1514,16 @@ __device__ void combine_worker_v2(
                 for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
                     // Poll: wait until this token's scatter is complete
                     if (elect_one_sync()) {
+                        // DIAG: Log what token_idx NVL sender is polling
+                        // if (chunk_idx == 0)
+                        //     printf("[MK-DIAG][NVL-SENDER-POLL] rank=%d ch=%d dst_nvl=%d rdma_idx=%d token_idx=%lld scatter_ready=%d\n",
+                        //            state->rank, channel_id, dst_nvl_rank, current_rdma_idx,
+                        //            (long long)token_idx, ld_acquire_sys_global(&state->scatter_token_ready[token_idx]));
                         auto wait_start = clock64();
                         while (ld_acquire_sys_global(&state->scatter_token_ready[token_idx]) == 0) {
                             if (clock64() - wait_start > NUM_TIMEOUT_CYCLES) {
-                                printf("MK combine NVL sender token_ready timeout, ch: %d, dst_nvl: %d, token: %lld\n",
-                                       channel_id, dst_nvl_rank, (long long)token_idx);
+                                printf("MK combine NVL sender token_ready timeout, ch: %d, dst_nvl: %d, token: %lld, max_total_recv=%d\n",
+                                       channel_id, dst_nvl_rank, (long long)token_idx, state->max_total_recv_tokens);
                                 trap();
                             }
                             __nanosleep(32);
@@ -1523,10 +1581,21 @@ __device__ void combine_worker_v2(
 
             tma_store_wait<0>();
             __syncwarp();
-            if (lane_id < kNumRDMARanks_C and is_lane_ready)
+            if (lane_id < kNumRDMARanks_C and is_lane_ready) {
+                // if (channel_id == 0 && lane_id == 0)
+                //     printf("[MK-DEBUG][NVL-SENDER-TAIL-WRITE] rank=%d nvl_rank=%d dst_nvl=%d ch=%d "
+                //            "lane=%d tail_val=%d tail_ptr=%p\n",
+                //            state->rank, nvl_rank, dst_nvl_rank, channel_id,
+                //            lane_id, cached_channel_tail_idx, (void*)(nvl_channel_tail.buffer() + lane_id));
                 st_release_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
+            }
         }
     } else {
+        // if (threadIdx.x == 0) {
+        //     printf("[MK-DEBUG][FWD-ENTER] rank=%d nvl_rank=%d block=%d combine_sm=%d\n",
+        //                state->rank, nvl_rank, blockIdx.x, sm_id);
+        // }
+
         // ========== Forwarder SM: NVLAndRDMAForwarder + RDMAReceiver + Coordinator ==========
         // (direct port from internode.cu L1923-2269)
 
@@ -1600,9 +1669,9 @@ __device__ void combine_worker_v2(
             sync_forwarder_smem();
 
             int cached_nvl_channel_tail_idx = 0;
-            int num_tokens_to_combine = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
-            int num_tokens_prefix = channel_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
-            num_tokens_to_combine -= num_tokens_prefix;
+            // Use per-channel token count to avoid cross-channel read of rdma_channel_prefix_matrix[ch-1]
+            int num_tokens_to_combine = state->combine_rdma_channel_token_count[dst_rdma_rank * num_channels + channel_id];
+            int num_tokens_prefix = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - num_tokens_to_combine;
             num_tokens_prefix += dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
             combined_nvl_head += num_tokens_prefix * NUM_MAX_NVL_PEERS;
 
@@ -1682,24 +1751,26 @@ __device__ void combine_worker_v2(
                 sync_large_warp();
 
                 for (int token_idx = token_start_idx + sub_warp_id; token_idx < token_end_idx; token_idx += kNumWarpsPerForwarder_C) {
+                    // Read normalized head (original DeepEP logic)
                     int expected_head = -1;
                     if (lane_id < NUM_MAX_NVL_PEERS) {
-                        expected_head = ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+                        expected_head = ld_acquire_sys_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+                        // Normalized semantics: negative = -(next_valid_head)-1, positive = actual head
                         expected_head < 0 ? (forwarder_nvl_head[warp_id][lane_id] = -expected_head - 1)
                                           : (forwarder_nvl_head[warp_id][lane_id] = expected_head);
                     }
 
-                    // if (channel_id == 4 && lane_id < NUM_MAX_NVL_PEERS && (dst_rdma_rank == 0 || (num_tokens_prefix + token_idx) >= 88 && (num_tokens_prefix + token_idx) <= 110)) {
-                    //     int global_token_idx = num_tokens_prefix + token_idx;
-                    //     int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
-                    //     printf("[MK-TRACE][COMBINE][FWD-NVL-PLAN-CH4] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d lane=%d src_nvl_rank=%d local_token=%d global_token=%d expected_head=%d encoded_progress=%d cached_tail=%d nvl_head_addr=%p nvl_tail_addr=%p nvl_x_base=%p send_buffer=%p\n",
-                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                    //            dst_rdma_rank, sub_warp_id, lane_id, lane_id, token_idx, global_token_idx,
-                    //            expected_head, encoded_progress, cached_nvl_channel_tail_idx,
-                    //            combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id,
-                    //            nvl_channel_tail.buffer(lane_id), nvl_channel_x.buffer(lane_id), send_buffer);
+                    // DEBUG: first token, first sub_warp
+                    // if (token_idx == token_start_idx && sub_warp_id == 0 && lane_id < NUM_MAX_NVL_PEERS && channel_id == 0) {
+                    //     printf("[MK-DEBUG][FWD-NVL-HEAD-READ] rank=%d nvl_rank=%d ch=%d warp=%d dst_rdma=%d "
+                    //            "token=%d lane=%d expected_head=%d cached_tail=%d nvl_head_addr=%p\n",
+                    //            state->rank, nvl_rank, channel_id, warp_id, dst_rdma_rank,
+                    //            token_idx, lane_id, expected_head, cached_nvl_channel_tail_idx,
+                    //            (void*)(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id));
                     // }
+
                     start_time = clock64();
+                    // Wait for NVL tail to advance past expected_head (original DeepEP logic)
                     while (cached_nvl_channel_tail_idx <= expected_head) {
                         cached_nvl_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
 
@@ -1808,6 +1879,9 @@ __device__ void combine_worker_v2(
             }
 
             __syncwarp();
+            // Set INT_MAX before retiring so Coordinator won't be blocked by this warp
+            if (lane_id < NUM_MAX_NVL_PEERS)
+                forwarder_nvl_head[warp_id][lane_id] = std::numeric_limits<int>::max();
             if (elect_one_sync())
                 forwarder_retired[warp_id] = true;
 
@@ -1819,7 +1893,10 @@ __device__ void combine_worker_v2(
 
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
-            // printf("combine receiver: sm_id: %d num_tokens: %d num_channels: %d channel_id: %d token_start_idx: %d, token_end_idx: %d\n", sm_id, num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+            // DIAG: RDMA Receiver token range
+            // if (lane_id == 0 && warp_id == 0)
+            //     printf("[MK-DIAG][RDMA-RECV-RANGE] rank=%d ch=%d token_range=[%d,%d) num_combined_tokens=%d\n",
+            //            state->rank, channel_id, token_start_idx, token_end_idx, num_combined_tokens);
 
             // DEBUG: RDMA receiver entry
             // if (lane_id < kNumRDMARanks_C)
@@ -1833,22 +1910,14 @@ __device__ void combine_worker_v2(
             for (int64_t token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumRDMAReceivers_C) {
                 int expected_head = -1;
                 if (lane_id < kNumRDMARanks_C) {
-                    expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
-                    // int encoded_progress = expected_head < 0 ? -expected_head - 1 : expected_head;
-                    // int tail_snapshot = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-                    // printf("[MK-TRACE][COMBINE][RDMA-RECEIVER][PLAN] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d lane=%d token=%lld token_range=[%d,%d) expected_head=%d encoded_progress=%d cached_tail=%d tail_snapshot=%d ready=%d combined_rdma_head_addr=%p combined_x=%p combined_topk_weights=%p rdma_tail_addr=%p rdma_recv_buffer=%p\n",
-                    //        state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, lane_id, (long long)token_idx,
-                    //        token_start_idx, token_end_idx, expected_head, encoded_progress, cached_channel_tail_idx,
-                    //        tail_snapshot, tail_snapshot > expected_head,
-                    //        combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id,
-                    //        combined_x + token_idx * hidden_int4,
-                    //        combined_topk_weights + token_idx * num_topk,
-                    //        rdma_channel_tail.buffer(lane_id), rdma_channel_data.recv_buffer(lane_id));
-                    (expected_head < 0) ? (rdma_receiver_rdma_head[warp_id][lane_id] = -expected_head - 1)
-                                        : (rdma_receiver_rdma_head[warp_id][lane_id] = expected_head);
+                    expected_head = ld_acquire_sys_global(combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
+                    // Normalized semantics: negative = -(next_valid_head)-1, positive = actual head
+                    expected_head < 0 ? (rdma_receiver_rdma_head[warp_id][lane_id] = -expected_head - 1)
+                                      : (rdma_receiver_rdma_head[warp_id][lane_id] = expected_head);
                 }
 
                 auto start_time = clock64();
+                // Wait for RDMA tail (normalized heads: always wait, negative heads skip via large value)
                 while (cached_channel_tail_idx <= expected_head) {
                     cached_channel_tail_idx = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
 
@@ -1860,13 +1929,13 @@ __device__ void combine_worker_v2(
                         printf("MK combine RDMA receiver timeout, rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d ch=%d warp=%d token=%lld token_range=[%d,%d) expected_head=%d cached_tail=%d tail_snapshot=%d rdma_tail_ptr=%p lane=%d tail0=%d tail1=%d head0=%d head1=%d tail0_ptr=%p tail1_ptr=%p head0_ptr=%p head1_ptr=%p rdma_recv_buffer_lane=%p combined_rdma_head_addr=%p\n",
                                state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id, (long long)token_idx,
                                token_start_idx, token_end_idx, expected_head, cached_channel_tail_idx,
-                               static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))),
-                               (void*)rdma_channel_tail.buffer(lane_id), lane_id, tail0, tail1, head0, head1,
-                               rdma_channel_tail.buffer(0), rdma_channel_tail.buffer(1),
-                               rdma_channel_head.buffer(0), rdma_channel_head.buffer(1),
-                               rdma_channel_data.recv_buffer(lane_id),
-                               combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
-                        trap();
+                           static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id))),
+                           (void*)rdma_channel_tail.buffer(lane_id), lane_id, tail0, tail1, head0, head1,
+                           rdma_channel_tail.buffer(0), rdma_channel_tail.buffer(1),
+                           rdma_channel_head.buffer(0), rdma_channel_head.buffer(1),
+                           rdma_channel_data.recv_buffer(lane_id),
+                           combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
+                    trap();
                     }
                 }
                 __syncwarp();
@@ -1953,6 +2022,9 @@ __device__ void combine_worker_v2(
             }
 
             __syncwarp();
+            // Set INT_MAX before retiring so Coordinator won't be blocked by this warp
+            if (lane_id < kNumRDMARanks_C)
+                rdma_receiver_rdma_head[warp_id][lane_id] = std::numeric_limits<int>::max();
             if (elect_one_sync())
                 rdma_receiver_retired[warp_id] = true;
 
@@ -2061,31 +2133,31 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
     switch (role) {
         case SmRole::kDispatch:
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = globaltimer_ns();
 #endif
             dispatch_worker_v2(sm_id, role_idx, state);
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
 #endif
             break;
 
         case SmRole::kCombine:
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = globaltimer_ns();
 #endif
             combine_worker_v2(role_idx, state);
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 4] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 4] = globaltimer_ns();
 #endif
             break;
 
         case SmRole::kCompute:
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 0] = globaltimer_ns();
 #endif
             compute_worker(sm_id, role_idx, num_compute_sms, state, smem_wmma_buf);
 #ifdef MK_PERF_TRACE
-            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = clock64();
+            if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = globaltimer_ns();
 #endif
             break;
 
@@ -2185,10 +2257,17 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     }
     if (base_ts == std::numeric_limits<int64_t>::max()) base_ts = 0;
 
+    // globaltimer_ns() already returns nanoseconds; convert to us for Perfetto.
+    // Use per-rank min as base so trace starts near 0; for cross-rank comparison,
+    // use aggregate_mk_perf_traces.py which aligns rank baselines.
+
     char filename[256];
     snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d.json", host_state.rank);
     FILE* f = fopen(filename, "w");
     if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
+
+    // Also write raw base_ts so post-processing can re-align ranks
+    printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
 
     fprintf(f, "[\n");
     bool first = true;
@@ -2198,18 +2277,24 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     };
     auto emit_event = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid) {
         if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_us = (start - base_ts) / 1000;
-        int64_t dur_us = (end - start) / 1000;
-        if (dur_us <= 0) dur_us = 1;
+        // Output in nanoseconds (Perfetto supports "displayTimeUnit":"ns" but default is us)
+        // We use microseconds with fractional part via integer division
+        int64_t ts_ns = start - base_ts;
+        int64_t dur_ns = end - start;
+        if (dur_ns <= 0) dur_ns = 1;
         emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%lld,\"dur\":%lld,\"pid\":%d,\"tid\":%d}",
-                name, cat, (long long)ts_us, (long long)dur_us, pid, tid);
+        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d}",
+                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid);
     };
 
     // Process/thread metadata
     emit_comma();
     fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}}",
             host_state.rank, host_state.rank);
+    // Embed base_ts_ns for cross-rank alignment by aggregate script
+    emit_comma();
+    fprintf(f, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":%lld}}",
+            host_state.rank, (long long)base_ts);
 
     for (int i = 0; i < dump_sms; ++i) {
         const char* role;
@@ -2237,10 +2322,17 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
             emit_event("dispatch", "dispatch", p[0], p[1], pid, i);
         } else if (i < num_dispatch_sms + num_combine_sms) {
             // Combine phases:
-            // [0]=enter, [1]=dispatch_done_acquired, [2]=head_norm_done, [3]=combine_protocol_start, [4]=exit
-            emit_event("wait_dispatch", "combine", p[0], p[1], pid, i);
-            emit_event("head_norm", "combine", p[1], p[2], pid, i);
-            emit_event("combine_protocol", "combine", p[3], p[4], pid, i);
+            // [0]=enter, [1]=dispatch_done_acquired (or immediate for NVL sender), [2]=head_norm_done (or immediate), [3]=combine_protocol_start, [4]=exit
+            int combine_sm_idx = i - num_dispatch_sms;
+            if (combine_sm_idx % 2 == 0) {
+                // NVL Sender SM (even): no wait_dispatch/head_norm, directly polls scatter_token_ready
+                emit_event("combine_send", "combine_nvl", p[2], p[4], pid, i);
+            } else {
+                // Forwarder SM (odd): waits dispatch_done + head_norm
+                emit_event("wait_dispatch", "combine_fwd", p[0], p[1], pid, i);
+                emit_event("head_norm", "combine_fwd", p[1], p[2], pid, i);
+                emit_event("combine_protocol", "combine_fwd", p[3], p[4], pid, i);
+            }
         } else {
             // Compute: [0]=enter, [1]=first_batch_start, [2]=exit
             emit_event("poll_wait", "compute", p[0], p[1], pid, i);
@@ -2390,12 +2482,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     // send_rdma_head: same as DeepEP {num_tokens, num_rdma_ranks}
     CUDA_CHECK(cudaMalloc(&send_rdma_head, num_tokens * num_rdma_ranks * sizeof(int)));
-    CUDA_CHECK(cudaMemset(send_rdma_head, 0, num_tokens * num_rdma_ranks * sizeof(int)));
+    CUDA_CHECK(cudaMemset(send_rdma_head, 0xFF, num_tokens * num_rdma_ranks * sizeof(int)));  // Init to -1
     // send_nvl_head: same as DeepEP {num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}
     // In megakernel we don't have num_rdma_recv_tokens at alloc time, use num_tokens * num_topk as upper bound
     int num_rdma_recv_tokens_ub = num_tokens * num_topk;
     CUDA_CHECK(cudaMalloc(&send_nvl_head, num_rdma_recv_tokens_ub * NUM_MAX_NVL_PEERS * sizeof(int)));
-    CUDA_CHECK(cudaMemset(send_nvl_head, 0, num_rdma_recv_tokens_ub * NUM_MAX_NVL_PEERS * sizeof(int)));
+    CUDA_CHECK(cudaMemset(send_nvl_head, 0xFF, num_rdma_recv_tokens_ub * NUM_MAX_NVL_PEERS * sizeof(int)));  // Init to -1 (all bits set)
     CUDA_CHECK(cudaMalloc(&combine_rdma_head_work, num_tokens * num_rdma_ranks * sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_rdma_head_work, 0, num_tokens * num_rdma_ranks * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&combine_nvl_head_work, num_rdma_recv_tokens_ub * NUM_MAX_NVL_PEERS * sizeof(int)));
@@ -2403,13 +2495,30 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     // Recv channel prefix matrices (written by forwarder)
     int num_channels = num_dispatch_sms / 2;  // even/odd pairing
+    int num_combine_channels = num_combine_sms / 2;
 
     printf("num_tokens: %d, um_rdma_ranks: %d, num_channels: %d\n", num_tokens, num_rdma_ranks, num_channels);
+
+    // Per-channel overlap signaling
+    int* channel_dispatch_done;
+    int* channel_normalized;
+    CUDA_CHECK(cudaMalloc(&channel_dispatch_done, num_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(channel_dispatch_done, 0, num_channels * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&channel_normalized, num_combine_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(channel_normalized, 0, num_combine_channels * sizeof(int)));
 
     CUDA_CHECK(cudaMalloc(&recv_rdma_channel_prefix_matrix, num_rdma_ranks * num_channels * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_rdma_channel_prefix_matrix, 0, num_rdma_ranks * num_channels * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&recv_gbl_channel_prefix_matrix, num_ranks * num_channels * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_gbl_channel_prefix_matrix, 0, num_ranks * num_channels * sizeof(int)));
+
+    // Per-channel token counts (non-cumulative) for per-channel overlap
+    int* recv_rdma_channel_token_count;
+    int* recv_gbl_channel_token_count;
+    CUDA_CHECK(cudaMalloc(&recv_rdma_channel_token_count, num_rdma_ranks * num_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(recv_rdma_channel_token_count, 0, num_rdma_ranks * num_channels * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&recv_gbl_channel_token_count, num_ranks * num_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(recv_gbl_channel_token_count, 0, num_ranks * num_channels * sizeof(int)));
 
     // Build host-side state and copy to device
     MegaKernelState host_state;
@@ -2435,6 +2544,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.send_nvl_head = send_nvl_head;
     host_state.recv_rdma_channel_prefix_matrix = recv_rdma_channel_prefix_matrix;
     host_state.recv_gbl_channel_prefix_matrix = recv_gbl_channel_prefix_matrix;
+    host_state.recv_rdma_channel_token_count = recv_rdma_channel_token_count;
+    host_state.recv_gbl_channel_token_count = recv_gbl_channel_token_count;
 
     // Dimensions
     host_state.num_tokens = num_tokens;
@@ -2502,6 +2613,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.num_forwarder_sms = num_forwarder_sms;
     host_state.num_compute_sms = num_compute_sms;
     host_state.num_dispatch_channels = num_dispatch_sms / 2;  // even/odd SM pairing
+    host_state.channel_dispatch_done = channel_dispatch_done;
+    host_state.channel_normalized = channel_normalized;
 
     // Combine state
     host_state.num_combine_sms = num_combine_sms;
@@ -2532,6 +2645,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.combine_rdma_channel_prefix_matrix = recv_rdma_channel_prefix_matrix;
     host_state.combine_rdma_rank_prefix_sum = recv_rdma_rank_prefix_sum;
     host_state.combine_gbl_channel_prefix_matrix = recv_gbl_channel_prefix_matrix;
+    host_state.combine_gbl_channel_token_count = recv_gbl_channel_token_count;
+    host_state.combine_rdma_channel_token_count = recv_rdma_channel_token_count;
     host_state.combine_num_tokens = max_total_recv_tokens;
     host_state.combine_num_combined_tokens = num_tokens;
     host_state.combine_hidden = hidden_dim;  // in dtype units (bf16), not int4
@@ -2594,6 +2709,10 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.send_nvl_head));
     CUDA_CHECK(cudaFree(host_state.recv_rdma_channel_prefix_matrix));
     CUDA_CHECK(cudaFree(host_state.recv_gbl_channel_prefix_matrix));
+    CUDA_CHECK(cudaFree(host_state.recv_rdma_channel_token_count));
+    CUDA_CHECK(cudaFree(host_state.recv_gbl_channel_token_count));
+    CUDA_CHECK(cudaFree(host_state.channel_dispatch_done));
+    CUDA_CHECK(cudaFree(host_state.channel_normalized));
 #ifdef MK_PERF_TRACE
     CUDA_CHECK(cudaFree(host_state.perf_phase_ts));
 #endif

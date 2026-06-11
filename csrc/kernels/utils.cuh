@@ -101,6 +101,13 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t* ptr) {
     return ret;
 }
 
+// Global timer: consistent across all SMs within one GPU (nanoseconds)
+__device__ __forceinline__ int64_t globaltimer_ns() {
+    int64_t ret;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ret));
+    return ret;
+}
+
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));

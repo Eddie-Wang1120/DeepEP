@@ -2,6 +2,7 @@
 .gitignore
 LICENSE
 README.md
+deep_ep_cpp.cpython-312-x86_64-linux-gnu.so
 format.sh
 install.sh
 pyproject.toml
@@ -26,6 +27,7 @@ csrc/kernels/intranode.cu
 csrc/kernels/launch.cuh
 csrc/kernels/layout.cu
 csrc/kernels/megakernel.cu
+csrc/kernels/megakernel_v2.cu
 csrc/kernels/runtime.cu
 csrc/kernels/utils.cuh
 deep_ep/__init__.py
