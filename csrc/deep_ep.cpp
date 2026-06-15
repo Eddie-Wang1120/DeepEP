@@ -13,6 +13,17 @@
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
 
+namespace deep_ep::megakernel {
+void notify_dispatch_logical_prefix(
+    const bool* is_token_in_rank,
+    int num_ranks,
+    int num_tokens,
+    int num_logical_channels,
+    int* rdma_channel_prefix_matrix,
+    int* gbl_channel_prefix_matrix,
+    cudaStream_t stream);
+}
+
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
     int device_count;
@@ -1912,7 +1923,9 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
 
     // Config for buffer sizing, aligned with tests/test_megakernel_v7.py DeepEP config
-    const int num_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
+    const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
+    const int num_logical_channels = num_physical_channels * 2;
+    const int num_channels = num_logical_channels;
     const int num_max_rdma_chunked_send_tokens = 8;
     const int num_max_rdma_chunked_recv_tokens = 256;
     const int num_max_nvl_chunked_send_tokens = 8;
@@ -1942,6 +1955,8 @@ torch::Tensor Buffer::megakernel_forward(
     printf("jinheng debug: enter this v1\n");
 
     // Step 2: notify_dispatch — exchange metadata via NVSHMEM
+    auto physical_rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_physical_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto physical_gbl_channel_prefix_matrix = torch::empty({num_ranks, num_physical_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -1957,12 +1972,14 @@ torch::Tensor Buffer::megakernel_forward(
            num_tokens, hidden_int4, num_topk, num_experts, num_local_experts, rdma_buffer_ptr,
            buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
            moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
-    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p rdma_cpm=%p recv_rdma_prefix=%p gbl_cpm=%p recv_gbl_prefix=%p\n",
+    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p physical_rdma_cpm=%p logical_rdma_cpm=%p recv_rdma_prefix=%p physical_gbl_cpm=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
            rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
            num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
-           rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
+           physical_rdma_channel_prefix_matrix.data_ptr<int>(), rdma_channel_prefix_matrix.data_ptr<int>(),
+           recv_rdma_rank_prefix_sum.data_ptr<int>(), physical_gbl_channel_prefix_matrix.data_ptr<int>(),
            gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
 
+    // Original notify still uses physical channels because it also cleans/exchanges physical buffer metadata.
     internode::notify_dispatch(
         num_tokens_per_rank.data_ptr<int>(),
         moe_recv_counter_mapped,
@@ -1975,14 +1992,14 @@ torch::Tensor Buffer::megakernel_forward(
         is_token_in_rank.data_ptr<bool>(),
         num_tokens,
         0,  // num_worst_tokens
-        num_channels,
+        num_physical_channels,
         hidden_int4,
         0,  // num_scales (BF16, no FP8)
         num_topk + 1,  // MK-v7 uses num_topk+1 int slots (src_token_idx + topk_idx)
         1,  // expert_alignment
-        rdma_channel_prefix_matrix.data_ptr<int>(),
+        physical_rdma_channel_prefix_matrix.data_ptr<int>(),
         recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        gbl_channel_prefix_matrix.data_ptr<int>(),
+        physical_gbl_channel_prefix_matrix.data_ptr<int>(),
         recv_gbl_rank_prefix_sum.data_ptr<int>(),
         rdma_buffer_ptr,
         num_max_rdma_chunked_recv_tokens,
@@ -1994,6 +2011,16 @@ torch::Tensor Buffer::megakernel_forward(
         num_rdma_bytes,
         num_nvl_bytes,
         low_latency_mode);
+
+    // Megakernel consumes separate logical-channel prefix matrices.
+    megakernel::notify_dispatch_logical_prefix(
+        is_token_in_rank.data_ptr<bool>(),
+        num_ranks,
+        num_tokens,
+        num_logical_channels,
+        rdma_channel_prefix_matrix.data_ptr<int>(),
+        gbl_channel_prefix_matrix.data_ptr<int>(),
+        stream);
 
     printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
            rank, *moe_recv_counter, *moe_recv_rdma_counter);
