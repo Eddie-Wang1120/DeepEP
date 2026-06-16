@@ -80,6 +80,18 @@ __device__ int combine_token(bool is_token_in_rank,
             topk_ranks[num_topk_ranks++] = i;
         }
     EP_DEVICE_ASSERT(num_topk_ranks <= kMaxNumRanks);
+#ifdef MK_TOKEN_TRACE
+    if (lane_id == 0) {
+        int rank0 = num_topk_ranks > 0 ? topk_ranks[0] : -1;
+        int rank1 = num_topk_ranks > 1 ? topk_ranks[1] : -1;
+        int slot0 = num_topk_ranks > 0 ? slot_indices[0] : -1;
+        int slot1 = num_topk_ranks > 1 ? slot_indices[1] : -1;
+        printf("[MK-DIAG][COMBINE-TOKEN-ENTRY] lane=%d in_rank=%d head=%d topk_ranks=%d ranks=[%d,%d] slots=[%d,%d] hidden_int4=%d num_topk=%d max_recv=%d smem=%p phase=[%u,%u]\n",
+               lane_id, static_cast<int>(is_token_in_rank), head_idx, num_topk_ranks,
+               rank0, rank1, slot0, slot1, hidden_int4, num_topk, num_max_recv_tokens,
+               smem_ptr, tma_phase[0], tma_phase[1]);
+    }
+#endif
     EP_STATIC_ASSERT(not(kUseTMA and kMaybeWithBias), "TMA cannot be used by receiver warps");
     EP_STATIC_ASSERT(kNumStages == 2, "Only support 2 stages now");
 
@@ -99,6 +111,13 @@ __device__ int combine_token(bool is_token_in_rank,
         };
 
         // Prefetch
+#ifdef MK_TOKEN_TRACE
+        if (lane_id == 0) {
+            printf("[MK-DIAG][COMBINE-TOKEN-TMA-PREFETCH0] topk_ranks=%d bytes=%d mbar=[%p,%p] load0=%p store0=%p phase=[%u,%u]\n",
+                   num_topk_ranks, kNumTMALoadBytes, tma_mbarrier(0), tma_mbarrier(1),
+                   tma_load_buffer(0, 0), tma_store_buffer(0), tma_phase[0], tma_phase[1]);
+        }
+#endif
         if (lane_id < num_topk_ranks)
             tma_load_1d(
                 tma_load_buffer(0, lane_id), get_addr_fn(topk_ranks[lane_id], slot_indices[lane_id], 0), tma_mbarrier(0), kNumTMALoadBytes);
@@ -120,7 +139,22 @@ __device__ int combine_token(bool is_token_in_rank,
                 __syncwarp();
             }
 
+#ifdef MK_TOKEN_TRACE
+            uint32_t phase_before_wait = tma_phase[stage_idx];
+            if (lane_id == 0) {
+                printf("[MK-DIAG][COMBINE-TOKEN-TMA-WAIT-BEFORE] iter=%d shifted=%d stage=%d phase_before=%u phase_pair=[%u,%u] mbar=%p topk_ranks=%d\n",
+                       iter, shifted, stage_idx, phase_before_wait, tma_phase[0], tma_phase[1],
+                       tma_mbarrier(stage_idx), num_topk_ranks);
+            }
+#endif
             mbarrier_wait(tma_mbarrier(stage_idx), tma_phase[stage_idx]);
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                printf("[MK-DIAG][COMBINE-TOKEN-TMA-WAIT-AFTER] iter=%d shifted=%d stage=%d phase_before=%u phase_after=%u phase_pair=[%u,%u] mbar=%p\n",
+                       iter, shifted, stage_idx, phase_before_wait, tma_phase[stage_idx],
+                       tma_phase[0], tma_phase[1], tma_mbarrier(stage_idx));
+            }
+#endif
             float values[kDtypePerInt4] = {0};
             #pragma unroll
             for (int j = 0; j < num_topk_ranks; ++j) {
@@ -131,7 +165,19 @@ __device__ int combine_token(bool is_token_in_rank,
             }
 
             // Wait shared memory to be released
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                printf("[MK-DIAG][COMBINE-TOKEN-TMA-STORE-WAIT-BEFORE] iter=%d shifted=%d stage=%d\n",
+                       iter, shifted, stage_idx);
+            }
+#endif
             tma_store_wait<kNumStages - 1>();
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                printf("[MK-DIAG][COMBINE-TOKEN-TMA-STORE-WAIT-AFTER] iter=%d shifted=%d stage=%d\n",
+                       iter, shifted, stage_idx);
+            }
+#endif
 
             // Copy into shared and issue TMA
             auto out_dtypes = reinterpret_cast<dtype_t*>(tma_store_buffer(stage_idx) + lane_id);
@@ -143,11 +189,27 @@ __device__ int combine_token(bool is_token_in_rank,
 
             if (elect_one_sync())
                 tma_store_1d(tma_store_buffer(stage_idx), combined_row + shifted, kNumTMALoadBytes);
+#ifdef MK_TOKEN_TRACE
+            if (lane_id == 0) {
+                printf("[MK-DIAG][COMBINE-TOKEN-TMA-STORE-ISSUED] iter=%d shifted=%d stage=%d dst=%p src=%p bytes=%d\n",
+                       iter, shifted, stage_idx, combined_row + shifted, tma_store_buffer(stage_idx), kNumTMALoadBytes);
+            }
+#endif
             __syncwarp();
         }
 
         // Flush all writes
+#ifdef MK_TOKEN_TRACE
+        if (lane_id == 0) {
+            printf("[MK-DIAG][COMBINE-TOKEN-TMA-FLUSH-BEFORE] phase=[%u,%u]\n", tma_phase[0], tma_phase[1]);
+        }
+#endif
         tma_store_wait<0>();
+#ifdef MK_TOKEN_TRACE
+        if (lane_id == 0) {
+            printf("[MK-DIAG][COMBINE-TOKEN-TMA-FLUSH-AFTER] phase=[%u,%u]\n", tma_phase[0], tma_phase[1]);
+        }
+#endif
     } else {
         #pragma unroll
         for (int i = lane_id; i < hidden_int4; i += 32) {
