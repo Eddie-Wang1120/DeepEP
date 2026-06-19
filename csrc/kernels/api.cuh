@@ -387,6 +387,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int num_forwarder_sms,
     int num_compute_sms,
     int num_combine_sms,
+    int num_logical_channels,
     int max_tokens_per_expert,
     int max_total_recv_tokens,
     int64_t num_rdma_bytes,

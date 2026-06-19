@@ -187,9 +187,9 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
     num_tokens = 4096
     hidden = 2048
     intermediate = 2048
-    experts_per_rank = 8
+    experts_per_rank = 16
     num_experts = num_ranks * experts_per_rank
-    num_topk = 2
+    num_topk = 8
     num_topk_groups = num_nodes
 
     if local_rank == 0:
@@ -218,7 +218,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
 
     # Config for dispatch/combine (baseline path)
     config_num_sms = 24
-    config = deep_ep.Config(config_num_sms, 8, 512, 16, 128)
+    config = deep_ep.Config(config_num_sms, 1, 256, 16, 256)
 
     # --- Path A: Baseline (DeepEP dispatch + PyTorch compute + DeepEP combine) ---
     baseline_output = None

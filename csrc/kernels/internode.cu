@@ -682,7 +682,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
 #ifdef MK_TOKEN_TRACE
             if (lane_id == 0) {
-                printf("[DEEPEP][DISPATCH-SEND] rank=%d token=%lld num_topk_ranks=%d ch=%d rdma=%d nvl=%d expert=%d topk0_w=%f h0=%f\n",
+                printf("[DEEPEP][DISPATCH-SEND] rank=%d token=%lld num_topk_ranks=%d ch=%d rdma=%d nvl=%d payload_topk0=%d payload_weight0=%f h0=%f\n",
                        rank, token_idx, num_topk_ranks, channel_id, rdma_rank, nvl_rank,
                        (int)ld_nc_global(topk_idx + token_idx * num_topk),
                        ld_nc_global(topk_weights + token_idx * num_topk),
@@ -978,7 +978,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (lane_id == 0 && is_in_dst_nvl_rank) {
                     auto fwd_topk_idx_ptr = reinterpret_cast<int*>(shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta));
                     auto fwd_topk_w_ptr = reinterpret_cast<float*>(fwd_topk_idx_ptr + num_topk);
-                    printf("[DEEPEP][DISPATCH-FWD] rank=%d src_rdma=%d dst_nvl=%d slot=%d ch=%d expert=%d topk0_w=%f h0=%f\n",
+                    printf("[DEEPEP][DISPATCH-FWD] rank=%d src_rdma=%d dst_nvl=%d slot=%d ch=%d payload_topk0=%d payload_weight0=%f h0=%f\n",
                            rank, src_rdma_rank, dst_nvl_rank, rdma_slot_idx, channel_id,
                            ld_nc_global(fwd_topk_idx_ptr), ld_nc_global(fwd_topk_w_ptr),
                            __bfloat162float(reinterpret_cast<nv_bfloat16*>(shifted)[0]));
@@ -986,9 +986,22 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 #endif
                 if (lane_id == src_rdma_rank) {
                     auto cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
+                    int rdma_nvl_before = rdma_nvl_token_idx;
                     rdma_nvl_token_idx += is_in_dst_nvl_rank;
-                    if (not kCachedMode)
+                    if (not kCachedMode) {
                         send_nvl_head[i * NUM_MAX_NVL_PEERS] = cached_head;
+#ifdef MK_TOKEN_TRACE
+                        auto fwd_topk_idx_ptr = reinterpret_cast<int*>(shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta));
+                        auto fwd_topk_w_ptr = reinterpret_cast<float*>(fwd_topk_idx_ptr + num_topk);
+                        printf("[DEEPEP-DIAG][DISPATCH-NVL-HEAD-WRITE] rank=%d ch=%d src_rdma=%d dst_nvl=%d rdma_i=%d rdma_head=%d rdma_tail=%d rdma_slot=%d is_in_dst=%d route_bits=0x%x cached_head=%d stored=%d rdma_nvl_before=%d rdma_nvl_after=%d payload_topk0=%d payload_weight0=%f h0=%f head_ptr=%p\n",
+                               rank, channel_id, src_rdma_rank, dst_nvl_rank, i, src_rdma_head, src_rdma_tail,
+                               rdma_slot_idx, is_in_dst_nvl_rank, src_meta.is_token_in_nvl_rank_bits, cached_head,
+                               ld_nc_global(send_nvl_head + i * NUM_MAX_NVL_PEERS), rdma_nvl_before,
+                               rdma_nvl_token_idx, ld_nc_global(fwd_topk_idx_ptr), ld_nc_global(fwd_topk_w_ptr),
+                               __bfloat162float(reinterpret_cast<nv_bfloat16*>(shifted)[0]),
+                               send_nvl_head + i * NUM_MAX_NVL_PEERS);
+#endif
+                    }
                 }
                 if (not is_in_dst_nvl_rank)
                     continue;
@@ -1202,9 +1215,24 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (lane_id == 0) {
                     auto topk_data_ptr = reinterpret_cast<int*>(shifted);
                     auto weight_data_ptr = reinterpret_cast<float*>(shifted + sizeof(int) * num_topk);
-                    printf("[DEEPEP][DISPATCH-RECV] rank=%d recv_token_idx=%lld expert=%d topk_slot=0 route_weight=%f src_rdma=%d src_nvl=%d ch=%d h0=%f\n",
-                           rank, recv_token_idx, ld_nc_global(topk_data_ptr),
-                           ld_nc_global(weight_data_ptr), (int)meta.src_rdma_rank, src_nvl_rank, channel_id,
+                    int payload_topk0 = ld_nc_global(topk_data_ptr);
+                    float payload_weight0 = ld_nc_global(weight_data_ptr);
+                    int local_topk_slot = -1;
+                    int local_expert = -1;
+                    float local_weight = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < num_topk; ++i) {
+                        auto payload_expert = ld_nc_global(topk_data_ptr + i);
+                        if (payload_expert >= local_expert_begin and payload_expert < local_expert_end) {
+                            local_topk_slot = i;
+                            local_expert = payload_expert - local_expert_begin;
+                            local_weight = ld_nc_global(weight_data_ptr + i);
+                            break;
+                        }
+                    }
+                    printf("[DEEPEP][DISPATCH-RECV] rank=%d recv_token_idx=%lld payload_topk0=%d payload_weight0=%f local_topk_slot=%d local_expert=%d local_weight=%f src_rdma=%d src_nvl=%d ch=%d h0=%f\n",
+                           rank, recv_token_idx, payload_topk0, payload_weight0, local_topk_slot, local_expert, local_weight,
+                           (int)meta.src_rdma_rank, src_nvl_rank, channel_id,
                            __bfloat162float(reinterpret_cast<nv_bfloat16*>(tma_buffer)[0]));
                 }
 #endif
@@ -1416,11 +1444,21 @@ __global__ void cached_notify(const int rdma_clean_offset,
             int last_head = 1 << 25;
             for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
                 auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
+                int last_before = last_head;
+                int normalized_head;
                 if (current_head < 0) {
-                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
+                    normalized_head = -last_head - 1;
+                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = normalized_head;
                 } else {
+                    normalized_head = current_head;
                     last_head = current_head;
                 }
+#ifdef MK_TOKEN_TRACE
+                printf("[DEEPEP-DIAG][COMBINE-RDMA-HEAD-NORM] rank=%d rdma_rank=%d nvl_rank=%d ch=%d src_rdma_lane=%d token=%d raw=%d norm=%d stored=%d last_before=%d last_after=%d token_range=[%d,%d)\n",
+                       rank, rdma_rank, nvl_rank, warp_id, lane_id, token_idx, current_head, normalized_head,
+                       __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id), last_before, last_head,
+                       token_start_idx, token_end_idx);
+#endif
             }
         }
     } else {
@@ -1474,12 +1512,24 @@ __global__ void cached_notify(const int rdma_clean_offset,
                         if (lane_id < NUM_MAX_NVL_PEERS) {
                             auto current_head =
                                 reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
+                            int last_before = last_head;
+                            int normalized_head;
                             if (current_head < 0) {
+                                normalized_head = -last_head - 1;
                                 reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
-                                    -last_head - 1;
+                                    normalized_head;
                             } else {
+                                normalized_head = current_head;
                                 last_head = current_head;
                             }
+#ifdef MK_TOKEN_TRACE
+                            printf("[DEEPEP-DIAG][COMBINE-NVL-HEAD-NORM] rank=%d rdma_rank=%d nvl_rank=%d ch=%d dst_rdma=%d token=%d lane_nvl=%d raw=%d norm=%d stored=%d last_before=%d last_after=%d shifted_range=[%d,%d) batch_range=[%d,%d) head_ptr=%p\n",
+                                   rank, rdma_rank, nvl_rank, warp_id, dst_rdma_rank, token_idx, lane_id,
+                                   current_head, normalized_head,
+                                   reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id],
+                                   last_before, last_head, token_start_idx, token_end_idx, batch_start_idx, batch_end_idx,
+                                   combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
+#endif
                         }
                     }
                     tma_store_fence();
@@ -1848,6 +1898,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
             int prefix_idx = (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_channels + channel_id;
             token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
             token_end_idx = (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
+#ifdef MK_TOKEN_TRACE
+            printf("[DEEPEP-DIAG][COMBINE-NVL-SEND-TASK] rank=%d rdma_rank=%d nvl_rank=%d ch=%d dst_nvl=%d src_rdma_lane=%d prefix_idx=%d range=[%d,%d) count=%d cached_head=%d cached_tail=%d x_base=%p\n",
+                   rank, rdma_rank, nvl_rank, channel_id, dst_nvl_rank, lane_id, prefix_idx, token_start_idx,
+                   token_end_idx, token_end_idx - token_start_idx, 0, 0, x);
+#endif
         }
         __syncwarp();
 
@@ -1937,10 +1992,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
 
 #ifdef MK_TOKEN_TRACE
                     if (lane_id == 0) {
-                        printf("[DEEPEP][COMBINE-NVL-SEND] rank=%d token=%lld dst_nvl=%d src_rdma=%d ch=%d topk0_w=%f h0=%f\n",
+                        printf("[DEEPEP][COMBINE-NVL-SEND] rank=%d token=%lld dst_nvl=%d src_rdma=%d ch=%d sender_queue_token=%lld dst_slot=%d queue_tail_before=%d payload_weight0=%f h0=%f x_ptr=%p\n",
                                rank, (long long)token_idx, dst_nvl_rank, current_rdma_idx, channel_id,
+                               (long long)token_idx, dst_slot_idx, cached_channel_tail_idx - 1,
                                ld_nc_global(topk_weights + token_idx * num_topk),
-                               __bfloat162float(reinterpret_cast<const nv_bfloat16*>(x + token_idx * hidden_int4)[0]));
+                               __bfloat162float(reinterpret_cast<const nv_bfloat16*>(x + token_idx * hidden_int4)[0]),
+                               shifted_x);
                     }
 #endif
 
@@ -2124,10 +2181,20 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     };
 #ifdef MK_TOKEN_TRACE
                     if (lane_id == 0) {
-                        printf("[DEEPEP][COMBINE-NVL-FWD] rank=%d token=%lld dst_rdma=%d head=%d ch=%d topk0_w=%f h0=%f\n",
-                               rank, (long long)token_idx, dst_rdma_rank, expected_head, channel_id,
-                               recv_tw_fn(0, expected_head >= 0 ? expected_head % num_max_nvl_chunked_recv_tokens_per_rdma : 0, 0),
-                               expected_head >= 0 ? __bfloat162float(reinterpret_cast<nv_bfloat16*>(const_cast<int4*>(get_addr_fn(0, expected_head % num_max_nvl_chunked_recv_tokens_per_rdma, 0)))[0]) : 0.f);
+                        int head0 = ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS);
+                        int head1 = NUM_MAX_NVL_PEERS > 1 ? ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + 1) : -1;
+                        int slot0 = head0 >= 0 ? head0 % num_max_nvl_chunked_recv_tokens_per_rdma : 0;
+                        printf("[DEEPEP-DIAG][COMBINE-FWD-NVL-HEAD-MAP] rank=%d rdma_rank=%d nvl_rank=%d ch=%d dst_rdma=%d local_nvl=%d token=%d global_token=%d lane_nvl=%d lane_raw_head=%d expected_head=%d sender_token=%d sender_range=[%d,%d) sender_count=%d tail_snapshot=%d head_ptr=%p x_lane_base=%p\n",
+                               rank, rdma_rank, nvl_rank, channel_id, dst_rdma_rank, nvl_rank, token_idx,
+                               token_idx + num_tokens_prefix, 0, head0, expected_head, token_idx, 0,
+                               num_tokens_to_combine, num_tokens_to_combine, cached_nvl_channel_tail_idx,
+                               combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS,
+                               get_addr_fn(0, slot0, 0));
+                        printf("[DEEPEP][COMBINE-NVL-FWD] rank=%d token=%lld dst_rdma=%d head=%d ch=%d head0=%d head1=%d slot0=%d slot0_weight0=%f slot0_h0=%f tail_local=%d head_ptr=%p\n",
+                               rank, (long long)token_idx, dst_rdma_rank, expected_head, channel_id, head0, head1, slot0,
+                               recv_tw_fn(0, slot0, 0),
+                               head0 >= 0 ? __bfloat162float(reinterpret_cast<nv_bfloat16*>(const_cast<int4*>(get_addr_fn(0, slot0, 0)))[0]) : 0.f,
+                               cached_nvl_channel_tail_idx, combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS);
                     }
 #endif
                     combine_token<NUM_MAX_NVL_PEERS, false, dtype_t, NUM_MAX_NVL_PEERS, true, kNumStages, kNumTMALoadBytes>(
@@ -2263,10 +2330,24 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     dummy_tma_phases);
 #ifdef MK_TOKEN_TRACE
                 if (lane_id == 0) {
-                    printf("[DEEPEP][COMBINE-RDMA-RECV] rank=%d token=%lld head=%d ch=%d rdma=%d nvl=%d topk0_w=%f h0=%f\n",
+                    int head0 = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks);
+                    int head1 = kNumRDMARanks > 1 ? ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + 1) : -1;
+                    int slot0 = head0 >= 0 ? head0 % num_max_rdma_chunked_recv_tokens : 0;
+                    int slot1 = head1 >= 0 ? head1 % num_max_rdma_chunked_recv_tokens : 0;
+                    printf("[DEEPEP-DIAG][RDMA-RECV-HEAD] rank=%d rdma_rank=%d nvl_rank=%d ch=%d warp=%d token=%lld src_rdma_lane=%d raw_expected=%d wait_head=%d token_range=[%d,%d) cached_tail=%d tail_snapshot=%d combined_rdma_head_addr=%p\n",
+                           rank, rdma_rank, nvl_rank, channel_id, warp_id, (long long)token_idx, 0, head0,
+                           expected_head, token_start_idx, token_end_idx, cached_channel_tail_idx,
+                           cached_channel_tail_idx, combined_rdma_head + token_idx * kNumRDMARanks);
+                    printf("[DEEPEP][COMBINE-RDMA-RECV] rank=%d token=%lld head=%d ch=%d rdma=%d nvl=%d combined_weight0=%f combined_h0=%f head0=%d head1=%d slot0=%d slot1=%d slot0_weight0=%f slot0_h0=%f slot1_weight0=%f slot1_h0=%f combined_x=%p topk_ptr=%p\n",
                            rank, (long long)token_idx, expected_head, channel_id, rdma_rank, nvl_rank,
                            ld_nc_global(combined_topk_weights + token_idx * num_topk),
-                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(combined_x + token_idx * hidden_int4)[0]));
+                           __bfloat162float(reinterpret_cast<nv_bfloat16*>(combined_x + token_idx * hidden_int4)[0]),
+                           head0, head1, slot0, slot1,
+                           recv_tw_fn(0, slot0, 0),
+                           head0 >= 0 ? __bfloat162float(reinterpret_cast<nv_bfloat16*>(get_addr_fn(0, slot0, 0))[0]) : 0.f,
+                           kNumRDMARanks > 1 ? recv_tw_fn(1, slot1, 0) : 0.f,
+                           head1 >= 0 && kNumRDMARanks > 1 ? __bfloat162float(reinterpret_cast<nv_bfloat16*>(get_addr_fn(1, slot1, 0))[0]) : 0.f,
+                           combined_x + token_idx * hidden_int4, combined_topk_weights + token_idx * num_topk);
                 }
 #endif
             }

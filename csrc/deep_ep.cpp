@@ -13,17 +13,6 @@
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
 
-namespace deep_ep::megakernel {
-void notify_dispatch_logical_prefix(
-    const bool* is_token_in_rank,
-    int num_ranks,
-    int num_tokens,
-    int num_logical_channels,
-    int* rdma_channel_prefix_matrix,
-    int* gbl_channel_prefix_matrix,
-    cudaStream_t stream);
-}
-
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
     int device_count;
@@ -402,11 +391,12 @@ void Buffer::sync(const std::vector<int>& device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
-        // Allocate
-        rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+        // Allocate. Non-low-latency megakernel uses a second RDMA region for combine.
+        int64_t rdma_alloc_bytes = low_latency_mode ? num_rdma_bytes : num_rdma_bytes * 2;
+        rdma_buffer_ptr = internode::alloc(rdma_alloc_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)
-        CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
+        CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, rdma_alloc_bytes));
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -1928,7 +1918,7 @@ torch::Tensor Buffer::megakernel_forward(
     const int num_channels = num_logical_channels;
     const int num_max_rdma_chunked_send_tokens = 8;
     const int num_max_rdma_chunked_recv_tokens = 256;
-    const int num_max_nvl_chunked_send_tokens = 8;
+    const int num_max_nvl_chunked_send_tokens = 16;
     const int num_max_nvl_chunked_recv_tokens = 256;
 
     // const int num_max_rdma_chunked_send_tokens = 16;
@@ -1955,8 +1945,6 @@ torch::Tensor Buffer::megakernel_forward(
     printf("jinheng debug: enter this v1\n");
 
     // Step 2: notify_dispatch — exchange metadata via NVSHMEM
-    auto physical_rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_physical_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto physical_gbl_channel_prefix_matrix = torch::empty({num_ranks, num_physical_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -1972,14 +1960,15 @@ torch::Tensor Buffer::megakernel_forward(
            num_tokens, hidden_int4, num_topk, num_experts, num_local_experts, rdma_buffer_ptr,
            buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
            moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
-    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p physical_rdma_cpm=%p logical_rdma_cpm=%p recv_rdma_prefix=%p physical_gbl_cpm=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
+    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p logical_rdma_cpm=%p recv_rdma_prefix=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
            rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
            num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
-           physical_rdma_channel_prefix_matrix.data_ptr<int>(), rdma_channel_prefix_matrix.data_ptr<int>(),
-           recv_rdma_rank_prefix_sum.data_ptr<int>(), physical_gbl_channel_prefix_matrix.data_ptr<int>(),
+           rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
            gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
 
-    // Original notify still uses physical channels because it also cleans/exchanges physical buffer metadata.
+    // Keep notify_dispatch's buffer cleanup aligned with the megakernel logical-channel layout.
+    // The prefix matrices are regenerated below for logical channels, but the cleanup range must
+    // cover every logical-channel RDMA/NVL buffer slice before the megakernel starts using them.
     internode::notify_dispatch(
         num_tokens_per_rank.data_ptr<int>(),
         moe_recv_counter_mapped,
@@ -1992,14 +1981,14 @@ torch::Tensor Buffer::megakernel_forward(
         is_token_in_rank.data_ptr<bool>(),
         num_tokens,
         0,  // num_worst_tokens
-        num_physical_channels,
+        num_logical_channels,
         hidden_int4,
         0,  // num_scales (BF16, no FP8)
         num_topk + 1,  // MK-v7 uses num_topk+1 int slots (src_token_idx + topk_idx)
         1,  // expert_alignment
-        physical_rdma_channel_prefix_matrix.data_ptr<int>(),
+        rdma_channel_prefix_matrix.data_ptr<int>(),
         recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        physical_gbl_channel_prefix_matrix.data_ptr<int>(),
+        gbl_channel_prefix_matrix.data_ptr<int>(),
         recv_gbl_rank_prefix_sum.data_ptr<int>(),
         rdma_buffer_ptr,
         num_max_rdma_chunked_recv_tokens,
@@ -2012,15 +2001,30 @@ torch::Tensor Buffer::megakernel_forward(
         num_nvl_bytes,
         low_latency_mode);
 
-    // Megakernel consumes separate logical-channel prefix matrices.
-    megakernel::notify_dispatch_logical_prefix(
-        is_token_in_rank.data_ptr<bool>(),
-        num_ranks,
-        num_tokens,
-        num_logical_channels,
-        rdma_channel_prefix_matrix.data_ptr<int>(),
-        gbl_channel_prefix_matrix.data_ptr<int>(),
-        stream);
+    const int source_meta_bytes = internode::get_source_meta_bytes();
+    auto get_num_bytes_per_token = [&](int num_topk_idx, int num_topk_weights) {
+        return align_up(hidden_int4 * static_cast<int>(sizeof(int4)) + source_meta_bytes +
+                            num_topk_idx * static_cast<int>(sizeof(int)) +
+                            num_topk_weights * static_cast<int>(sizeof(float)),
+                        static_cast<int>(sizeof(int4)));
+    };
+    auto get_rdma_bytes = [&](int num_topk_idx, int num_topk_weights) {
+        int64_t data_bytes = static_cast<int64_t>(get_num_bytes_per_token(num_topk_idx, num_topk_weights)) *
+            num_max_rdma_chunked_recv_tokens * num_rdma_ranks * 2 * num_logical_channels;
+        int64_t meta_bytes = static_cast<int64_t>(NUM_MAX_NVL_PEERS * 2 + 4) *
+            num_rdma_ranks * 2 * num_logical_channels * sizeof(int);
+        return data_bytes + meta_bytes;
+    };
+    auto get_nvl_bytes = [&](int num_topk_idx, int num_topk_weights) {
+        int64_t data_bytes = static_cast<int64_t>(get_num_bytes_per_token(num_topk_idx, num_topk_weights)) *
+            num_max_nvl_chunked_recv_tokens * NUM_MAX_NVL_PEERS * num_logical_channels;
+        int64_t meta_bytes = static_cast<int64_t>(NUM_MAX_NVL_PEERS) *
+            (2 * num_rdma_ranks + 2) * num_logical_channels * sizeof(int);
+        return data_bytes + meta_bytes;
+    };
+    EP_HOST_ASSERT(get_rdma_bytes(num_topk + 1, num_topk) + get_rdma_bytes(0, num_topk) <= num_rdma_bytes);
+    EP_HOST_ASSERT(get_nvl_bytes(num_topk + 1, num_topk) <= num_nvl_bytes);
+    EP_HOST_ASSERT(get_nvl_bytes(0, num_topk) <= num_nvl_bytes);
 
     printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
            rank, *moe_recv_counter, *moe_recv_rdma_counter);
@@ -2096,6 +2100,7 @@ torch::Tensor Buffer::megakernel_forward(
         num_forwarder_sms,
         num_compute_sms,
         num_combine_sms,
+        num_logical_channels,
         max_tokens_per_expert,
         max_total_recv_tokens > 0 ? max_total_recv_tokens : 1,
         num_rdma_bytes,
