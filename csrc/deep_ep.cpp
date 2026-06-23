@@ -1916,15 +1916,10 @@ torch::Tensor Buffer::megakernel_forward(
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
     const int num_logical_channels = num_physical_channels * 2;
     const int num_channels = num_logical_channels;
-    const int num_max_rdma_chunked_send_tokens = 8;
+    const int num_max_rdma_chunked_send_tokens = 16;
     const int num_max_rdma_chunked_recv_tokens = 256;
     const int num_max_nvl_chunked_send_tokens = 16;
     const int num_max_nvl_chunked_recv_tokens = 256;
-
-    // const int num_max_rdma_chunked_send_tokens = 16;
-    // const int num_max_rdma_chunked_recv_tokens = 128;
-    // const int num_max_nvl_chunked_send_tokens = 8;
-    // const int num_max_nvl_chunked_recv_tokens = 512;
 
     // Step 1: Compute dispatch layout
     auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));

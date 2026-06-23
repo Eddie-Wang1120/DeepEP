@@ -78,10 +78,11 @@ def print_bitwise_mismatches(baseline_output, megakernel_output, rank, hidden_st
 
 def moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights, W_gate, W_up, W_down, experts_per_rank):
     """
-    Compute MoE expert forward on received tokens (baseline path).
+    Megatron-style non-TE MoE expert forward on received tokens.
     recv_topk_idx [num_recv, num_topk] contains LOCAL expert IDs (0..experts_per_rank-1), -1 for others.
+    Router weights are applied inside the expert path, matching Megatron's DeepEP forward usage.
     """
-    expert_out = torch.zeros(recv_x.shape[0], recv_x.shape[1], dtype=torch.float32, device=recv_x.device)
+    expert_out = torch.zeros_like(recv_x)
 
     for expert_id in range(experts_per_rank):
         mask = (recv_topk_idx == expert_id)  # [num_recv, num_topk]
@@ -90,17 +91,19 @@ def moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights, W_gate, W_up, 
             continue
 
         token_indices = row_mask.nonzero(as_tuple=True)[0]
-        tokens = recv_x[token_indices].float()
+        tokens = recv_x[token_indices]
 
-        gate = torch.matmul(tokens, W_gate[expert_id].float().T)
-        up = torch.matmul(tokens, W_up[expert_id].float().T)
+        gate = torch.matmul(tokens, W_gate[expert_id].T)
+        up = torch.matmul(tokens, W_up[expert_id].T)
         swiglu_out = F.silu(gate) * up
-        down = torch.matmul(swiglu_out, W_down[expert_id].float().T)
 
         weights = (recv_topk_weights[token_indices] * mask[token_indices].float()).sum(dim=1, keepdim=True)
-        expert_out[token_indices] += down * weights
+        swiglu_out = (swiglu_out * weights.to(swiglu_out.dtype)).to(swiglu_out.dtype)
 
-    return expert_out.to(torch.bfloat16)
+        down = torch.matmul(swiglu_out, W_down[expert_id].T)
+        expert_out[token_indices] += down
+
+    return expert_out
 
 
 def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
@@ -155,7 +158,6 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
     # SM allocation: 24 dispatch, 8 forwarder (NUM_MAX_NVL_PEERS), rest compute
     num_dispatch_sms = 24
-    num_forwarder_sms = 8  # internally derived from NUM_MAX_NVL_PEERS, not a param here
     # total_sms = num_dispatch_sms + num_forwarder_sms + num_compute_sms
     total_sms = num_sms  # use all available SMs
 
@@ -184,9 +186,9 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
     num_nodes = num_ranks // num_local_ranks
 
     # Configuration
-    num_tokens = 4096
-    hidden = 2048
-    intermediate = 2048
+    num_tokens = 8192
+    hidden = 4096
+    intermediate = 4096
     experts_per_rank = 16
     num_experts = num_ranks * experts_per_rank
     num_topk = 8
