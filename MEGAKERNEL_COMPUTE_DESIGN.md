@@ -2,11 +2,11 @@
 
 ## 背景
 
-当前 MK-v7 megakernel 已经把 dispatch 和 combine 融合到同一个 persistent CUDA kernel 中，并通过 logical channel 做通信流水。但 compute 仍处于占位/模拟阶段，尚未真正进入 dispatch -> compute -> combine 的数据路径。
+当前 MK-v7 megakernel 已经把 dispatch、compute 和 combine 融合到同一个 persistent CUDA kernel 中，并通过 logical channel 做通信流水。compute 已进入 dispatch -> compute -> combine 的真实 FFN 数据路径。
 
 本设计文档总结第一版 compute 接入方案：优先保证真实 compute 路径闭环、信号正确和 combine 可按 token ready 推进；暂不追求复杂动态调度和极限性能。
 
-## 重构起点：通信已对齐，compute 仍是占位
+## 当前状态：通信与 compute 已接入
 
 当前 `megakernel.cu` 的实际状态（区别于本文档早期设想，重构前必须对齐认知）：
 
@@ -17,15 +17,15 @@ dispatch  : 已对齐。NVL receiver 直接把原始 token 写入 combine_input�
 combine   : 已对齐。combine_x 直接指向 combine_input（megakernel.cu:2961），
             NVL sender 按 token 顺序自旋等待 combine_token_ready，带 timeout→trap
             （megakernel.cu:1708-1722）。
-compute   : 占位。compute_worker 是「单 SM 处理一个 expert」的 round-robin
-            （megakernel.cu:1192），内部只 __nanosleep ~100us（megakernel.cu:1235-1240），
-            然后发 per-token-ready。完全不做 GEMM、不写任何输出。
-            另存在一个已分配但未接线的 compute_output 缓冲（megakernel.cu:2761）。
+compute   : 已接入真实 FFN。compute_worker 采用 32-SM consumer group 协作一个 expert batch，
+            满 128 token 走 M=128 batched GEMM，dispatch_done 后 flush tail；
+            多 local expert contribution 先 atomicAdd 到 compute_output_f，最后转 bf16
+            到 compute_output 并发 per-token-ready。
 ```
 
-关键事实：**combine 当前发的是 dispatch 写进 combine_input 的原始 token，而不是 FFN 输出**。compute 只是一个纯 gate（pure gate）。重构的本质就是：让 compute 真正算 FFN 并把结果接到 combine 的输入，同时维持现有信号协议不破。
+关键事实：**combine 当前发的是 compute_output 中的 FFN 输出**。dispatch 写 combine_input 作为 compute 输入，compute 写 compute_output 作为 combine 输入，两者已分离。
 
-本文档「## SM 划分」「## Compute Batch 粒度」「## Consumer Group 内同步」等章节描述的是 `3×32 SM consumer group` 设想，与现有「单 SM/expert」代码不一致，相关取舍见文末「## 待决策点」。
+本文档「## SM 划分」「## Compute Batch 粒度」「## Consumer Group 内同步」等章节描述的 `3×32 SM consumer group` 已作为当前 compute 路线落地。
 
 ## 目标
 
@@ -39,7 +39,7 @@ dispatch -> compute -> combine
 
 ## SM 划分
 
-> 注意：以下 `3×32 consumer group` 是本文档早期设想。现有代码实际是「单 SM 处理一个 expert」的 round-robin（megakernel.cu:1192），且 launch 时 `compute = total - dispatch - combine = 148 - 24 - 24 = 100`（无 reserved）。两套方案差异很大（是否需要 group barrier、scratch 布局、SM 数都不同），见文末「## 待决策点」决策 D1。
+> 当前实现采用 `3×32 consumer group`：`compute = floor((total - dispatch - combine) / 32) * 32`，测试默认 `148 - 24 - 24 = 100`，因此启用 96 个 compute SM，剩余 4 个 SM reserved。
 
 硬件总 SM 数：
 
@@ -88,7 +88,7 @@ dtype = BF16
 
 ### GEMM 形状与转置约定（必须与现有 device_gemm_bf16 一致）
 
-当前代码第一版仍按 `COMPUTE_BATCH_SIZE=128` 聚合/flush work unit，但每个 work unit 内先用 per-token `M=1` GEMM 跑通正确性闭环，尚未实现本文档主推的 `M=128` batch GEMM。由于 WMMA `load_matrix_sync` 会按 16 行 tile 读取，`M=1` 输入必须先拷到带 16 行 padding 的 workspace，不能直接指向 compact token buffer。
+当前代码按 `COMPUTE_BATCH_SIZE=128` 聚合/flush work unit，并用 `M=batch_size` 的 batched GEMM 执行 FFN。full batch 为 `M=128`；tail batch 复用同一路径，workspace 固定预留 128 行并将 `[batch_size,128)` 行清零，避免 WMMA `load_matrix_sync` 在 M 维 tile 读取时越界。
 
 现有 `device_gemm_bf16`（megakernel.cu:251）语义是 `C = A @ B^T`：A 取 `row_major`，B 取 `col_major`，即 `C[M,N] = A[M,K] @ B[N,K]^T`。三次 GEMM 的映射：
 
@@ -391,7 +391,7 @@ NUM_TIMEOUT_CYCLES >= 整个 dispatch + 最慢 expert compute 的总时长上界
 
 ## Consumer Group 内同步
 
-> 注意：本节的 `group_barrier[consumer_id]` / `group_phase[consumer_id]` 仅在采用「3×32 SM consumer group」方案（决策 D1 选 group）时才需要。现有「单 SM/expert」方案下，一个 batch 的全套 GEMM 在单个 block 内由 warps 用 `device_gemm_bf16` 完成，阶段间用 `__syncthreads()` 即可，不需要跨 SM 的 global barrier。
+> 当前实现已采用「3×32 SM consumer group」方案。每个 consumer group 配 `compute_group_barrier[group_id]` / `compute_group_phase[group_id]`，阶段间通过 reusable global barrier 同步 32 个 SM。
 
 一个 32-SM consumer group 处理一个 batch 时，阶段之间需要同步：
 
@@ -464,10 +464,8 @@ consumer group 内更高效 barrier；
 下面是重构前需要你拍板的点。每条给了现状、选项和我的倾向，你决定后我再据此改代码/文档。
 
 - **D1｜compute 的 SM 划分模型**
-  - 现状：单 SM 处理一个 expert，experts 在 100 个 compute SM 上 round-robin（megakernel.cu:1192）。`experts_per_rank=8` 时只有 8 个 SM 在算，其余空转。
-  - 选项 A：保持「单 SM/expert」，一个 block 内 warps 跑完整 batch 的 GEMM。改动小，无需 group barrier。冷门/热门 expert 负载不均，大 batch 时单 SM 算力不足。
-  - 选项 B：改成「N 个 SM 协作一个 expert batch」（文档原设想 3×32），按 N 维 tile 切分。算力利用率高，但需要跨 SM global barrier + scratch 布局重构，复杂度高。
-  - 倾向：第一版先 A（正确性闭环优先），B 列入后续优化。
+  - 当前实现：采用选项 B，固定 32 个 SM 组成一个 compute consumer group，多个 group 在 local experts 上 round-robin。默认 `total=148, dispatch=24, combine=24` 时启用 3 个 group / 96 个 compute SM，剩余 4 个 SM reserved。
+  - 每个 group 共享一份 batch workspace，GEMM tile 由 `group_warp_id` 在 32 个 SM 的所有 warp 上切分；阶段间用 `compute_group_barrier/phase` 做 global barrier。
 
 - **D2｜combine 的最终数据来源 / buffer 所有权**
   - 现状：combine_input 由 dispatch 写原始 token，combine_x 指向它；compute 不写输出（megakernel.cu:1032/2961）。
@@ -488,8 +486,6 @@ consumer group 内更高效 barrier；
 
 - **D5｜reduce 实现方式**（依赖 D2）
   - expected>1 的 token 多 expert contribution 必须累加。
-  - 选项 A：统一走 atomic accumulate 到输出 buffer。简单，BF16 atomic 精度/性能需验证。
-  - 选项 B：scratch 暂存 + 最后 reduce；expected==1 快路径直接 store。
-  - 倾向：第一版 B（正确性优先，且避免 BF16 atomic 精度问题）。
+  - 当前实现：dispatch 先发布最终 `token_compute_expected`，再发布 expert slot；compute 中 `expected==1` 直接 store 到 `compute_output`，`expected>1` 走 `compute_output_f` float atomic reduce，最后一个 expert 转 bf16 并发 ready。该实现避免 BF16 atomic 精度问题，同时保留单 expert 快路径。
 
-我的建议组合：**D1=A, D2=A, D3=B(先), D4=对齐baseline, D5=B**。这是「正确性闭环最快、改动最小」的一版。你确认或调整后，我开始重构 `compute_worker`。
+当前落地组合：**D1=B, D2=A, D3=B(先), D4=对齐baseline, D5=B**。compute 已从单 SM/expert 升级为 32-SM consumer group 协作一个 expert batch。

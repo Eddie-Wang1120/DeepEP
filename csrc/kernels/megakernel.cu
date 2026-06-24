@@ -43,6 +43,7 @@ namespace megakernel {
 // ============================================================================
 
 constexpr int COMPUTE_BATCH_SIZE = 128;  // Tokens per expert batch before triggering GEMM
+constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
@@ -139,6 +140,8 @@ struct MegaKernelState {
     int* token_compute_done;            // [max_total_recv_tokens] how many local experts have finished
     int* combine_token_ready;           // [max_total_recv_tokens] set to 1 when all local experts done
     float* compute_output_f;            // [max_total_recv_tokens, hidden] float accumulator for multi-expert reduce
+    int* compute_group_barrier;         // [num_compute_groups] reusable global barrier counters
+    int* compute_group_phase;           // [num_compute_groups] reusable global barrier phase flags
 
     // --- Compute state ---
     int* compute_done_count;          // Atomic: how many experts have finished compute
@@ -273,14 +276,15 @@ __device__ void device_gemm_bf16(
     const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (transposed access)
     __nv_bfloat16* __restrict__ C,        // [M, N] row-major
     int M, int K, int N,
-    int warp_id, int num_warps,
+    int tile_warp_id, int num_tile_warps,
+    int smem_warp_id,
     float* smem_buf
 ) {
     const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
     const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
     const int total_tiles = tiles_m * tiles_n;
 
-    for (int tile_idx = warp_id; tile_idx < total_tiles; tile_idx += num_warps) {
+    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
         int tile_row = tile_idx / tiles_n;
         int tile_col = tile_idx % tiles_n;
         int row_offset = tile_row * WMMA_M;
@@ -300,7 +304,7 @@ __device__ void device_gemm_bf16(
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 
-        float* c_buf = smem_buf + warp_id * WMMA_M * WMMA_N;
+        float* c_buf = smem_buf + smem_warp_id * WMMA_M * WMMA_N;
         wmma::store_matrix_sync(c_buf, c_frag, WMMA_N, wmma::mem_row_major);
         __syncwarp();
 
@@ -1145,18 +1149,32 @@ __device__ void dispatch_worker_v2(
                 mk_perf_record_range_ts_at(state->perf_dispatch_detail_ts, dispatch_detail_base_idx + 15, false, detail_end_ts);
 #endif
 
-                // Fill topk weights and src_meta, and record mapping for compute
+                // Fill topk weights/src_meta, publish this token's local expert count, then
+                // publish expert slots. expected must be final before any expert_recv_count
+                // advances, otherwise compute can mark multi-local-expert tokens ready early.
                 const int local_expert_end = local_expert_begin + state->num_local_experts;
-                for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
-                    int expert_id = ld_nc_global(topk_data_ptr + topk_slot);
-                    if (expert_id < local_expert_begin || expert_id >= local_expert_end)
-                        continue;
-                    int local_expert_id = expert_id - local_expert_begin;
-                    float route_w = ld_nc_global(weight_data_ptr + topk_slot);
-                    if (lane_id == 0) {
+                if (lane_id == 0) {
+                    int local_hits = 0;
+                    for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
+                        int expert_id = ld_nc_global(topk_data_ptr + topk_slot);
+                        if (expert_id < local_expert_begin || expert_id >= local_expert_end)
+                            continue;
+                        float route_w = ld_nc_global(weight_data_ptr + topk_slot);
                         state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot] = route_w;
+                        local_hits += 1;
+                    }
+                    if (local_hits > 0) {
                         state->combine_input_src_meta[recv_token_idx] = meta;
-                        atomicAdd(&state->token_compute_expected[recv_token_idx], 1);
+                        atomicAdd(&state->token_compute_expected[recv_token_idx], local_hits);
+                        __threadfence_system();
+                    }
+
+                    for (int topk_slot = 0; topk_slot < num_topk; ++topk_slot) {
+                        int expert_id = ld_nc_global(topk_data_ptr + topk_slot);
+                        if (expert_id < local_expert_begin || expert_id >= local_expert_end)
+                            continue;
+                        int local_expert_id = expert_id - local_expert_begin;
+                        float route_w = ld_nc_global(weight_data_ptr + topk_slot);
                         // Allocate slot (via expert_token_offsets) and write mapping
                         int slot = atomicAdd(&state->expert_token_offsets[local_expert_id], 1);
 #ifdef MK_TOKEN_TRACE
@@ -1294,6 +1312,22 @@ __device__ void dispatch_worker_v2(
 // Compute Worker: polls expert_recv_count, does GEMM+SwiGLU in batches
 // ============================================================================
 
+__device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int phase = ld_acquire_sys_global(&state->compute_group_phase[group_id]);
+        int arrived = atomicAdd(&state->compute_group_barrier[group_id], 1) + 1;
+        if (arrived == group_size) {
+            st_release_sys_global(&state->compute_group_barrier[group_id], 0);
+            st_release_sys_global(&state->compute_group_phase[group_id], phase + 1);
+        } else {
+            while (ld_acquire_sys_global(&state->compute_group_phase[group_id]) == phase)
+                __nanosleep(64);
+        }
+    }
+    __syncthreads();
+}
+
 __device__ void compute_worker(
     int sm_id,
     int compute_sm_idx,  // 0-based index among compute SMs
@@ -1302,30 +1336,43 @@ __device__ void compute_worker(
     float* smem_wmma_buf
 ) {
     const int thread_id = threadIdx.x;
-    const int warp_id = thread_id / 32;
-    const int lane_id = thread_id % 32;
-    const int num_warps = blockDim.x / 32;
+    const int local_warp_id = thread_id / 32;
+    const int group_sm_idx = compute_sm_idx % COMPUTE_GROUP_SIZE;
+    const int group_id = compute_sm_idx / COMPUTE_GROUP_SIZE;
+    const int num_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
+    if (num_compute_groups == 0 || group_id >= num_compute_groups)
+        return;
+    const int num_warps_per_sm = blockDim.x / 32;
+    const int group_warp_id = group_sm_idx * num_warps_per_sm + local_warp_id;
+    const int group_num_warps = COMPUTE_GROUP_SIZE * num_warps_per_sm;
+    const int group_thread_id = group_sm_idx * blockDim.x + thread_id;
+    const int group_num_threads = COMPUTE_GROUP_SIZE * blockDim.x;
     const int num_local_experts = state->num_local_experts;
     const int max_tpe = state->max_tokens_per_expert;
     const int hidden = state->hidden_dim;
     const int intermediate = state->intermediate_dim;
     const int num_topk = state->num_topk;
-    constexpr int COMPUTE_BATCH_SIZE = 128;
 
-    // Per-SM global-memory workspace for GEMM intermediates.
-    // This first compute version drains 128-token work units as per-token M=1 GEMMs.
-    // WMMA load_matrix_sync still reads a full 16-row tile for matrix A, so M=1 inputs
-    // are copied into padded buffers before GEMM to avoid reading past compact token data.
-    const int padded_m = WMMA_M;
+    // Per-SM global-memory workspace for batched GEMM intermediates.
+    // Full batches use M=128. Tail batches use the same path with rows [batch_size,128)
+    // zero-filled so WMMA M tiles never read past valid token rows.
+    const int padded_m = COMPUTE_BATCH_SIZE;
     const int input_stride = padded_m * hidden;
+    const int gate_stride = padded_m * intermediate;
     const int up_stride = padded_m * intermediate;
-    const int gemm_stride = input_stride + intermediate + up_stride + hidden;  // input + gate + up/act + down
-    __nv_bfloat16* input_buf = state->gemm_workspace + compute_sm_idx * gemm_stride;
+    const int down_stride = padded_m * hidden;
+    const int gemm_stride = input_stride + gate_stride + up_stride + down_stride;
+    __nv_bfloat16* input_buf = state->gemm_workspace + group_id * gemm_stride;
     __nv_bfloat16* gate_buf = input_buf + input_stride;
-    __nv_bfloat16* up_buf   = gate_buf + intermediate;     // reused as activation after SwiGLU
+    __nv_bfloat16* up_buf   = gate_buf + gate_stride;     // reused as activation after SwiGLU
     __nv_bfloat16* down_buf = up_buf + up_stride;
 
-    for (int expert_id = compute_sm_idx; expert_id < num_local_experts; expert_id += num_compute_sms) {
+    __shared__ int s_recv_token_idx[COMPUTE_BATCH_SIZE];
+    __shared__ int s_topk_slot[COMPUTE_BATCH_SIZE];
+    __shared__ int s_expected[COMPUTE_BATCH_SIZE];
+    __shared__ int s_is_last[COMPUTE_BATCH_SIZE];
+
+    for (int expert_id = group_id; expert_id < num_local_experts; expert_id += num_compute_groups) {
         int computed_so_far = 0;
 
         while (true) {
@@ -1356,93 +1403,120 @@ __device__ void compute_worker(
             int batch_size = min(ready_tokens, COMPUTE_BATCH_SIZE);
 
 #ifdef MK_PERF_TRACE
-            if (computed_so_far == 0 && expert_id == compute_sm_idx && thread_id == 0 && sm_id < state->perf_total_sms)
+            if (computed_so_far == 0 && expert_id == group_id && group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms)
                 state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
 #endif
 
-            // Process each token in the batch
-            for (int i = 0; i < batch_size; ++i) {
+            for (int i = thread_id; i < batch_size; i += blockDim.x) {
                 int base_offset = expert_id * max_tpe + computed_so_far + i;
-                int recv_token_idx = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2]);
-                int topk_slot = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2 + 1]);
-
+                s_recv_token_idx[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2]);
+                s_topk_slot[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+                s_expected[i] = ld_acquire_sys_global(&state->token_compute_expected[s_recv_token_idx[i]]);
 #ifdef MK_TOKEN_TRACE
-                if (thread_id == 0)
-                    printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d recv_token=%d topk_slot=%d\n",
-                           state->rank, sm_id, expert_id, recv_token_idx, topk_slot);
+                printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
+                       state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
 #endif
+            }
+            __syncthreads();
 
-                // Input: A[1, hidden] from combine_input (dispatch wrote raw token here).
-                for (int h = thread_id; h < hidden; h += blockDim.x)
-                    input_buf[h] = state->combine_input[(int64_t)recv_token_idx * hidden + h];
-                for (int h = hidden + thread_id; h < input_stride; h += blockDim.x)
-                    input_buf[h] = __float2bfloat16(0.0f);
-                __syncthreads();
-                const __nv_bfloat16* A = input_buf;
+            for (int idx = group_thread_id; idx < input_stride; idx += group_num_threads) {
+                int row = idx / hidden;
+                int h = idx - row * hidden;
+                input_buf[idx] = (row < batch_size)
+                    ? state->combine_input[(int64_t)s_recv_token_idx[row] * hidden + h]
+                    : __float2bfloat16(0.0f);
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-                // Expert weight slices
-                const __nv_bfloat16* w_gate = &state->W_gate[expert_id * intermediate * hidden];
-                const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
-                const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
+            // Expert weight slices
+            const __nv_bfloat16* w_gate = &state->W_gate[expert_id * intermediate * hidden];
+            const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
+            const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
 
-                // GEMM 1: gate = A @ W_gate^T  →  gate_buf[1, intermediate]
-                device_gemm_bf16(A, w_gate, gate_buf, 1, hidden, intermediate, warp_id, num_warps, smem_wmma_buf);
-                __syncthreads();
+            // GEMM 1/2: [batch_size, hidden] @ [intermediate, hidden]^T
+            device_gemm_bf16(input_buf, w_gate, gate_buf, batch_size, hidden, intermediate,
+                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            device_gemm_bf16(input_buf, w_up, up_buf, batch_size, hidden, intermediate,
+                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-                // GEMM 2: up = A @ W_up^T  →  up_buf[1, intermediate]
-                device_gemm_bf16(A, w_up, up_buf, 1, hidden, intermediate, warp_id, num_warps, smem_wmma_buf);
-                __syncthreads();
-
-                // SwiGLU + route weight: act = silu(gate) * up * route_weight
-                float route_w = ld_nc_global(&state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot]);
-                for (int j = thread_id; j < intermediate; j += blockDim.x) {
-                    float g = __bfloat162float(gate_buf[j]);
-                    float u = __bfloat162float(up_buf[j]);
+            // SwiGLU + route weight: act = silu(gate) * up * route_weight.
+            for (int idx = group_thread_id; idx < up_stride; idx += group_num_threads) {
+                int row = idx / intermediate;
+                if (row < batch_size) {
+                    int recv_token_idx = s_recv_token_idx[row];
+                    int topk_slot = s_topk_slot[row];
+                    float route_w = ld_nc_global(&state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot]);
+                    float g = __bfloat162float(gate_buf[idx]);
+                    float u = __bfloat162float(up_buf[idx]);
                     float silu_g = g * (1.0f / (1.0f + __expf(-g)));
-                    up_buf[j] = __float2bfloat16(silu_g * u * route_w);
+                    up_buf[idx] = __float2bfloat16(silu_g * u * route_w);
+                } else {
+                    up_buf[idx] = __float2bfloat16(0.0f);
                 }
-                for (int j = intermediate + thread_id; j < up_stride; j += blockDim.x)
-                    up_buf[j] = __float2bfloat16(0.0f);
-                __syncthreads();
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-                // GEMM 3: down = act @ W_down^T  →  down_buf[1, hidden]
-                device_gemm_bf16(up_buf, w_down, down_buf, 1, intermediate, hidden, warp_id, num_warps, smem_wmma_buf);
-                __syncthreads();
+            // GEMM 3: [batch_size, intermediate] @ [hidden, intermediate]^T
+            device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
+                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-                // Accumulate into float output buffer (multi-expert reduce via atomicAdd)
-                for (int h = thread_id; h < hidden; h += blockDim.x)
+            // expected==1 can store directly; multi-local-expert tokens reduce through float atomics.
+            for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
+                int row = idx / hidden;
+                int h = idx - row * hidden;
+                int recv_token_idx = s_recv_token_idx[row];
+                if (s_expected[row] == 1) {
+                    state->compute_output[(int64_t)recv_token_idx * hidden + h] = down_buf[idx];
+                } else {
                     atomicAdd(&state->compute_output_f[(int64_t)recv_token_idx * hidden + h],
-                              __bfloat162float(down_buf[h]));
-                __syncthreads();
-
-                // Per-token completion signal
-                __shared__ int s_is_last;
-                if (thread_id == 0) {
-                    __threadfence_system();  // ensure compute_output_f writes globally visible
-                    int done_cnt = atomicAdd(&state->token_compute_done[recv_token_idx], 1) + 1;
-                    int expected = ld_acquire_sys_global(&state->token_compute_expected[recv_token_idx]);
-                    s_is_last = (done_cnt == expected);
+                              __bfloat162float(down_buf[idx]));
                 }
-                __syncthreads();
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            __threadfence_system();  // ensure output/reduce writes are visible before done counters
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-                if (s_is_last) {
-                    // Last expert for this token: convert float→bf16 and signal ready
-                    for (int h = thread_id; h < hidden; h += blockDim.x)
+            // Per-token completion signal. One SM per group owns counters/ready publication.
+            if (group_sm_idx == 0 && thread_id < batch_size) {
+                int recv_token_idx = s_recv_token_idx[thread_id];
+                if (s_expected[thread_id] == 1) {
+                    s_is_last[thread_id] = 1;
+                } else {
+                    int done_cnt = atomicAdd(&state->token_compute_done[recv_token_idx], 1) + 1;
+                    s_is_last[thread_id] = (done_cnt == s_expected[thread_id]);
+                }
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+            if (group_sm_idx == 0) {
+                for (int idx = thread_id; idx < batch_size * hidden; idx += blockDim.x) {
+                    int row = idx / hidden;
+                    int h = idx - row * hidden;
+                    if (s_is_last[row] && s_expected[row] > 1) {
+                        int recv_token_idx = s_recv_token_idx[row];
                         state->compute_output[(int64_t)recv_token_idx * hidden + h] =
                             __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
-                    __syncthreads();
-                    if (thread_id == 0) {
-                        __threadfence_system();
-                        st_release_sys_global(&state->combine_token_ready[recv_token_idx], 1);
                     }
                 }
             }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            __threadfence_system();
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+            if (group_sm_idx == 0 && thread_id < batch_size && s_is_last[thread_id]) {
+                st_release_sys_global(&state->combine_token_ready[s_recv_token_idx[thread_id]], 1);
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
             computed_so_far += batch_size;
         }
 
 #ifdef MK_PERF_TRACE
-        int next_expert_id = expert_id + num_compute_sms;
-        if (next_expert_id >= num_local_experts && thread_id == 0 && sm_id < state->perf_total_sms)
+        int next_expert_id = expert_id + num_compute_groups;
+        if (next_expert_id >= num_local_experts && group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms)
             state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = globaltimer_ns();
 #endif
     }
@@ -3014,6 +3088,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     internode::SourceMeta* recv_src_meta;
     int* compute_done_count;
     int* expert_compute_cursor;
+    int* compute_group_barrier;
+    int* compute_group_phase;
     __nv_bfloat16* compute_output;
     __nv_bfloat16* combine_input;
     float* combine_input_topk_weights;
@@ -3074,6 +3150,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(compute_done_count, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&expert_compute_cursor, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_compute_cursor, 0, num_local_experts * sizeof(int)));
+    int num_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
+    EP_HOST_ASSERT(num_compute_groups > 0);
+    EP_HOST_ASSERT(num_compute_sms == num_compute_groups * COMPUTE_GROUP_SIZE);
+    CUDA_CHECK(cudaMalloc(&compute_group_barrier, num_compute_groups * sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_group_barrier, 0, num_compute_groups * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_group_phase, num_compute_groups * sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_group_phase, 0, num_compute_groups * sizeof(int)));
 
     // Combine per-expert completion signals
     int* expert_compute_done;
@@ -3105,10 +3188,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&compute_output_f, (size_t)max_total_recv_tokens * hidden_dim * sizeof(float)));
     CUDA_CHECK(cudaMemset(compute_output_f, 0, (size_t)max_total_recv_tokens * hidden_dim * sizeof(float)));
 
-    // GEMM workspace: per-SM intermediates (padded input + gate + padded up/act + down).
-    // Padded M=16 inputs avoid WMMA M=1 tile loads reading past compact token buffers.
-    size_t per_sm_elems = (size_t)(16 * hidden_dim + intermediate_dim + 16 * intermediate_dim + hidden_dim);
-    size_t workspace_bytes = num_compute_sms * per_sm_elems * sizeof(__nv_bfloat16);
+    // GEMM workspace: per-compute-group batched intermediates for M=128 compute batches.
+    size_t per_group_elems = (size_t)COMPUTE_BATCH_SIZE * (2 * hidden_dim + 2 * intermediate_dim);
+    size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
 
     // Output accumulator [num_tokens, hidden_dim] in float32
@@ -3274,6 +3356,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_compute_done = token_compute_done;
     host_state.combine_token_ready = combine_token_ready;
     host_state.compute_output_f = compute_output_f;
+    host_state.compute_group_barrier = compute_group_barrier;
+    host_state.compute_group_phase = compute_group_phase;
 
     // Combine infrastructure
     void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
@@ -3372,6 +3456,8 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.token_compute_done));
     CUDA_CHECK(cudaFree(host_state.combine_token_ready));
     CUDA_CHECK(cudaFree(host_state.compute_output_f));
+    CUDA_CHECK(cudaFree(host_state.compute_group_barrier));
+    CUDA_CHECK(cudaFree(host_state.compute_group_phase));
     CUDA_CHECK(cudaFree(host_state.combined_x));
     CUDA_CHECK(cudaFree(host_state.combined_topk_weights));
     CUDA_CHECK(cudaFree(host_state.compute_output));

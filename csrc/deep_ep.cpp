@@ -1905,11 +1905,14 @@ torch::Tensor Buffer::megakernel_forward(
     printf("jinheng debug: num_ranks: %d, num_local_experts: %d, hidden_int4: %d, num_topk: %d, intermediate_dim: %d\n", num_ranks, num_local_experts, hidden_int4, num_topk, intermediate_dim);
 
 
-    // SM allocation: dispatch -> combine -> forwarder -> compute
-    // Forwarder SMs = NUM_MAX_NVL_PEERS (one per NVL destination)
-    const int num_forwarder_sms = NUM_MAX_NVL_PEERS;
-    const int num_compute_sms = total_sms - num_dispatch_sms - num_combine_sms - num_forwarder_sms;
-    EP_HOST_ASSERT(num_compute_sms > 0);
+    // SM allocation: dispatch -> combine -> compute groups, leaving any remainder reserved.
+    constexpr int compute_group_size = 32;
+    const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms;
+    const int num_compute_groups = compute_available_sms / compute_group_size;
+    const int num_compute_sms = num_compute_groups * compute_group_size;
+    const int num_forwarder_sms = compute_available_sms - num_compute_sms;  // reserved SMs, not launched as a role
+    const int active_total_sms = num_dispatch_sms + num_combine_sms + num_compute_sms;
+    EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
 
     // Config for buffer sizing, aligned with tests/test_megakernel_v7.py DeepEP config
@@ -2051,10 +2054,10 @@ torch::Tensor Buffer::megakernel_forward(
     // Worst case: all tokens route to one expert (each token can appear num_topk times)
     const int max_tokens_per_expert = std::max(1, max_total_recv_tokens * num_topk);
 
-    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d num_forwarder_sms=%d num_compute_sms=%d total_sms=%d\n",
+    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
            rank, max_total_recv_tokens, max_tokens_per_expert,
            static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
-           num_dispatch_sms, num_combine_sms, num_forwarder_sms, num_compute_sms, total_sms);
+           num_dispatch_sms, num_combine_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
 
     AT_CUDA_CHECK(cudaGetLastError());
 
@@ -2119,8 +2122,8 @@ torch::Tensor Buffer::megakernel_forward(
     // Match internode.cu dispatch/combine dynamic shared memory requirements.
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     printf("[MK-HOST][KERNEL][BEFORE] rank=%d state=%p total_sms=%d smem_size=%d stream=%p\n",
-           rank, state, total_sms, smem_size, stream.stream());
-    megakernel::launch_megakernel_v7(state, total_sms, smem_size, stream);
+           rank, state, active_total_sms, smem_size, stream.stream());
+    megakernel::launch_megakernel_v7(state, active_total_sms, smem_size, stream);
     printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
 
     printf("jinheng debug: enter this v4\n");
