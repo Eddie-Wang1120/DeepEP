@@ -107,7 +107,7 @@ def moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights, W_gate, W_up, 
 
 
 def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
-                          num_experts, experts_per_rank, buffer, config, local_rank, rank):
+                          num_experts, experts_per_rank, buffer, config, local_rank, rank, no_compute):
     """
     Baseline: DeepEP dispatch -> PyTorch expert compute -> DeepEP combine.
     Returns combined output [num_tokens, hidden] in bf16.
@@ -132,13 +132,17 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     if local_rank == 0:
         print(f'[Rank {rank}] Baseline dispatch done: recv_x shape={recv_x.shape}', flush=True)
 
-    # expert_out = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
-    #                                   W_gate, W_up, W_down, experts_per_rank)
+    if no_compute:
+        combine_x = recv_x
+    else:
+        combine_x = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
+                                        W_gate, W_up, W_down, experts_per_rank)
+    combine_topk_weights = recv_topk_weights
 
     combined_x, combined_topk_weights, event = buffer.combine(
-        x=recv_x,
+        x=combine_x,
         handle=handle,
-        topk_weights=recv_topk_weights,
+        topk_weights=combine_topk_weights,
         config=config
     )
 
@@ -230,7 +234,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
 
         baseline_output = run_baseline_pipeline(
             x, topk_idx, topk_weights, W_gate, W_up, W_down,
-            num_experts, experts_per_rank, buffer, config, local_rank, rank)
+            num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute)
     elif local_rank == 0:
         print(f'[Rank {rank}] Skipping baseline; only checking megakernel_forward completion', flush=True)
 
@@ -271,10 +275,27 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
         bitwise_equal = torch.equal(baseline_output, megakernel_output)
         print(f'  bitwise_equal: {bitwise_equal}')
 
-        if bitwise_equal:
+        if args.no_compute:
+            passed = bitwise_equal
+            failure_reason = 'bitwise precision mismatch'
+        else:
+            # Real compute uses PyTorch matmul/SwiGLU in the baseline and WMMA/__expf in
+            # megakernel, so BF16 bitwise equality is not expected. Keep the test focused
+            # on numerical agreement unless --no-compute is used to validate pure comms.
+            max_abs_tol = 1e-3
+            calc_diff_tol = 1e-8
+            cos_tol = 0.999
+            passed = max_abs_diff <= max_abs_tol and diff <= calc_diff_tol and cos_sim >= cos_tol
+            failure_reason = (
+                f'tolerance mismatch: max_abs_diff<={max_abs_tol}, '
+                f'calc_diff<={calc_diff_tol}, cosine_similarity>={cos_tol}'
+            )
+            print(f'  tolerance: max_abs_diff<={max_abs_tol:.1e}, calc_diff<={calc_diff_tol:.1e}, cosine_similarity>={cos_tol:.6f}')
+
+        if passed:
             print(f'  PASSED')
         else:
-            print(f'  FAILED - bitwise precision mismatch')
+            print(f'  FAILED - {failure_reason}')
             print(f'  baseline[:5]:    {baseline_output[0, :5].float().tolist()}')
             print(f'  megakernel[:5]:  {megakernel_output[0, :5].float().tolist()}')
             print_bitwise_mismatches(
@@ -315,6 +336,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test MK-v7 persistent megakernel vs baseline')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--skip-baseline', action='store_true')
+    parser.add_argument('--no-compute', action='store_true', help='Skip PyTorch expert compute in the baseline path')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 

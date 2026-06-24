@@ -2106,6 +2106,15 @@ torch::Tensor Buffer::megakernel_forward(
 
     AT_CUDA_CHECK(cudaGetLastError());
 
+#ifdef MK_PERF_TRACE
+
+    // Align all ranks after notify/state setup and immediately before the timed megakernel launch.
+    // This keeps dispatch fwd_wait_meta / recv_wait_prefix from measuring host-side node launch skew.
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    nvshmem_barrier_all();
+
+#endif
+
     // Compute shared memory size
     // Match internode.cu dispatch/combine dynamic shared memory requirements.
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
