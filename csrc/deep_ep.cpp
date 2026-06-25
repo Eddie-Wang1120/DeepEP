@@ -341,8 +341,6 @@ void Buffer::sync(const std::vector<int>& device_ids,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
-    printf("jinheng debug: enter sync\n");
-
     // Sync IPC handles
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
@@ -1881,9 +1879,6 @@ torch::Tensor Buffer::megakernel_forward(
     int num_combine_sms,
     int total_sms) {
 #ifndef DISABLE_NVSHMEM
-
-    printf("jinheng debug: enter this v0\n");
-
     pybind11::gil_scoped_release release;
 
     // Input validation
@@ -1900,10 +1895,6 @@ torch::Tensor Buffer::megakernel_forward(
     const int num_topk = topk_idx.size(1);
     const int intermediate_dim = W_gate.size(1);  // [num_experts, intermediate, hidden]
     const int num_local_experts = num_experts / num_ranks;
-
-    printf("jinheng debug: num_tokens: %d, hidden_dim: %d, num_experts: %d, num_dispatch_sms: %d, total_sms: %d\n", num_tokens, hidden_dim, num_experts, num_dispatch_sms, total_sms);
-    printf("jinheng debug: num_ranks: %d, num_local_experts: %d, hidden_int4: %d, num_topk: %d, intermediate_dim: %d\n", num_ranks, num_local_experts, hidden_int4, num_topk, intermediate_dim);
-
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
@@ -1940,8 +1931,6 @@ torch::Tensor Buffer::megakernel_forward(
         num_tokens_per_expert_t.data_ptr<int>(),
         is_token_in_rank.data_ptr<bool>(),
         num_tokens, num_topk, num_ranks, num_experts, stream);
-
-    printf("jinheng debug: enter this v1\n");
 
     // Step 2: notify_dispatch — exchange metadata via NVSHMEM
     auto rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -2047,8 +2036,6 @@ torch::Tensor Buffer::megakernel_forward(
         printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
     printf("]\n");
 
-    printf("jinheng debug: enter this v2\n");
-
     // Step 3: Allocate and launch megakernel v7
     const int max_total_recv_tokens = *moe_recv_counter;
     // Per-expert budget: evenly distribute received tokens across local experts, with 2x headroom
@@ -2106,7 +2093,6 @@ torch::Tensor Buffer::megakernel_forward(
         num_nvl_bytes);
 
     printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
-    printf("jinheng debug: enter this v3\n");
 
     AT_CUDA_CHECK(cudaGetLastError());
 
@@ -2127,12 +2113,8 @@ torch::Tensor Buffer::megakernel_forward(
     megakernel::launch_megakernel_v7(state, active_total_sms, smem_size, stream);
     printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
 
-    printf("jinheng debug: enter this v4\n");
-
     AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    printf("jinheng debug: after v0 startup v2");
 
     // Get combined_x directly (bf16, no extra copy/convert)
     void* combined_x_ptr = megakernel::get_combined_x_ptr(state);

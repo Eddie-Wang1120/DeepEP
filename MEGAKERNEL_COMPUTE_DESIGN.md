@@ -176,9 +176,10 @@ struct ComputeTask {
 第一版策略：
 
 ```text
-满 128 才进入主路径计算；
-dispatch 全局结束后，不足 128 的 tail batch 才 flush。
+满 128 -> 立即算
+不满 128 -> 等当前 dispatch round 完成后，一次性全 flush
 ```
+
 
 这样可以避免 compute 因尾批不足 128 而死等，同时保持主路径 batch GEMM 的效率。
 
@@ -224,7 +225,7 @@ recv_token_source_info 已稳定；
 
 ## Combine Head-of-Line Blocking 风险
 
-第一版使用全局 dispatch_done 后 flush tail，正确性简单，但可能带来性能风险：
+当前实现按 dispatch round flush tail，而不是等全局 dispatch_done；每个 round 对应一组 `num_dispatch_channels` 个 logical_channel，round 内全部结束后统一 flush：
 
 ```text
 combine 按发射顺序等待 combine_token_ready；
@@ -232,7 +233,7 @@ combine 按发射顺序等待 combine_token_ready；
 combine 可能被该 token head-of-line block。
 ```
 
-第一版接受这个风险，优先验证真实 compute 闭环。后续优化可引入 per-logical-channel tail flush。
+当前实现接受按 round flush 的粒度风险，优先验证真实 compute 闭环。后续若要进一步前移 tail flush，可再引入 per-logical-channel tail flush。
 
 ## 第二版：Per-Logical-Channel Tail Flush
 
@@ -456,7 +457,7 @@ consumer group 内更高效 barrier；
 
 ## 结论
 
-当前采用 1 个 scheduler SM、3 个动态 compute consumer group、每组 32 SM、每个 batch 128 token、全局 dispatch_done 后 flush tail、per-token-ready 放行 combine 的方案。
+当前采用 1 个 scheduler SM、3 个动态 compute consumer group、每组 32 SM、每个 batch 128 token、按 dispatch round flush tail、per-token-ready 放行 combine 的方案。
 
 该方案优先解决真实 compute 接入和协议正确性问题，并避免静态 expert/group 绑定导致的负载不均。性能上仍可能存在 combine head-of-line blocking，但可以通过后续 per-logical-channel tail flush 和更细粒度调度继续优化。
 

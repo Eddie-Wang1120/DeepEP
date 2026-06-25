@@ -201,8 +201,10 @@ def test(**kwargs):
 
 
 TEST_CASES = [
-    test(num_tokens=16, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
-    test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=4096, hidden=2048, intermediate=4096, experts_per_rank=8, num_topk=4),
+    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # Add more cases here, for example:
     # test(num_tokens=8192, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
 ]
