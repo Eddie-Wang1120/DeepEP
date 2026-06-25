@@ -4,7 +4,7 @@
 
 当前 MK-v7 megakernel 已经把 dispatch、compute 和 combine 融合到同一个 persistent CUDA kernel 中，并通过 logical channel 做通信流水。compute 已进入 dispatch -> compute -> combine 的真实 FFN 数据路径。
 
-本设计文档总结第一版 compute 接入方案：优先保证真实 compute 路径闭环、信号正确和 combine 可按 token ready 推进；暂不追求复杂动态调度和极限性能。
+本设计文档总结当前 compute 接入方案：优先保证真实 compute 路径闭环、信号正确和 combine 可按 token ready 推进；compute 调度已从按 expert 静态轮询升级为 scheduler SM + 动态 task queue。
 
 ## 当前状态：通信与 compute 已接入
 
@@ -14,18 +14,18 @@
 dispatch  : 已对齐。NVL receiver 直接把原始 token 写入 combine_input（megakernel.cu:1032），
             并在 topk 循环前一次性算好 token_compute_expected，再自旋保证 slot 数据先于
             expert_recv_count 可见（megakernel.cu:1040-1082）。
-combine   : 已对齐。combine_x 直接指向 combine_input（megakernel.cu:2961），
-            NVL sender 按 token 顺序自旋等待 combine_token_ready，带 timeout→trap
-            （megakernel.cu:1708-1722）。
-compute   : 已接入真实 FFN。compute_worker 采用 32-SM consumer group 协作一个 expert batch，
-            满 128 token 走 M=128 batched GEMM，dispatch_done 后 flush tail；
+combine   : 已对齐。combine_x 直接指向 compute_output，NVL sender 按 token 顺序
+            自旋等待 combine_token_ready，带 timeout→trap。
+compute   : 已接入真实 FFN。1 个 scheduler SM 扫描 expert_recv_count 并生成 ComputeTask；
+            3 个 32-SM consumer group 通过 CAS 动态 pop task，任意 group 都可处理任意
+            expert batch。满 128 token 走 M=128 batched GEMM，dispatch_done 后 flush tail；
             多 local expert contribution 先 atomicAdd 到 compute_output_f，最后转 bf16
             到 compute_output 并发 per-token-ready。
 ```
 
 关键事实：**combine 当前发的是 compute_output 中的 FFN 输出**。dispatch 写 combine_input 作为 compute 输入，compute 写 compute_output 作为 combine 输入，两者已分离。
 
-本文档「## SM 划分」「## Compute Batch 粒度」「## Consumer Group 内同步」等章节描述的 `3×32 SM consumer group` 已作为当前 compute 路线落地。
+本文档「## SM 划分」「## Compute Batch 粒度」「## Compute Task Queue」「## Consumer Group 内同步」等章节描述的 `scheduler + 3×32 SM consumer group` 已作为当前 compute 路线落地。
 
 ## 目标
 
@@ -39,7 +39,7 @@ dispatch -> compute -> combine
 
 ## SM 划分
 
-> 当前实现采用 `3×32 consumer group`：`compute = floor((total - dispatch - combine) / 32) * 32`，测试默认 `148 - 24 - 24 = 100`，因此启用 96 个 compute SM，剩余 4 个 SM reserved。
+> 当前实现采用 `1 scheduler SM + 3×32 consumer group`：先从 reserved 中抽 1 个 SM 做 scheduler，`compute = floor((total - dispatch - combine - scheduler) / 32) * 32`。测试默认 `148 - 24 - 24 - 1 = 99`，因此启用 96 个 compute SM，剩余 3 个 SM reserved。
 
 硬件总 SM 数：
 
@@ -47,16 +47,18 @@ dispatch -> compute -> combine
 total SM = 148
 ```
 
-第一版静态划分：
+当前划分：
 
 ```text
-dispatch = 24 SM
-combine  = 24 SM
-compute  = 96 SM = 3 个 consumer group * 32 SM
-reserved = 4 SM
+dispatch  = 24 SM
+combine   = 24 SM
+scheduler = 1 SM
+compute   = 96 SM = 3 个 consumer group * 32 SM
+reserved  = 3 SM
+active    = 145 SM
 ```
 
-其中每个 compute consumer group 固定 32 个 SM，一次处理一个 expert 的一个 batch。
+其中 scheduler SM 只负责入队 compute task；每个 compute consumer group 固定 32 个 SM，一次处理一个 expert 的一个 batch。consumer group 不再绑定 expert，空闲 group 可动态领取任意 expert batch。
 
 ## Compute Batch 粒度
 
@@ -142,18 +144,17 @@ route weight 只乘一次，且位置与 baseline 一致：SwiGLU 后、W_down �
 
 ## Compute Task Queue
 
-建议引入 compute task queue。队列元素是 batch descriptor：
+当前已引入 compute task queue。队列元素是 batch descriptor：
 
 ```cpp
 struct ComputeTask {
     int expert_id;
     int start_slot;
     int num_tokens;          // 128 或 tail < 128
-    int logical_channel_id;  // 第一版可不使用，第二版做 per-channel flush 时需要
 };
 ```
 
-第一版入队规则：
+当前入队规则：
 
 ```text
 正常阶段：
@@ -166,7 +167,7 @@ struct ComputeTask {
   -> 入队一个 tail batch
 ```
 
-`enqueue_cursor[expert]` 记录该 expert 已经入队到哪个 expert-local slot，避免重复入队。
+`enqueue_cursor[expert]` 记录该 expert 已经入队到哪个 expert-local slot，避免重复入队。scheduler 是唯一 producer，通过 `compute_task_tail` 顺序发布任务；compute groups 是多个 consumer，通过 CAS 推进 `compute_task_head` 领取任务。group 内只有 `group_sm_idx==0 && threadIdx.x==0` pop task，并通过 `compute_group_task_idx[group_id]` 广播给同组 32 个 SM；`-1` 表示暂时无任务，`-2` 表示 scheduler 已完成且队列为空，整组统一退出，避免 group barrier 分歧。
 
 ## 不足 128 Token 的处理
 
@@ -370,7 +371,7 @@ wait combine_token_ready[token_idx]
 
 ### ⚠ 新增正确性前提：先 fence output，再发 ready
 
-现状下 compute 是 pure gate，combine 读的是 dispatch 写的 combine_input，所以 ready 信号不涉及 output 可见性。重构后 compute 要真正写 output，必须保证写出顺序：
+当前 compute 真正写 output，ready 信号必须保证 output 可见性。写出顺序必须保持：
 
 ```text
 1. compute 写 compute_output[recv_token_idx]（含多 expert reduce）；
@@ -427,17 +428,17 @@ SwiGLU 后可覆盖 `up_scratch` 为 activation，供 `W_down` 使用。
 
 ## 第一版落地范围
 
-第一版建议只实现以下内容：
+当前已实现以下内容：
 
 ```text
-3 个固定 compute consumer group；
+1 个 scheduler SM；
+3 个动态 compute consumer group；
 每组 32 SM；
 full batch = 128；
 全局 dispatch_done 后 flush tail；
-compute 输出写 combine_input；
+compute 输出写 compute_output；
 combine 用 per-token-ready 等待；
-不做 per-channel tail flush；
-不做复杂动态调度。
+不做 per-channel tail flush。
 ```
 
 ## 后续优化方向
@@ -455,17 +456,17 @@ consumer group 内更高效 barrier；
 
 ## 结论
 
-第一版采用固定 3 个 compute consumer group、每组 32 SM、每个 batch 128 token、全局 dispatch_done 后 flush tail、per-token-ready 放行 combine 的方案是可行的。
+当前采用 1 个 scheduler SM、3 个动态 compute consumer group、每组 32 SM、每个 batch 128 token、全局 dispatch_done 后 flush tail、per-token-ready 放行 combine 的方案。
 
-该方案优先解决真实 compute 接入和协议正确性问题。性能上可能存在 combine head-of-line blocking，但可以通过后续 per-logical-channel tail flush 和更细粒度调度继续优化。
+该方案优先解决真实 compute 接入和协议正确性问题，并避免静态 expert/group 绑定导致的负载不均。性能上仍可能存在 combine head-of-line blocking，但可以通过后续 per-logical-channel tail flush 和更细粒度调度继续优化。
 
 ## 待决策点
 
 下面是重构前需要你拍板的点。每条给了现状、选项和我的倾向，你决定后我再据此改代码/文档。
 
 - **D1｜compute 的 SM 划分模型**
-  - 当前实现：采用选项 B，固定 32 个 SM 组成一个 compute consumer group，多个 group 在 local experts 上 round-robin。默认 `total=148, dispatch=24, combine=24` 时启用 3 个 group / 96 个 compute SM，剩余 4 个 SM reserved。
-  - 每个 group 共享一份 batch workspace，GEMM tile 由 `group_warp_id` 在 32 个 SM 的所有 warp 上切分；阶段间用 `compute_group_barrier/phase` 做 global barrier。
+  - 当前实现：采用选项 B，固定 32 个 SM 组成一个 compute consumer group，并从 reserved 中抽 1 个 SM 做 scheduler。默认 `total=148, dispatch=24, combine=24, scheduler=1` 时启用 3 个 group / 96 个 compute SM，剩余 3 个 SM reserved。
+  - 每个 group 共享一份 batch workspace，GEMM tile 由 `group_warp_id` 在 32 个 SM 的所有 warp 上切分；阶段间用 `compute_group_barrier/phase` 做 global barrier。group 通过 task queue 动态领取任意 expert batch，不再按 local expert 静态 round-robin。
 
 - **D2｜combine 的最终数据来源 / buffer 所有权**
   - 现状：combine_input 由 dispatch 写原始 token，combine_x 指向它；compute 不写输出（megakernel.cu:1032/2961）。
@@ -488,4 +489,4 @@ consumer group 内更高效 barrier；
   - expected>1 的 token 多 expert contribution 必须累加。
   - 当前实现：dispatch 先发布最终 `token_compute_expected`，再发布 expert slot；compute 中 `expected==1` 直接 store 到 `compute_output`，`expected>1` 走 `compute_output_f` float atomic reduce，最后一个 expert 转 bf16 并发 ready。该实现避免 BF16 atomic 精度问题，同时保留单 expert 快路径。
 
-当前落地组合：**D1=B, D2=A, D3=B(先), D4=对齐baseline, D5=B**。compute 已从单 SM/expert 升级为 32-SM consumer group 协作一个 expert batch。
+当前落地组合：**D1=B + scheduler/task queue, D2=A, D3=B(先), D4=对齐baseline, D5=B**。compute 已从单 SM/expert 升级为 scheduler 动态分发、32-SM consumer group 协作一个 expert batch。

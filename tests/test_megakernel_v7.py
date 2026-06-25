@@ -15,6 +15,9 @@ Usage (2 nodes x 8 GPUs):
 import argparse
 import os
 import sys
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -183,25 +186,49 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     return result
 
 
-def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args):
+@dataclass(frozen=True)
+class TestCase:
+    num_tokens: int = 16
+    hidden: int = 256
+    intermediate: int = 256
+    experts_per_rank: int = 8
+    num_topk: int = 2
+    num_topk_groups: Optional[int] = None
+
+
+def test(**kwargs):
+    return TestCase(**kwargs)
+
+
+TEST_CASES = [
+    test(num_tokens=16, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
+    test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
+    # Add more cases here, for example:
+    # test(num_tokens=8192, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
+]
+
+
+def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, case, case_idx, num_cases):
     """Compare baseline vs megakernel output."""
-    torch.manual_seed(42 + rank)
+    torch.manual_seed(42 + rank + case_idx * 1000003)
 
     num_nodes = num_ranks // num_local_ranks
 
     # Configuration
-    num_tokens = 8192
-    hidden = 4096
-    intermediate = 4096
-    experts_per_rank = 16
+    num_tokens = case.num_tokens
+    hidden = case.hidden
+    intermediate = case.intermediate
+    experts_per_rank = case.experts_per_rank
     num_experts = num_ranks * experts_per_rank
-    num_topk = 8
-    num_topk_groups = num_nodes
+    num_topk = case.num_topk
+    num_topk_groups = num_nodes if case.num_topk_groups is None else case.num_topk_groups
 
     if local_rank == 0:
+        print(f'')
+        print(f'[Rank {rank}] === Test case {case_idx + 1}/{num_cases} ===', flush=True)
         print(f'[Rank {rank}] Config: num_tokens={num_tokens}, hidden={hidden}, '
               f'intermediate={intermediate}, experts_per_rank={experts_per_rank}, '
-              f'topk={num_topk}, num_ranks={num_ranks}', flush=True)
+              f'topk={num_topk}, num_topk_groups={num_topk_groups}, num_ranks={num_ranks}', flush=True)
 
     # Generate test data
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='cuda') * 0.1
@@ -321,8 +348,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if local_rank == 0:
         print(f'[Rank {rank}] Buffer initialized, num_ranks={num_ranks}, num_sms={num_sms}', flush=True)
 
-    diff, max_abs_diff, cos_sim = test_main(
-        local_rank, num_local_ranks, rank, num_ranks, buffer, group, args)
+    for case_idx, case in enumerate(TEST_CASES):
+        test_main(
+            local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
+            case, case_idx, len(TEST_CASES))
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
 
     buffer.destroy()
     dist.barrier()
@@ -389,7 +420,12 @@ if __name__ == '__main__':
         if local_rank == 0:
             print(f'[Rank {global_rank}] Buffer initialized, world_size={world_size}, num_sms={num_sms}', flush=True)
 
-        test_main(local_rank, num_local_ranks, global_rank, world_size, buffer, group, args)
+        for case_idx, case in enumerate(TEST_CASES):
+            test_main(
+                local_rank, num_local_ranks, global_rank, world_size, buffer, group, args,
+                case, case_idx, len(TEST_CASES))
+            dist.barrier(group=group)
+            torch.cuda.synchronize()
 
         buffer.destroy()
         dist.barrier()

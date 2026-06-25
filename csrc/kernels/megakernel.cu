@@ -44,6 +44,7 @@ namespace megakernel {
 
 constexpr int COMPUTE_BATCH_SIZE = 128;  // Tokens per expert batch before triggering GEMM
 constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
+constexpr int COMPUTE_SCHEDULER_SMS = 1; // Reserved SMs used to enqueue compute tasks
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
@@ -72,7 +73,14 @@ constexpr int kMegaKernelNumThreads = (kNumCombineForwarders + 1) * 32;
 enum class SmRole {
     kDispatch,      // Runs full DeepEP dispatch (even SM = forwarder, odd SM = sender)
     kCombine,       // DeepEP combine (even SM = NVLSender+RDMAReceiver, odd SM = Forwarder)
-    kCompute        // Polls expert_recv_count, does GEMM+SwiGLU
+    kScheduler,     // Enqueues expert compute batches for dynamic compute groups
+    kCompute        // Pops compute tasks, does GEMM+SwiGLU
+};
+
+struct ComputeTask {
+    int expert_id;
+    int start_slot;
+    int num_tokens;
 };
 
 // ============================================================================
@@ -142,6 +150,13 @@ struct MegaKernelState {
     float* compute_output_f;            // [max_total_recv_tokens, hidden] float accumulator for multi-expert reduce
     int* compute_group_barrier;         // [num_compute_groups] reusable global barrier counters
     int* compute_group_phase;           // [num_compute_groups] reusable global barrier phase flags
+    ComputeTask* compute_tasks;         // [max_compute_tasks] dynamic compute task queue
+    int max_compute_tasks;
+    int* compute_task_head;             // CAS pop cursor
+    int* compute_task_tail;             // single scheduler publish cursor
+    int* compute_enqueue_done;          // set by scheduler after tail tasks are published
+    int* expert_enqueue_cursor;         // [num_local_experts] how many slots have been enqueued
+    int* compute_group_task_idx;        // [num_compute_groups] broadcast popped task idx to group SMs
 
     // --- Compute state ---
     int* compute_done_count;          // Atomic: how many experts have finished compute
@@ -1309,7 +1324,7 @@ __device__ void dispatch_worker_v2(
 }
 
 // ============================================================================
-// Compute Worker: polls expert_recv_count, does GEMM+SwiGLU in batches
+// Compute Scheduler + Worker: scheduler enqueues expert batches, compute groups run GEMM+SwiGLU
 // ============================================================================
 
 __device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
@@ -1326,6 +1341,59 @@ __device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int g
         }
     }
     __syncthreads();
+}
+
+__device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens) {
+    int tail = ld_acquire_sys_global(state->compute_task_tail);
+    if (tail >= state->max_compute_tasks) {
+        printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
+        trap();
+    }
+    state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens};
+    __threadfence_system();
+    st_release_sys_global(state->compute_task_tail, tail + 1);
+}
+
+__device__ void compute_scheduler_worker(MegaKernelState* state) {
+    if (threadIdx.x != 0)
+        return;
+
+    const int num_local_experts = state->num_local_experts;
+    bool tail_enqueued = false;
+
+    while (true) {
+        for (int expert_id = 0; expert_id < num_local_experts; ++expert_id) {
+            int cursor = ld_acquire_sys_global(&state->expert_enqueue_cursor[expert_id]);
+            int arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
+            while (arrived - cursor >= COMPUTE_BATCH_SIZE) {
+                scheduler_publish_task(state, expert_id, cursor, COMPUTE_BATCH_SIZE);
+                cursor += COMPUTE_BATCH_SIZE;
+                st_release_sys_global(&state->expert_enqueue_cursor[expert_id], cursor);
+                arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
+            }
+        }
+
+        int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
+        bool dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count);
+        if (dispatch_done && !tail_enqueued) {
+            for (int expert_id = 0; expert_id < num_local_experts; ++expert_id) {
+                int cursor = ld_acquire_sys_global(&state->expert_enqueue_cursor[expert_id]);
+                int arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
+                if (arrived > cursor) {
+                    scheduler_publish_task(state, expert_id, cursor, arrived - cursor);
+                    st_release_sys_global(&state->expert_enqueue_cursor[expert_id], arrived);
+                }
+            }
+            __threadfence_system();
+            st_release_sys_global(state->compute_enqueue_done, 1);
+            tail_enqueued = true;
+        }
+
+        if (tail_enqueued)
+            break;
+
+        __nanosleep(128);
+    }
 }
 
 __device__ void compute_worker(
@@ -1372,154 +1440,159 @@ __device__ void compute_worker(
     __shared__ int s_expected[COMPUTE_BATCH_SIZE];
     __shared__ int s_is_last[COMPUTE_BATCH_SIZE];
 
-    for (int expert_id = group_id; expert_id < num_local_experts; expert_id += num_compute_groups) {
-        int computed_so_far = 0;
-
-        while (true) {
-            int arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
-            int ready_tokens = arrived - computed_so_far;
-
-            bool should_compute = (ready_tokens >= COMPUTE_BATCH_SIZE);
-            bool done = false;
-
-            if (!should_compute) {
-                int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
-                done = (dispatch_done_count == state->expected_dispatch_done_count);
-                if (done && ready_tokens > 0)
-                    should_compute = true;
-                if (done && ready_tokens == 0) {
-                    arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
-                    if (arrived == computed_so_far)
-                        break;
-                    continue;
+    bool recorded_first_batch = false;
+    while (true) {
+        if (group_sm_idx == 0 && thread_id == 0) {
+            int task_idx = -1;
+            while (true) {
+                int head = ld_acquire_sys_global(state->compute_task_head);
+                int tail = ld_acquire_sys_global(state->compute_task_tail);
+                if (head >= tail) {
+                    if (ld_acquire_sys_global(state->compute_enqueue_done))
+                        task_idx = -2;
+                    break;
+                }
+                if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
+                    task_idx = head;
+                    break;
                 }
             }
+            st_release_sys_global(&state->compute_group_task_idx[group_id], task_idx);
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-            if (!should_compute) {
-                if (thread_id == 0) __nanosleep(64);
-                continue;
-            }
-
-            int batch_size = min(ready_tokens, COMPUTE_BATCH_SIZE);
-
-#ifdef MK_PERF_TRACE
-            if (computed_so_far == 0 && expert_id == group_id && group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms)
-                state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
-#endif
-
-            for (int i = thread_id; i < batch_size; i += blockDim.x) {
-                int base_offset = expert_id * max_tpe + computed_so_far + i;
-                s_recv_token_idx[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2]);
-                s_topk_slot[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2 + 1]);
-                s_expected[i] = ld_acquire_sys_global(&state->token_compute_expected[s_recv_token_idx[i]]);
-#ifdef MK_TOKEN_TRACE
-                printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
-                       state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
-#endif
-            }
-            __syncthreads();
-
-            for (int idx = group_thread_id; idx < input_stride; idx += group_num_threads) {
-                int row = idx / hidden;
-                int h = idx - row * hidden;
-                input_buf[idx] = (row < batch_size)
-                    ? state->combine_input[(int64_t)s_recv_token_idx[row] * hidden + h]
-                    : __float2bfloat16(0.0f);
-            }
+        int task_idx = ld_acquire_sys_global(&state->compute_group_task_idx[group_id]);
+        if (task_idx == -2)
+            break;
+        if (task_idx < 0) {
+            if (group_sm_idx == 0 && thread_id == 0)
+                __nanosleep(128);
             compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            // Expert weight slices
-            const __nv_bfloat16* w_gate = &state->W_gate[expert_id * intermediate * hidden];
-            const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
-            const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
-
-            // GEMM 1/2: [batch_size, hidden] @ [intermediate, hidden]^T
-            device_gemm_bf16(input_buf, w_gate, gate_buf, batch_size, hidden, intermediate,
-                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-            device_gemm_bf16(input_buf, w_up, up_buf, batch_size, hidden, intermediate,
-                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            // SwiGLU + route weight: act = silu(gate) * up * route_weight.
-            for (int idx = group_thread_id; idx < up_stride; idx += group_num_threads) {
-                int row = idx / intermediate;
-                if (row < batch_size) {
-                    int recv_token_idx = s_recv_token_idx[row];
-                    int topk_slot = s_topk_slot[row];
-                    float route_w = ld_nc_global(&state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot]);
-                    float g = __bfloat162float(gate_buf[idx]);
-                    float u = __bfloat162float(up_buf[idx]);
-                    float silu_g = g * (1.0f / (1.0f + __expf(-g)));
-                    up_buf[idx] = __float2bfloat16(silu_g * u * route_w);
-                } else {
-                    up_buf[idx] = __float2bfloat16(0.0f);
-                }
-            }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            // GEMM 3: [batch_size, intermediate] @ [hidden, intermediate]^T
-            device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
-                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            // expected==1 can store directly; multi-local-expert tokens reduce through float atomics.
-            for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
-                int row = idx / hidden;
-                int h = idx - row * hidden;
-                int recv_token_idx = s_recv_token_idx[row];
-                if (s_expected[row] == 1) {
-                    state->compute_output[(int64_t)recv_token_idx * hidden + h] = down_buf[idx];
-                } else {
-                    atomicAdd(&state->compute_output_f[(int64_t)recv_token_idx * hidden + h],
-                              __bfloat162float(down_buf[idx]));
-                }
-            }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-            __threadfence_system();  // ensure output/reduce writes are visible before done counters
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            // Per-token completion signal. One SM per group owns counters/ready publication.
-            if (group_sm_idx == 0 && thread_id < batch_size) {
-                int recv_token_idx = s_recv_token_idx[thread_id];
-                if (s_expected[thread_id] == 1) {
-                    s_is_last[thread_id] = 1;
-                } else {
-                    int done_cnt = atomicAdd(&state->token_compute_done[recv_token_idx], 1) + 1;
-                    s_is_last[thread_id] = (done_cnt == s_expected[thread_id]);
-                }
-            }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            if (group_sm_idx == 0) {
-                for (int idx = thread_id; idx < batch_size * hidden; idx += blockDim.x) {
-                    int row = idx / hidden;
-                    int h = idx - row * hidden;
-                    if (s_is_last[row] && s_expected[row] > 1) {
-                        int recv_token_idx = s_recv_token_idx[row];
-                        state->compute_output[(int64_t)recv_token_idx * hidden + h] =
-                            __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
-                    }
-                }
-            }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-            __threadfence_system();
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            if (group_sm_idx == 0 && thread_id < batch_size && s_is_last[thread_id]) {
-                st_release_sys_global(&state->combine_token_ready[s_recv_token_idx[thread_id]], 1);
-            }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-            computed_so_far += batch_size;
+            continue;
         }
 
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        ComputeTask task = state->compute_tasks[task_idx];
+        int expert_id = task.expert_id;
+        int start_slot = task.start_slot;
+        int batch_size = task.num_tokens;
+
 #ifdef MK_PERF_TRACE
-        int next_expert_id = expert_id + num_compute_groups;
-        if (next_expert_id >= num_local_experts && group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms)
-            state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = globaltimer_ns();
+        if (!recorded_first_batch && group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms) {
+            state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 1] = globaltimer_ns();
+            recorded_first_batch = true;
+        }
 #endif
+
+        for (int i = thread_id; i < batch_size; i += blockDim.x) {
+            int base_offset = expert_id * max_tpe + start_slot + i;
+            s_recv_token_idx[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2]);
+            s_topk_slot[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+            s_expected[i] = ld_acquire_sys_global(&state->token_compute_expected[s_recv_token_idx[i]]);
+#ifdef MK_TOKEN_TRACE
+            printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
+                   state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
+#endif
+        }
+        __syncthreads();
+
+        for (int idx = group_thread_id; idx < input_stride; idx += group_num_threads) {
+            int row = idx / hidden;
+            int h = idx - row * hidden;
+            input_buf[idx] = (row < batch_size)
+                ? state->combine_input[(int64_t)s_recv_token_idx[row] * hidden + h]
+                : __float2bfloat16(0.0f);
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        // Expert weight slices
+        const __nv_bfloat16* w_gate = &state->W_gate[expert_id * intermediate * hidden];
+        const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
+        const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
+
+        // GEMM 1/2: [batch_size, hidden] @ [intermediate, hidden]^T
+        device_gemm_bf16(input_buf, w_gate, gate_buf, batch_size, hidden, intermediate,
+                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        device_gemm_bf16(input_buf, w_up, up_buf, batch_size, hidden, intermediate,
+                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        // SwiGLU + route weight: act = silu(gate) * up * route_weight.
+        for (int idx = group_thread_id; idx < up_stride; idx += group_num_threads) {
+            int row = idx / intermediate;
+            if (row < batch_size) {
+                int recv_token_idx = s_recv_token_idx[row];
+                int topk_slot = s_topk_slot[row];
+                float route_w = ld_nc_global(&state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot]);
+                float g = __bfloat162float(gate_buf[idx]);
+                float u = __bfloat162float(up_buf[idx]);
+                float silu_g = g * (1.0f / (1.0f + __expf(-g)));
+                up_buf[idx] = __float2bfloat16(silu_g * u * route_w);
+            } else {
+                up_buf[idx] = __float2bfloat16(0.0f);
+            }
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        // GEMM 3: [batch_size, intermediate] @ [hidden, intermediate]^T
+        device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
+                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        // expected==1 can store directly; multi-local-expert tokens reduce through float atomics.
+        for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
+            int row = idx / hidden;
+            int h = idx - row * hidden;
+            int recv_token_idx = s_recv_token_idx[row];
+            if (s_expected[row] == 1) {
+                state->compute_output[(int64_t)recv_token_idx * hidden + h] = down_buf[idx];
+            } else {
+                atomicAdd(&state->compute_output_f[(int64_t)recv_token_idx * hidden + h],
+                          __bfloat162float(down_buf[idx]));
+            }
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        __threadfence_system();  // ensure output/reduce writes are visible before done counters
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        // Per-token completion signal. One SM per group owns counters/ready publication.
+        if (group_sm_idx == 0 && thread_id < batch_size) {
+            int recv_token_idx = s_recv_token_idx[thread_id];
+            if (s_expected[thread_id] == 1) {
+                s_is_last[thread_id] = 1;
+            } else {
+                int done_cnt = atomicAdd(&state->token_compute_done[recv_token_idx], 1) + 1;
+                s_is_last[thread_id] = (done_cnt == s_expected[thread_id]);
+            }
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        if (group_sm_idx == 0) {
+            for (int idx = thread_id; idx < batch_size * hidden; idx += blockDim.x) {
+                int row = idx / hidden;
+                int h = idx - row * hidden;
+                if (s_is_last[row] && s_expected[row] > 1) {
+                    int recv_token_idx = s_recv_token_idx[row];
+                    state->compute_output[(int64_t)recv_token_idx * hidden + h] =
+                        __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
+                }
+            }
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        __threadfence_system();
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+
+        if (group_sm_idx == 0 && thread_id < batch_size && s_is_last[thread_id]) {
+            st_release_sys_global(&state->combine_token_ready[s_recv_token_idx[thread_id]], 1);
+        }
+        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
     }
+
+#ifdef MK_PERF_TRACE
+    if (group_sm_idx == 0 && thread_id == 0 && sm_id < state->perf_total_sms)
+        state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 2] = globaltimer_ns();
+#endif
 }
 
 // ============================================================================
@@ -2618,7 +2691,7 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
     auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
 
     // Determine SM role based on blockIdx.x
-    // Layout: [Dispatch 0..D-1] [Combine D..D+C-1] [Compute D+C..total-1]
+    // Layout: [Dispatch] [Combine] [Scheduler] [Compute groups]
     SmRole role;
     int role_idx;
 
@@ -2628,9 +2701,12 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
     } else if (sm_id < num_dispatch_sms + num_combine_sms) {
         role = SmRole::kCombine;
         role_idx = sm_id - num_dispatch_sms;
+    } else if (sm_id < num_dispatch_sms + num_combine_sms + COMPUTE_SCHEDULER_SMS) {
+        role = SmRole::kScheduler;
+        role_idx = sm_id - num_dispatch_sms - num_combine_sms;
     } else {
         role = SmRole::kCompute;
-        role_idx = sm_id - num_dispatch_sms - num_combine_sms;
+        role_idx = sm_id - num_dispatch_sms - num_combine_sms - COMPUTE_SCHEDULER_SMS;
     }
 
     switch (role) {
@@ -2652,6 +2728,10 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
 #ifdef MK_PERF_TRACE
             if (threadIdx.x == 0 && sm_id < state->perf_total_sms) state->perf_phase_ts[sm_id * MegaKernelState::MK_PERF_NUM_PHASES + 4] = globaltimer_ns();
 #endif
+            break;
+
+        case SmRole::kScheduler:
+            compute_scheduler_worker(state);
             break;
 
         case SmRole::kCompute:
@@ -3090,6 +3170,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* expert_compute_cursor;
     int* compute_group_barrier;
     int* compute_group_phase;
+    ComputeTask* compute_tasks;
+    int* compute_task_head;
+    int* compute_task_tail;
+    int* compute_enqueue_done;
+    int* expert_enqueue_cursor;
+    int* compute_group_task_idx;
     __nv_bfloat16* compute_output;
     __nv_bfloat16* combine_input;
     float* combine_input_topk_weights;
@@ -3157,6 +3243,19 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(compute_group_barrier, 0, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&compute_group_phase, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_phase, 0, num_compute_groups * sizeof(int)));
+
+    int max_compute_tasks = num_local_experts * (max_tokens_per_expert / COMPUTE_BATCH_SIZE + 2);
+    CUDA_CHECK(cudaMalloc(&compute_tasks, (size_t)max_compute_tasks * sizeof(ComputeTask)));
+    CUDA_CHECK(cudaMalloc(&compute_task_head, sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_task_head, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_task_tail, sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_task_tail, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_enqueue_done, sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_enqueue_done, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&expert_enqueue_cursor, num_local_experts * sizeof(int)));
+    CUDA_CHECK(cudaMemset(expert_enqueue_cursor, 0, num_local_experts * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_group_task_idx, num_compute_groups * sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_group_task_idx, 0xff, num_compute_groups * sizeof(int)));
 
     // Combine per-expert completion signals
     int* expert_compute_done;
@@ -3312,6 +3411,15 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Compute state
     host_state.compute_done_count = compute_done_count;
     host_state.expert_compute_cursor = expert_compute_cursor;
+    host_state.compute_group_barrier = compute_group_barrier;
+    host_state.compute_group_phase = compute_group_phase;
+    host_state.compute_tasks = compute_tasks;
+    host_state.max_compute_tasks = max_compute_tasks;
+    host_state.compute_task_head = compute_task_head;
+    host_state.compute_task_tail = compute_task_tail;
+    host_state.compute_enqueue_done = compute_enqueue_done;
+    host_state.expert_enqueue_cursor = expert_enqueue_cursor;
+    host_state.compute_group_task_idx = compute_group_task_idx;
 
     // Expert weights
     host_state.W_gate = W_gate;
@@ -3356,8 +3464,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_compute_done = token_compute_done;
     host_state.combine_token_ready = combine_token_ready;
     host_state.compute_output_f = compute_output_f;
-    host_state.compute_group_barrier = compute_group_barrier;
-    host_state.compute_group_phase = compute_group_phase;
 
     // Combine infrastructure
     void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
@@ -3368,7 +3474,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t* perf_dispatch_role_ts;
     int64_t* perf_dispatch_detail_ts;
     int64_t* perf_combine_lch_ts;
-    int perf_total_sms = num_dispatch_sms + num_combine_sms + num_compute_sms;
+    int perf_total_sms = num_dispatch_sms + num_combine_sms + COMPUTE_SCHEDULER_SMS + num_compute_sms;
     constexpr int NP = MegaKernelState::MK_PERF_NUM_PHASES;
     constexpr int NLP = MegaKernelState::MK_PERF_NUM_LCH_PHASES;
     constexpr int NDR = MegaKernelState::MK_PERF_NUM_DISPATCH_ROLES;
@@ -3458,6 +3564,12 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.compute_output_f));
     CUDA_CHECK(cudaFree(host_state.compute_group_barrier));
     CUDA_CHECK(cudaFree(host_state.compute_group_phase));
+    CUDA_CHECK(cudaFree(host_state.compute_tasks));
+    CUDA_CHECK(cudaFree(host_state.compute_task_head));
+    CUDA_CHECK(cudaFree(host_state.compute_task_tail));
+    CUDA_CHECK(cudaFree(host_state.compute_enqueue_done));
+    CUDA_CHECK(cudaFree(host_state.expert_enqueue_cursor));
+    CUDA_CHECK(cudaFree(host_state.compute_group_task_idx));
     CUDA_CHECK(cudaFree(host_state.combined_x));
     CUDA_CHECK(cudaFree(host_state.combined_topk_weights));
     CUDA_CHECK(cudaFree(host_state.compute_output));

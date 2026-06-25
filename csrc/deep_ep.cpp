@@ -1905,13 +1905,14 @@ torch::Tensor Buffer::megakernel_forward(
     printf("jinheng debug: num_ranks: %d, num_local_experts: %d, hidden_int4: %d, num_topk: %d, intermediate_dim: %d\n", num_ranks, num_local_experts, hidden_int4, num_topk, intermediate_dim);
 
 
-    // SM allocation: dispatch -> combine -> compute groups, leaving any remainder reserved.
+    // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
-    const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms;
+    constexpr int compute_scheduler_sms = 1;
+    const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;
-    const int num_forwarder_sms = compute_available_sms - num_compute_sms;  // reserved SMs, not launched as a role
-    const int active_total_sms = num_dispatch_sms + num_combine_sms + num_compute_sms;
+    const int num_forwarder_sms = compute_available_sms - num_compute_sms;  // remaining reserved SMs, not launched as a role
+    const int active_total_sms = num_dispatch_sms + num_combine_sms + compute_scheduler_sms + num_compute_sms;
     EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
 
@@ -2054,10 +2055,10 @@ torch::Tensor Buffer::megakernel_forward(
     // Worst case: all tokens route to one expert (each token can appear num_topk times)
     const int max_tokens_per_expert = std::max(1, max_total_recv_tokens * num_topk);
 
-    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
+    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d scheduler_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
            rank, max_total_recv_tokens, max_tokens_per_expert,
            static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
-           num_dispatch_sms, num_combine_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
+           num_dispatch_sms, num_combine_sms, compute_scheduler_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
 
     AT_CUDA_CHECK(cudaGetLastError());
 
