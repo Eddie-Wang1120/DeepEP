@@ -491,3 +491,148 @@ consumer group 内更高效 barrier；
   - 当前实现：dispatch 先发布最终 `token_compute_expected`，再发布 expert slot；compute 中 `expected==1` 直接 store 到 `compute_output`，`expected>1` 走 `compute_output_f` float atomic reduce，最后一个 expert 转 bf16 并发 ready。该实现避免 BF16 atomic 精度问题，同时保留单 expert 快路径。
 
 当前落地组合：**D1=B + scheduler/task queue, D2=A, D3=B(先), D4=对齐baseline, D5=B**。compute 已从单 SM/expert 升级为 scheduler 动态分发、32-SM consumer group 协作一个 expert batch。
+
+---
+
+# 附录：Compute 计算部分性能优化（B300，借鉴 SonicMoE）
+
+> 本章是独立于上面「接入/协议正确性」的另一个维度：**在协议已闭环的前提下，如何把 compute 的 GEMM/SwiGLU
+> 计算部分在 B300（Blackwell，SM100）上做到性能最优**，主要借鉴 SonicMoE 的 IO/Tile-aware 思路。
+> 适用范围：推理 forward-only。dispatch / combine 不在本章范围。
+
+参考实现：SonicMoE（`../sonic-moe/`），论文 `SonicMOE.pdf` + 博客 `assets/2026-04-22-sonicmoe-blackwell.md`。
+本仓相关代码：`device_gemm_bf16`（megakernel.cu:287-335）、`compute_worker`（megakernel.cu:1370-1575）。
+
+## A. SonicMoE 对 MoE 计算的优化点
+
+核心判断：**细粒度 + 高稀疏 MoE 已进入 memory-bound regime**（算术强度低），瓶颈是 IO 与调度，不是算力。
+
+### A.1 算法层：消除 O(TKd) 中间张量（不适用 megakernel）
+- 反向重排 `dS_{t,e}=⟨dO_t, A_e W_2⟩=⟨dA'_{e,t}, A_{e,t}⟩`，避免缓存 `Y`/`dY`，激活显存与粒度无关。
+- megakernel 是推理 forward-only，无 backward、无激活缓存，这层不复用。
+
+### A.2 IO 层（forward 最该复用）
+- **Gather fusion**：token gather 融进 GMEM→SMEM load（cp.async / TMA gather4），不写 gathered X 到 HBM。
+- **L2 局部性**：从原始 `T×d` 张量 gather（比预聚合 `T×K×d` 小 K 倍），更易常驻 L2（B300 192MB），实测 HBM load 下降、L2 命中率 74.9% vs 66.3%。
+- **SwiGLU in-register epilogue 融合**：MMA 结果在寄存器/TMEM 内直接算 SwiGLU，不落 HBM 再读回。
+- **Expert aggregation = gather-and-sum**：GEMM 连续打包输出，聚合时每 token gather 自己激活的专家输出求和（比 scatter-fusion 在 Hopper 快 20%，B300 仍快 3%）。
+
+### A.3 硬件/调度层（B300 直接相关）
+- **2CTA MMA**：一对 CTA 协作一条 UMMA，M_tile 翻倍到 256；B（权重）tile 在 CTA pair 间 multicast 共享，**B-side SMEM/HBM 流量减半**。
+- **UMMA(`tcgen05.mma`) + TMEM 双缓冲**：UMMA 单线程异步发射，结果进 TMEM；MMA warp 填一个 stage，epilogue warps 排空另一个 → MMA 与 epilogue IO 重叠（dH kernel epilogue IO +24%，TFLOPS 仅 -11%）。
+- **CLC 动态 tile scheduler**：硬件管理工作队列，无 GMEM atomic，对专家 token 数不均天然均衡。
+- **Producer-consumer mainloop + 可定制 epilogue（`epi_visit_subtile`）**：fusion 逻辑集中在 epilogue 注入点。
+
+## B. megakernel 计算部分现状的性能问题
+
+`compute_worker` 三段 GEMM 全部走 `device_gemm_bf16`，问题：
+- 用 **WMMA legacy API（16×16×16）**，不是 Blackwell 的 `tcgen05.mma`/TMEM，TensorCore 利用率远未到峰值。
+- **无 SMEM tiling / 无 cp.async 流水**：`load_matrix_sync` 每个 tile 直读 GMEM，A/B 重复从 GMEM 读，无 load/MMA 重叠。
+- **中间张量全部落 GMEM**：gate_buf/up_buf/down_buf 在 GMEM workspace，SwiGLU 还要从 GMEM 读回算再写回。
+- **三次 GEMM 间全局 barrier 串行**（每段后 `compute_group_sync`），无 MMA/epilogue 重叠。
+- **32 SM 协作 128-token batch + 16×16 碎 tile**，调度与同步开销高。
+
+## C. 重点议题：「重复 load 权重」是不是最大瓶颈？
+
+### C.1 现象确实存在
+`compute_worker`（megakernel.cu:1474-1506）每个 task 即时从 GMEM 读专家权重；`device_gemm_bf16`（megakernel.cu:314-317）K 维循环里 `wmma::load_matrix_sync(b_frag, ...)` 每个 tile 直读 GMEM 权重 B，**无 SMEM 缓存、无跨 batch 复用**。同专家被切成多个 task 时权重重复 load，不同专家轮流上场也无法常驻。
+
+### C.2 用算术强度定量判断
+单段 GEMM `[M,K]·[K,N]`：FLOPs ≈ `2·M·K·N`，权重加载字节 ≈ `2·K·N`（bf16），
+**权重复用率 ≈ FLOPs/权重字节 = M（batch token 数）**。
+- 当前 `COMPUTE_BATCH_SIZE=128` → 权重每加载一次仅被 128 token 复用。
+- M=128 在 B300 上对 bf16 GEMM 仍偏小（平衡点约 300+），**确实偏 memory-bound，权重 IO 占比高**——担心成立。
+- 若 M 能到 256/512，权重就不再是主瓶颈。
+
+### C.3 更准确的根因排序
+比"跨 batch 重复 load 权重"更致命的是：
+1. **权重连 SMEM 都没进**：直读 GMEM，连同一 batch 内不同 16×16 tile 都重复读同一块权重（无 SMEM tiling）。
+2. **WMMA 16×16×16 + 无流水**：load 无法与 MMA 重叠。
+3. **中间张量落 GMEM 再读回**算 SwiGLU。
+
+**结论：权重 IO 是瓶颈的一部分，但根因是"无 SMEM 缓存 + 无 load/compute 重叠 + tile 太小"，
+不仅仅是跨 batch 重复 load。需 microbench/ncu 实测确认占比再定优先级。**
+
+## D. 可复用的 SonicMoE 思路（映射到 megakernel）
+
+| SonicMoE 思路 | 复用性 | 说明 |
+|---|---|---|
+| SwiGLU 融进 epilogue（in-register） | 高，必做 | 当前 gate/up 写 GMEM 再读回算 SwiGLU 是纯浪费；在 accumulator 还在寄存器/TMEM 时直接算 silu(gate)*up |
+| GEMM1+GEMM2 合并 / 中间不落 GMEM | 高 | gate、up 同 input，可合并成 `[M,2I]` GEMM 或共享 input tile；act 直接喂 down-proj |
+| UMMA(tcgen05) + TMEM 替换 WMMA | 最大算力收益（B300 核心） | 16×16×16 WMMA 在 B300 严重欠速；换 `tcgen05.mma`，accumulator 进 TMEM，M_tile 用 128/256 |
+| 2CTA MMA（权重 multicast） | 适配 group 模型 | group 内多 SM 共享专家权重 tile，2CTA multicast 减半权重 HBM/SMEM 流量——直接缓解 C 节的权重重复 load |
+| MMA/epilogue IO 重叠（TMEM 双缓冲） | 中高 | warp specialization：MMA warp 填一个 TMEM stage，epilogue warp 排空另一个并做 SwiGLU+写回，去掉 barrier 串行 |
+| cp.async / TMA 流水进 SMEM | 必做 | 替换 `load_matrix_sync` 直读 GMEM，建 producer-consumer 双缓冲 mainloop |
+| Gather fusion + L2 局部性 | 部分适用 | dispatch 已把 token 路由到 expert storage；可让 GEMM 直接按 source_info 从 `combine_input` 流式 gather 进 SMEM，省掉 input_buf 拷贝 |
+| gather-and-sum 聚合（避免 scatter） | 已类似 | 当前多专家 reduce 用 float atomicAdd；如 profiling 显示 atomic 热点再改 gather-and-sum |
+| CLC 动态 tile scheduler | 概念可借 | megakernel 已有软件任务队列做动态均衡，作用类似 CLC；GEMM 内部 tile 调度可换 persistent/CLC 风格减少同步 |
+| 反向 dS/dH 重排、token rounding、激活显存优化 | 不适用 | forward-only，无 backward、无激活缓存 |
+
+## E. 计算逻辑改动方案（按优先级）
+
+### P0 — 重写 `device_gemm_bf16` 为 Blackwell GEMM（决定性能上限）
+- 用 `tcgen05.mma`(UMMA) 替换 `nvcuda::wmma`，accumulator 落 TMEM。
+- 用 cp.async / TMA 把 input 和专家权重 tile 流水进 SMEM，建 N-stage 双缓冲 mainloop（producer 加载 / consumer MMA）。
+- tile 放大到 M=128（或 2CTA 的 256），N/K 取 64/128，取代碎片化 16×16。
+- 现实建议：与其裸 CUDA 手写 UMMA，**优先在 compute_worker 内调用 SonicMoE 依赖的 QuACK / CUTLASS Blackwell grouped-GEMM device 接口**，复用其 mainloop+epilogue。megakernel 的 128 token/expert batch 天然就是 grouped-GEMM 的 M 分组。
+
+### P1 — 三段 GEMM 融合 + 中间张量不落 GMEM
+- GEMM1(gate) 与 GEMM2(up) 合并为单个 `X·[W_gate|W_up]` 输出 `[M,2I]`，或至少共享 input SMEM tile。
+- **SwiGLU 放进 epilogue**：accumulator 在 TMEM/寄存器内直接算 `silu(gate)*up*route_w`（route weight 位置严格对齐 baseline：SwiGLU 后、W_down 前，见 D4），产出 act tile 直接作为 down-proj 输入 tile，删除 gate_buf/up_buf GMEM workspace 与对应往返。
+- 删掉 input_buf 的 GMEM 拷贝，GEMM 直接按 `recv_token_source_info` gather 从 `combine_input` 进 SMEM（gather fusion）。
+
+### P2 — MMA/epilogue 重叠 + 权重 multicast
+- TMEM 双 stage + warp specialization 重叠 MMA 与 SwiGLU/写回，去掉每段 GEMM 后的全局 `compute_group_sync`。
+- group 内多 SM 用 2CTA MMA 对同一专家权重做 multicast，减半权重 SMEM/HBM 流量。
+
+### P3 — 调度与 reduce 收尾
+- `COMPUTE_GROUP_SIZE=32` SM 协作 128 token 偏重；配合大 tile 后缩小 group（如 1-2 SM/batch 用 2CTA），减少跨 SM 同步。
+- 适当提高 `COMPUTE_BATCH_SIZE`（提高 M / 权重复用率），或让同专家多 batch 连续处理（权重在 SMEM/L2 跨 task 复用）。
+- 多专家 reduce 的 float atomicAdd 可保留；若 ncu 显示 atomic 热点再改 gather-and-sum。
+
+## F. 验证计划
+- **microbench**：单专家三段 GEMM `[128,hidden]→[128,2I]→SwiGLU→[128,hidden]`，对比改造前后 TFLOPS 与 HBM 流量。
+- **ncu 指标**：Tensor Pipe util、DRAM throughput、L2 hit rate；单独拉出 `W_gate/up/down` 的 HBM read bytes，对比 input/激活 bytes，定量回答"权重 load 占总 IO 多少"。
+- **端到端**：接回 megakernel，BF16 数值对齐用 precision-alignment 流程。
+- 顺序建议：先 microbench 确认当前 `device_gemm_bf16` 是 memory-bound 且权重 IO 占比 → 再按 P0→P3 改造。
+
+## G. 演进顺序与依赖链（分步实施，勿混在一个 patch）
+
+这些优化**不是 5 个平行独立 patch**，有依赖关系。一次只改一个因素（对齐 AGENTS.md「最小变量」原则），每加一项都对一次数值基线，便于定位 diff。
+
+```
+[已完成] SwiGLU 融进 epilogue (WMMA 版) —— 定义数值正确性基线
+    │
+    ├─ cp.async/TMA 流水进 SMEM   ← 可独立做（WMMA 版上即可），不强依赖 UMMA
+    ├─ GEMM1+GEMM2 合并成 [M,2I]  ← 正交，任意阶段可做（需同步改 workspace layout）
+    │
+    └─ P0: UMMA(tcgen05)+TMEM 替换 WMMA   ← 会重写 device_gemm_swiglu_fused
+            ├─ 依赖它: 2CTA MMA 权重 multicast（WMMA 无 2CTA 概念）
+            └─ 依赖它: MMA/epilogue TMEM 双缓冲重叠（依赖 TMEM）
+```
+
+- **当前 `device_gemm_swiglu_fused`（WMMA 版）的定位**：它定义了 fused gate+up + epilogue SwiGLU 的**计算语义和数值基线**。UMMA 版会重写底层 MMA，但保留这套骨架（同样在 epilogue 从 TMEM 排空时算 SwiGLU）。所以这版不是白做，是后续 UMMA 改造的 reference。
+- **2CTA / TMEM 双缓冲依赖 UMMA**：必须先有 `tcgen05.mma`+TMEM 才能用 `cta_group::2` 和双 stage 重叠。
+- **数值基线策略**：每一步改造后，新内核输出都要和上一个稳定版本在 BF16 容差内对齐，再叠加下一项。不要把 UMMA + 2CTA + 双缓冲混进一个改动。
+
+### 已知待处理的不兼容点（workspace layout）
+当前为不动显存分配，`gemm_workspace` 仍保留 `input/gate/up/down` 四段切分，其中 `gate` 段在 fusion 后已不再使用（代码里 `(void)gate_buf` 标记）。等做到「GEMM1+GEMM2 合并成 `[M,2I]`」或 UMMA 版时：
+- `gate_stride` 段可彻底删除；
+- 需同步改 `compute_worker` 的 stride 计算（megakernel.cu:1482-1491）和 host 端 `gemm_workspace` 分配大小。
+
+## H. 变更记录
+
+### 2026-06-26｜SwiGLU 融进 epilogue（WMMA 版，已完成，待编译验证）
+- **改动文件**：`csrc/kernels/megakernel.cu`（仅此文件）。
+- **新增** `device_gemm_swiglu_fused`（megakernel.cu:351）：融合 gate+up GEMM。
+  - 每个 16×16 N-tile 同时累加 `cg_frag`(gate) 与 `cu_frag`(up)，**A tile 每个 K 步只 load 一次**被两个 MMA 共享。
+  - accumulator 经 SMEM 暂存后在 epilogue 内直接算 `silu(gate)*up*route_w`，**只写一次 act** 到 GMEM。
+  - per-warp SMEM 分 gate/up 两块（`2*WMMA_M*WMMA_N` floats）；padded 行写 0。
+- **`compute_worker` 改造**：
+  - 新增 `s_route_w[]`，加载 token 元信息时一次性 gather route weight 进 SMEM（megakernel.cu:1546）。
+  - 用一次 `device_gemm_swiglu_fused` 替换原「gate GEMM + barrier + up GEMM + barrier + SwiGLU 循环 + barrier」（megakernel.cu:1575）。
+- **route weight 位置不变**：SwiGLU 后、W_down 前，与 baseline 一致（D4）。
+- **收益**：省掉 gate_buf/up_buf 两趟 GMEM 写 + SwiGLU 读回两趟 GMEM 读；去掉两个 `compute_group_sync` 全局 barrier；A tile 在 gate/up 间复用，减半 A 的 GMEM load。
+- **SMEM 预算**：fused 每 SM 用量约 `25 warps * 2 * 256 * 4 = 51200 B`，小于现有 `smem_size = max(8*16384, 24*9248) = 221952 B`（deep_ep.cpp:2110），安全。
+- **验证方式**：用户跑 `run_megakernel_v7_test.sh` 单测做 BF16 数值对齐（编译/执行由用户负责）。若出 diff，优先排查 `s_route_w` 的 gather 索引（megakernel.cu:1546）。
+- **状态**：代码已写，未编译验证。

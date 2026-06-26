@@ -335,6 +335,90 @@ __device__ void device_gemm_bf16(
 }
 
 // ============================================================================
+// Fused gate+up GEMM with in-register SwiGLU epilogue.
+//
+// Computes act = silu(gate) * up * route_weight in a single pass:
+//   gate = A @ W_gate^T   (A:[M,K] row_major, W_gate:[N,K] col_major)
+//   up   = A @ W_up^T     (same shapes, N = intermediate)
+// For each N-tile, both gate and up accumulators stay in registers; SwiGLU is
+// applied before any store. Only the activation `act` ([M,N]) is written to GMEM,
+// eliminating the two GMEM round-trips for gate_buf/up_buf and the standalone
+// SwiGLU read-modify-write loop.
+//
+// route_w[row] is the per-token route weight (already gathered by caller);
+// rows >= valid_rows are written as 0 so the downstream W_down GEMM is unaffected.
+// ============================================================================
+__device__ void device_gemm_swiglu_fused(
+    const __nv_bfloat16* __restrict__ A,       // [M, K] row_major
+    const __nv_bfloat16* __restrict__ W_gate,  // [N, K] col_major (B = A@B^T)
+    const __nv_bfloat16* __restrict__ W_up,    // [N, K] col_major
+    __nv_bfloat16* __restrict__ act,           // [M, N] row_major output
+    const float* __restrict__ route_w,         // [M] per-row route weight
+    int valid_rows,                            // rows < valid_rows are real tokens
+    int M, int K, int N,
+    int tile_warp_id, int num_tile_warps,
+    int smem_warp_id,
+    float* smem_buf
+) {
+    const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
+    const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
+    const int total_tiles = tiles_m * tiles_n;
+    const int lane_id = threadIdx.x % 32;
+
+    // Two separate SMEM scratch regions per warp (gate / up) to avoid races.
+    float* gate_buf = smem_buf + smem_warp_id * (2 * WMMA_M * WMMA_N);
+    float* up_buf   = gate_buf + WMMA_M * WMMA_N;
+
+    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
+        int tile_row = tile_idx / tiles_n;
+        int tile_col = tile_idx % tiles_n;
+        int row_offset = tile_row * WMMA_M;
+        int col_offset = tile_col * WMMA_N;
+
+        if (row_offset >= M || col_offset >= N) continue;
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> bg_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> bu_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> cg_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> cu_frag;
+
+        wmma::fill_fragment(cg_frag, 0.0f);
+        wmma::fill_fragment(cu_frag, 0.0f);
+
+        // A tile is shared between gate and up GEMM (loaded once per K step).
+        for (int k = 0; k < K; k += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
+            wmma::load_matrix_sync(bg_frag, W_gate + col_offset * K + k, K);
+            wmma::load_matrix_sync(bu_frag, W_up   + col_offset * K + k, K);
+            wmma::mma_sync(cg_frag, a_frag, bg_frag, cg_frag);
+            wmma::mma_sync(cu_frag, a_frag, bu_frag, cu_frag);
+        }
+
+        wmma::store_matrix_sync(gate_buf, cg_frag, WMMA_N, wmma::mem_row_major);
+        wmma::store_matrix_sync(up_buf,   cu_frag, WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+
+        // In-register (SMEM-staged) SwiGLU epilogue: silu(gate) * up * route_w.
+        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+            int row = i / WMMA_N;
+            int col = i % WMMA_N;
+            int out_row = row_offset + row;
+            int out_col = col_offset + col;
+            if (out_row >= M || out_col >= N) continue;
+            if (out_row < valid_rows) {
+                float g = gate_buf[i];
+                float u = up_buf[i];
+                float silu_g = g * (1.0f / (1.0f + __expf(-g)));
+                act[out_row * N + out_col] = __float2bfloat16(silu_g * u * route_w[out_row]);
+            } else {
+                act[out_row * N + out_col] = __float2bfloat16(0.0f);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Dispatch Worker v2: Complete copy of DeepEP internode.cu dispatch function
 // as a __device__ function. Uses even/odd SM pattern from DeepEP:
 //   - Even SM (is_forwarder): kRDMAAndNVLForwarder + kForwarderCoordinator warps
@@ -1402,14 +1486,18 @@ __device__ void compute_worker(
     const int down_stride = padded_m * hidden;
     const int gemm_stride = input_stride + gate_stride + up_stride + down_stride;
     __nv_bfloat16* input_buf = state->gemm_workspace + group_id * gemm_stride;
-    __nv_bfloat16* gate_buf = input_buf + input_stride;
-    __nv_bfloat16* up_buf   = gate_buf + gate_stride;     // reused as activation after SwiGLU
+    __nv_bfloat16* gate_buf = input_buf + input_stride;   // unused after gate+up SwiGLU fusion (kept for workspace layout)
+    __nv_bfloat16* up_buf   = gate_buf + gate_stride;     // holds fused activation = silu(gate)*up*route_w
     __nv_bfloat16* down_buf = up_buf + up_stride;
+    (void)gate_buf;
 
     __shared__ int s_recv_token_idx[COMPUTE_BATCH_SIZE];
     __shared__ int s_topk_slot[COMPUTE_BATCH_SIZE];
     __shared__ int s_expected[COMPUTE_BATCH_SIZE];
     __shared__ int s_is_last[COMPUTE_BATCH_SIZE];
+    // Per-row route weight, gathered once and consumed inside the fused
+    // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
+    __shared__ float s_route_w[COMPUTE_BATCH_SIZE];
 
     while (true) {
         if (group_sm_idx == 0 && thread_id == 0) {
@@ -1455,6 +1543,7 @@ __device__ void compute_worker(
             s_recv_token_idx[i] = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
             s_topk_slot[i] = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             s_expected[i] = ld_acquire_global(&state->token_compute_expected[s_recv_token_idx[i]]);
+            s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[s_recv_token_idx[i] * num_topk + s_topk_slot[i]]);
 #ifdef MK_TOKEN_TRACE
             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
                    state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
@@ -1476,29 +1565,16 @@ __device__ void compute_worker(
         const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
         const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
 
-        // GEMM 1/2: [batch_size, hidden] @ [intermediate, hidden]^T
-        device_gemm_bf16(input_buf, w_gate, gate_buf, batch_size, hidden, intermediate,
-                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-        device_gemm_bf16(input_buf, w_up, up_buf, batch_size, hidden, intermediate,
-                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-
-        // SwiGLU + route weight: act = silu(gate) * up * route_weight.
-        for (int idx = group_thread_id; idx < up_stride; idx += group_num_threads) {
-            int row = idx / intermediate;
-            if (row < batch_size) {
-                int recv_token_idx = s_recv_token_idx[row];
-                int topk_slot = s_topk_slot[row];
-                float route_w = ld_nc_global(&state->combine_input_topk_weights[recv_token_idx * num_topk + topk_slot]);
-                float g = __bfloat162float(gate_buf[idx]);
-                float u = __bfloat162float(up_buf[idx]);
-                float silu_g = g * (1.0f / (1.0f + __expf(-g)));
-                up_buf[idx] = __float2bfloat16(silu_g * u * route_w);
-            } else {
-                up_buf[idx] = __float2bfloat16(0.0f);
-            }
-        }
+        // Fused gate+up GEMM with in-register SwiGLU epilogue:
+        //   act = silu(A@W_gate^T) * (A@W_up^T) * route_w
+        // gate/up accumulators stay in registers; only act ([M,intermediate])
+        // is written to GMEM (reusing up_buf), eliminating the gate_buf/up_buf
+        // round-trips and the standalone SwiGLU read-modify-write loop.
+        // M=batch_size so only real-token rows are computed/written, matching
+        // the downstream W_down GEMM which also uses M=batch_size.
+        device_gemm_swiglu_fused(input_buf, w_gate, w_up, up_buf, s_route_w,
+                                 batch_size, batch_size, hidden, intermediate,
+                                 group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
         // GEMM 3: [batch_size, intermediate] @ [hidden, intermediate]^T
