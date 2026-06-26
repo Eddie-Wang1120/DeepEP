@@ -145,7 +145,8 @@ struct MegaKernelState {
     int num_ranks;                    // Total ranks
 
     // --- Receive-side signaling (written by Forwarder, read by Compute) ---
-    int* expert_recv_count;           // [num_local_experts] atomic counter
+    int* expert_recv_count;           // [num_local_experts] continuous ready count (advanced by scheduler)
+    int* expert_slot_ready;           // [num_local_experts * max_tokens_per_expert] per-slot ready flag
     int* dispatch_done;               // Flag: set to 1 when all dispatch+forward is finished
     int* dispatch_done_count;         // Atomic: how many NVL receiver warps have finished
     int expected_dispatch_done_count; // Expected number of NVL receiver warp completions
@@ -1120,8 +1121,7 @@ __device__ void dispatch_worker_v2(
                         atomicAdd(&state->token_compute_expected[recv_token_idx], local_hits);
                     }
 
-                    // Pass 1: allocate slots and write source_info for all local hits,
-                    // WITHOUT per-hit fences.
+                    // Pass 1: allocate slots and write source_info for all local hits.
                     int hit_local_expert[32];
                     int hit_slot[32];
                     int num_hits = 0;
@@ -1131,18 +1131,13 @@ __device__ void dispatch_worker_v2(
                             continue;
                         int local_expert_id = expert_id - local_expert_begin;
                         int slot = atomicAdd(&state->expert_token_offsets[local_expert_id], 1);
-#ifdef MK_TOKEN_TRACE
-                        if (slot >= state->max_tokens_per_expert) {
-                            printf("[MK-ERROR] rank=%d expert=%d local_expert=%d slot=%d OVERFLOW (max_tpe=%d)\n",
-                                   state->rank, expert_id, local_expert_id, slot, state->max_tokens_per_expert);
-                            break;
-                        }
-#endif
+                        if (slot >= state->max_tokens_per_expert)
+                            continue;  // overflow guard: drop tokens beyond capacity
                         int dest_offset = local_expert_id * state->max_tokens_per_expert + slot;
                         int* dst_ptr = &state->recv_token_source_info[dest_offset * 2];
-                        // Plain stores: visibility is guaranteed by the single __threadfence()
-                        // below before any expert_recv_count advances. The only reader is this
-                        // GPU's compute worker, so no per-store system-scope release is needed.
+                        // Plain stores: ordering vs slot_ready is enforced by the single
+                        // __threadfence() below. All readers are this GPU's compute workers,
+                        // so device-scope visibility is sufficient.
                         st_na_global(dst_ptr, static_cast<int>(recv_token_idx));
                         st_na_global(dst_ptr + 1, topk_slot);
                         hit_local_expert[num_hits] = local_expert_id;
@@ -1150,25 +1145,19 @@ __device__ void dispatch_worker_v2(
                         num_hits += 1;
                     }
 
-                    // Single fence per token. recv_token_source_info / token_compute_expected /
-                    // combine_input are consumed only by this GPU's compute workers (no remote
-                    // NVSHMEM/RDMA reader), so device-scope fence suffices instead of system-scope.
+                    // Single device-scope fence per token: orders the plain source_info
+                    // stores before the slot_ready release stores. The whole signal chain
+                    // (slot_ready -> scheduler -> expert_recv_count -> compute) stays in
+                    // device scope because no remote GPU reads these buffers.
                     if (num_hits > 0)
                         __threadfence();
 
-                    // Pass 2: advance expert_recv_count for each hit (ordered per expert).
+                    // Pass 2: mark each slot ready (unordered, no spin-wait). Scheduler
+                    // scans the bitmap and advances expert_recv_count.
                     for (int h = 0; h < num_hits; ++h) {
                         int local_expert_id = hit_local_expert[h];
                         int slot = hit_slot[h];
-#ifdef MK_PERF_TRACE
-                        int64_t wait_recvcount_start = globaltimer_ns();
-#endif
-                        while (ld_acquire_sys_global(&state->expert_recv_count[local_expert_id]) != slot)
-                            __nanosleep(32);
-#ifdef MK_PERF_TRACE
-                        wait_recvcount_acc += globaltimer_ns() - wait_recvcount_start;
-#endif
-                        st_release_sys_global(&state->expert_recv_count[local_expert_id], slot + 1);
+                        st_na_release(&state->expert_slot_ready[local_expert_id * state->max_tokens_per_expert + slot], 1);
                     }
 #ifdef MK_PERF_TRACE
                     int64_t publish_total = globaltimer_ns() - publish_start;
@@ -1309,29 +1298,61 @@ __device__ void compute_scheduler_worker(MegaKernelState* state) {
         return;
 
     const int num_local_experts = state->num_local_experts;
+    const int max_tpe = state->max_tokens_per_expert;
     bool tail_enqueued = false;
 
     while (true) {
+        // Scan per-slot ready bitmap and advance expert_recv_count for each expert.
         for (int expert_id = 0; expert_id < num_local_experts; ++expert_id) {
-            int cursor = ld_acquire_sys_global(&state->expert_enqueue_cursor[expert_id]);
-            int arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
-            while (arrived - cursor >= COMPUTE_BATCH_SIZE) {
+            int old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
+            int count = old_count;
+            while (count < max_tpe &&
+                   ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + count]) == 1) {
+                ++count;
+            }
+            if (count != old_count) {
+                // Fence: source_info stores (made visible to us via slot_ready acquire)
+                // must be visible to compute workers that read them after observing the
+                // expert_recv_count advance. Device scope suffices (no remote reader).
+                __threadfence();
+                st_na_release(&state->expert_recv_count[expert_id], count);
+            }
+
+            // Enqueue full batches.
+            int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+            while (count - cursor >= COMPUTE_BATCH_SIZE) {
                 scheduler_publish_task(state, expert_id, cursor, COMPUTE_BATCH_SIZE);
                 cursor += COMPUTE_BATCH_SIZE;
-                st_release_sys_global(&state->expert_enqueue_cursor[expert_id], cursor);
-                arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
+                st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
             }
         }
 
         int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
         bool dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count);
         if (dispatch_done && !tail_enqueued) {
+            // Final scan after dispatch is done to catch the last (< BATCH) slots.
             for (int expert_id = 0; expert_id < num_local_experts; ++expert_id) {
-                int cursor = ld_acquire_sys_global(&state->expert_enqueue_cursor[expert_id]);
-                int arrived = ld_acquire_sys_global(&state->expert_recv_count[expert_id]);
-                if (arrived > cursor) {
-                    scheduler_publish_task(state, expert_id, cursor, arrived - cursor);
-                    st_release_sys_global(&state->expert_enqueue_cursor[expert_id], arrived);
+                int count = ld_acquire_global(&state->expert_recv_count[expert_id]);
+                while (count < max_tpe &&
+                       ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + count]) == 1) {
+                    ++count;
+                }
+                __threadfence();
+                st_na_release(&state->expert_recv_count[expert_id], count);
+
+                int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                // Enqueue full batches first, then a final (< BATCH) tail batch.
+                // Every published task must have num_tokens <= COMPUTE_BATCH_SIZE,
+                // otherwise compute_worker overruns its [COMPUTE_BATCH_SIZE] shared
+                // arrays (s_recv_token_idx/...) and triggers an illegal memory access.
+                while (count - cursor >= COMPUTE_BATCH_SIZE) {
+                    scheduler_publish_task(state, expert_id, cursor, COMPUTE_BATCH_SIZE);
+                    cursor += COMPUTE_BATCH_SIZE;
+                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+                }
+                if (count > cursor) {
+                    scheduler_publish_task(state, expert_id, cursor, count - cursor);
+                    st_na_release(&state->expert_enqueue_cursor[expert_id], count);
                 }
             }
             __threadfence_system();
@@ -1342,7 +1363,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state) {
         if (tail_enqueued)
             break;
 
-        __nanosleep(128);
+        __nanosleep(64);
     }
 }
 
@@ -1431,9 +1452,9 @@ __device__ void compute_worker(
 
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
             int base_offset = expert_id * max_tpe + start_slot + i;
-            s_recv_token_idx[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2]);
-            s_topk_slot[i] = ld_acquire_sys_global(&state->recv_token_source_info[base_offset * 2 + 1]);
-            s_expected[i] = ld_acquire_sys_global(&state->token_compute_expected[s_recv_token_idx[i]]);
+            s_recv_token_idx[i] = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
+            s_topk_slot[i] = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+            s_expected[i] = ld_acquire_global(&state->token_compute_expected[s_recv_token_idx[i]]);
 #ifdef MK_TOKEN_TRACE
             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
                    state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
@@ -3105,6 +3126,10 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     // Receive storage — indexed as [local_expert_id * max_tokens_per_expert + slot]
     const size_t total_expert_slots = (size_t)num_local_experts * max_tokens_per_expert;
+
+    int* expert_slot_ready;
+    CUDA_CHECK(cudaMalloc(&expert_slot_ready, total_expert_slots * sizeof(int)));
+    CUDA_CHECK(cudaMemset(expert_slot_ready, 0, total_expert_slots * sizeof(int)));
     size_t recv_tokens_bytes = total_expert_slots * hidden_dim * sizeof(__nv_bfloat16);
     CUDA_CHECK(cudaMalloc(&recv_tokens, recv_tokens_bytes));
 
@@ -3282,6 +3307,7 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     // Receive-side signaling
     host_state.expert_recv_count = expert_recv_count;
+    host_state.expert_slot_ready = expert_slot_ready;
     host_state.dispatch_done = dispatch_done;
     host_state.dispatch_done_count = dispatch_done_count;
     host_state.timeout_log_counters = timeout_log_counters;
@@ -3464,6 +3490,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
 
     CUDA_CHECK(cudaFree(host_state.expert_recv_count));
+    CUDA_CHECK(cudaFree(host_state.expert_slot_ready));
     CUDA_CHECK(cudaFree(host_state.dispatch_done));
     CUDA_CHECK(cudaFree(host_state.dispatch_done_count));
     CUDA_CHECK(cudaFree(host_state.timeout_log_counters));
