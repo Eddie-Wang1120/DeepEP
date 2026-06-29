@@ -63,17 +63,17 @@ def print_bitwise_mismatches(baseline_output, megakernel_output, rank, hidden_st
             f'baseline_bf16=0x{baseline_bit:04x} megakernel_bf16=0x{megakernel_bit:04x}',
             flush=True)
 
-        if token_idx not in printed_tokens:
-            printed_tokens.add(token_idx)
-            if topk_idx is not None:
-                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_idx={topk_idx[token_idx].detach().cpu().tolist()}', flush=True)
-            if topk_weights is not None:
-                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_weights={topk_weights[token_idx].detach().cpu().float().tolist()}', flush=True)
-            if hidden_states is not None:
-                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states={hidden_states[token_idx].detach().cpu().float().tolist()}', flush=True)
-                print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states_bf16_hex={[hex(int(v) & 0xffff) for v in hidden_states[token_idx].detach().contiguous().view(torch.int16).cpu().tolist()]}', flush=True)
-            print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} baseline_output={baseline_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
-            print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} megakernel_output={megakernel_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
+        # if token_idx not in printed_tokens:
+        #     printed_tokens.add(token_idx)
+        #     if topk_idx is not None:
+        #         print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_idx={topk_idx[token_idx].detach().cpu().tolist()}', flush=True)
+        #     if topk_weights is not None:
+        #         print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} topk_weights={topk_weights[token_idx].detach().cpu().float().tolist()}', flush=True)
+        #     if hidden_states is not None:
+        #         print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states={hidden_states[token_idx].detach().cpu().float().tolist()}', flush=True)
+        #         print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} hidden_states_bf16_hex={[hex(int(v) & 0xffff) for v in hidden_states[token_idx].detach().contiguous().view(torch.int16).cpu().tolist()]}', flush=True)
+        #     print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} baseline_output={baseline_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
+        #     print(f'[Rank {rank}] MISMATCH-TOKEN token={token_idx} megakernel_output={megakernel_contig[token_idx].detach().cpu().float().tolist()}', flush=True)
 
     if limit < mismatch_count:
         print(f'[Rank {rank}] BITWISE mismatch print truncated: printed={limit}, total={mismatch_count}', flush=True)
@@ -118,7 +118,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
-    buffer.set_num_sms(24)
+    buffer.set_num_sms(48)
 
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
@@ -203,8 +203,8 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=4096, hidden=2048, intermediate=4096, experts_per_rank=8, num_topk=4),
-    # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
-    test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
+    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # Add more cases here, for example:
     # test(num_tokens=8192, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
 ]
@@ -261,6 +261,16 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         if local_rank == 0:
             print(f'[Rank {rank}] Running baseline (dispatch+compute+combine)...', flush=True)
 
+        for w in range(args.warmup):
+            if local_rank == 0:
+                print(f'[Rank {rank}] Baseline warmup {w + 1}/{args.warmup}', flush=True)
+            run_baseline_pipeline(
+                x, topk_idx, topk_weights, W_gate, W_up, W_down,
+                num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute)
+        if args.warmup > 0:
+            dist.barrier(group=group)
+            torch.cuda.synchronize()
+
         baseline_output = run_baseline_pipeline(
             x, topk_idx, topk_weights, W_gate, W_up, W_down,
             num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute)
@@ -274,6 +284,16 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     # --- Path B: MegaKernel v7 (fused persistent kernel) ---
     if local_rank == 0:
         print(f'[Rank {rank}] Running megakernel_forward (v7)...', flush=True)
+
+    for w in range(args.warmup):
+        if local_rank == 0:
+            print(f'[Rank {rank}] MegaKernel warmup {w + 1}/{args.warmup}', flush=True)
+        run_megakernel_pipeline(
+            x, topk_idx, topk_weights, W_gate, W_up, W_down,
+            num_experts, buffer, local_rank, rank)
+    if args.warmup > 0:
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
 
     megakernel_output = run_megakernel_pipeline(
         x, topk_idx, topk_weights, W_gate, W_up, W_down,
@@ -363,13 +383,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 if __name__ == '__main__':
-
-    print("jinheng debug: enter this")
-
     parser = argparse.ArgumentParser(description='Test MK-v7 persistent megakernel vs baseline')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--skip-baseline', action='store_true')
     parser.add_argument('--no-compute', action='store_true', help='Skip PyTorch expert compute in the baseline path')
+    parser.add_argument('--warmup', type=int, default=100,
+                        help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 

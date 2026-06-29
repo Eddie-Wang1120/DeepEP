@@ -2029,6 +2029,46 @@ torch::Tensor Buffer::megakernel_forward(
     for (int i = 0; i < num_local_experts; ++i)
         moe_recv_expert_counter[i] = -1;
 
+    // Re-entrancy reset: megakernel_forward reuses the same NVSHMEM/IPC symmetric
+    // buffers across calls (they are Buffer-lifetime, not per-call). dispatch/combine
+    // leave stale RDMA/NVL channel head/tail counters and the combine kernel
+    // normalizes send_nvl_head/send_rdma_head in place. A second call would read
+    // those dirty values (observed as negative normalized heads -> combine forwarder
+    // NVL-check timeout). Zero the symmetric data regions and barrier across all
+    // ranks so every peer starts from a clean buffer, mirroring how DeepEP's
+    // dispatch/combine rely on a zero-initialized buffer each iteration.
+    {
+        // RDMA symmetric buffer: alloc is num_rdma_bytes*2 (dispatch + combine halves)
+        // in non-low-latency mode (see Buffer::sync). Clear the full allocation.
+        const int64_t rdma_reset_bytes = low_latency_mode ? num_rdma_bytes : num_rdma_bytes * 2;
+        CUDA_CHECK(cudaMemsetAsync(rdma_buffer_ptr, 0, rdma_reset_bytes, stream));
+
+        // NVL symmetric buffer: per rank layout is [dispatch_half | combine_half],
+        // each half = num_nvl_bytes data + signals/ptrs. Only the data regions hold
+        // channel head/tail counters that must start at 0; zero both data regions.
+        if (num_nvl_bytes > 0) {
+            const int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
+            const int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
+            const int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
+            const int64_t per_half = num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes;
+            auto nvl_base = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]);
+            CUDA_CHECK(cudaMemsetAsync(nvl_base, 0, num_nvl_bytes, stream));                 // dispatch data
+            CUDA_CHECK(cudaMemsetAsync(nvl_base + per_half, 0, num_nvl_bytes, stream));      // combine data
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Cross-rank barrier so no peer races ahead and writes into a buffer another
+        // peer has not yet cleared. NVL (intranode) + RDMA (internode) both needed.
+        if (num_nvl_bytes > 0) {
+            intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, stream);
+            intranode::barrier(combine_barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        if (is_available() and num_rdma_bytes > 0) {
+            internode::barrier();
+        }
+    }
+
     printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
            rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
            num_tokens, hidden_int4, num_topk, num_experts, num_local_experts, rdma_buffer_ptr,
