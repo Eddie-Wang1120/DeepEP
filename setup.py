@@ -39,6 +39,12 @@ if __name__ == '__main__':
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel.cu']
     include_dirs = ['csrc/']
+    # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute (S4.4 / MEGAKERNEL_COMPUTE_DESIGN.md I.9.10).
+    # Header-only; only adds include paths. cutlass_ref is the cloned NVIDIA/cutlass v4.5.2.
+    _cutlass_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cutlass_ref')
+    if os.path.isdir(os.path.join(_cutlass_root, 'include')):
+        include_dirs.append(os.path.join(_cutlass_root, 'include'))
+        include_dirs.append(os.path.join(_cutlass_root, 'tools', 'util', 'include'))
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
@@ -70,8 +76,9 @@ if __name__ == '__main__':
         # Disable internode and low-latency kernels
         assert disable_nvshmem
     else:
-        # Prefer H800 series
-        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')
+        # Prefer H800 series (SM90) and Blackwell B200/B300 (SM100).
+        # SM100 (10.0) is required for the megakernel compute UMMA (tcgen05.mma) + TMEM path.
+        os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0;10.0')
 
         # CUDA 12 flags
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])

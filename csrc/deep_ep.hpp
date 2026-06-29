@@ -316,6 +316,13 @@ public:
         int num_dispatch_sms,
         int num_combine_sms,
         int total_sms);
+
+#ifdef MK_PERF_TRACE
+    // Baseline perf trace state: accumulated across dispatch/combine calls, dumped on request.
+    float deepep_perf_trace_dispatch_ms_ = 0.0f;
+    float deepep_perf_trace_combine_ms_ = 0.0f;
+    void dump_deepep_perf_trace();
+#endif
 };
 
 }  // namespace deep_ep

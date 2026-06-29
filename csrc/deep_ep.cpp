@@ -1225,6 +1225,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
     }
 
+#ifdef MK_PERF_TRACE
+    cudaEvent_t dispatch_start_ev, dispatch_end_ev;
+    AT_CUDA_CHECK(cudaEventCreate(&dispatch_start_ev));
+    AT_CUDA_CHECK(cudaEventCreate(&dispatch_end_ev));
+    AT_CUDA_CHECK(cudaEventRecord(dispatch_start_ev, comm_stream));
+#endif
+
     // Launch data dispatch
     // NOTES: the buffer size checks are moved into the `.cu` file
     internode::dispatch(recv_x.data_ptr(),
@@ -1265,6 +1272,16 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         comm_stream,
                         num_channels,
                         low_latency_mode);
+
+#ifdef MK_PERF_TRACE
+    AT_CUDA_CHECK(cudaEventRecord(dispatch_end_ev, comm_stream));
+    AT_CUDA_CHECK(cudaEventSynchronize(dispatch_end_ev));
+    float dispatch_ms = 0.0f;
+    AT_CUDA_CHECK(cudaEventElapsedTime(&dispatch_ms, dispatch_start_ev, dispatch_end_ev));
+    deepep_perf_trace_dispatch_ms_ = dispatch_ms;
+    AT_CUDA_CHECK(cudaEventDestroy(dispatch_start_ev));
+    AT_CUDA_CHECK(cudaEventDestroy(dispatch_end_ev));
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1453,6 +1470,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Launch data combine
     auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+
+#ifdef MK_PERF_TRACE
+    cudaEvent_t combine_start_ev, combine_end_ev;
+    AT_CUDA_CHECK(cudaEventCreate(&combine_start_ev));
+    AT_CUDA_CHECK(cudaEventCreate(&combine_end_ev));
+    AT_CUDA_CHECK(cudaEventRecord(combine_start_ev, comm_stream));
+#endif
+
     internode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        combined_x.data_ptr(),
                        combined_topk_weights_ptr,
@@ -1482,6 +1507,17 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        comm_stream,
                        num_channels,
                        low_latency_mode);
+
+#ifdef MK_PERF_TRACE
+    AT_CUDA_CHECK(cudaEventRecord(combine_end_ev, comm_stream));
+    AT_CUDA_CHECK(cudaEventSynchronize(combine_end_ev));
+    float combine_ms = 0.0f;
+    AT_CUDA_CHECK(cudaEventElapsedTime(&combine_ms, combine_start_ev, combine_end_ev));
+    deepep_perf_trace_combine_ms_ = combine_ms;
+    AT_CUDA_CHECK(cudaEventDestroy(combine_start_ev));
+    AT_CUDA_CHECK(cudaEventDestroy(combine_end_ev));
+    dump_deepep_perf_trace();
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1520,6 +1556,50 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     return {};
 #endif
 }
+
+#ifdef MK_PERF_TRACE
+void Buffer::dump_deepep_perf_trace() {
+    // Emit a Perfetto-compatible JSON array for this rank's baseline dispatch/combine timing.
+    // File naming matches what aggregate_mk_perf_traces.py expects.
+    char filename[256];
+    snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_dispatch.json", rank);
+    FILE* f = fopen(filename, "w");
+    if (f) {
+        // Timestamps: we use 0-based; dispatch spans [0, dispatch_ms], combine spans [dispatch_ms, dispatch_ms+combine_ms]
+        double dispatch_us = deepep_perf_trace_dispatch_ms_ * 1000.0;
+        double combine_us = deepep_perf_trace_combine_ms_ * 1000.0;
+        fprintf(f, "[\n");
+        fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
+        fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
+        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"dispatch\"}},\n", rank);
+        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
+                dispatch_us, rank);
+        fprintf(f, "]\n");
+        fclose(f);
+        printf("[DEEPEP-PERF] dispatch trace written to %s (%.3f us)\n", filename, dispatch_us);
+
+        // Combine in a separate file
+        snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine.json", rank);
+        f = fopen(filename, "w");
+        if (f) {
+            fprintf(f, "[\n");
+            fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
+            fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
+            fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"combine\"}},\n", rank);
+            fprintf(f, "{\"name\":\"combine\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
+                    combine_us, rank);
+            fprintf(f, "]\n");
+            fclose(f);
+            printf("[DEEPEP-PERF] combine trace written to %s (%.3f us)\n", filename, combine_us);
+        }
+    } else {
+        printf("[DEEPEP-PERF] Failed to open %s\n", filename);
+    }
+    // Reset for next iteration
+    deepep_perf_trace_dispatch_ms_ = 0.0f;
+    deepep_perf_trace_combine_ms_ = 0.0f;
+}
+#endif
 
 void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
 #ifndef DISABLE_NVSHMEM
@@ -1898,7 +1978,11 @@ torch::Tensor Buffer::megakernel_forward(
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
-    constexpr int compute_scheduler_sms = 1;
+    // S4.2: scheduler region uses 2 SMs so the launched grid is even (cluster_dim=2).
+    // dispatch/combine are even, compute is a multiple of 32 (even); 2 schedulers keep the
+    // sum even without a hacky padding SM. Only scheduler SM #0 does work; #1 idles
+    // (see compute_scheduler_worker gating in megakernel.cu).
+    constexpr int compute_scheduler_sms = 2;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;
@@ -1906,6 +1990,8 @@ torch::Tensor Buffer::megakernel_forward(
     const int active_total_sms = num_dispatch_sms + num_combine_sms + compute_scheduler_sms + num_compute_sms;
     EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
+    EP_HOST_ASSERT(num_dispatch_sms % 2 == 0);
+    EP_HOST_ASSERT(active_total_sms % 2 == 0 && "S4.2: active_total_sms must be even for cluster_dim=2");
 
     // Config for buffer sizing, aligned with tests/test_megakernel_v7.py DeepEP config
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
@@ -2190,7 +2276,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24,
              py::arg("num_combine_sms") = 24,
-             py::arg("total_sms") = 148);
+             py::arg("total_sms") = 148)
+#ifdef MK_PERF_TRACE
+        .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
+#endif
+        ;
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
