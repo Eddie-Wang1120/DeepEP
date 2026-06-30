@@ -45,6 +45,13 @@ if __name__ == '__main__':
     if os.path.isdir(os.path.join(_cutlass_root, 'include')):
         include_dirs.append(os.path.join(_cutlass_root, 'include'))
         include_dirs.append(os.path.join(_cutlass_root, 'tools', 'util', 'include'))
+    _deepgemm_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'DeepGEMM')
+    _deepgemm_include = os.path.join(_deepgemm_root, 'deep_gemm', 'include')
+    _deepgemm_cutlass_include = os.path.join(_deepgemm_root, 'third-party', 'cutlass', 'include')
+    if os.path.isdir(_deepgemm_include):
+        include_dirs.append(_deepgemm_include)
+    if os.path.isdir(_deepgemm_cutlass_include):
+        include_dirs.append(_deepgemm_cutlass_include)
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
@@ -108,6 +115,18 @@ if __name__ == '__main__':
     if int(os.getenv('MK_TOKEN_TRACE', 0)):
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
+
+    # MK_FORCE_WMMA: force compute_worker gate/up + down to the WMMA path,
+    # bypassing the DeepGEMM UMMA path (precision isolation, step 1).
+    if int(os.getenv('MK_FORCE_WMMA', 0)):
+        cxx_flags.append('-DMK_FORCE_WMMA')
+        nvcc_flags.append('-DMK_FORCE_WMMA')
+
+    # MK_UMMA_SINGLE_CLUSTER: only cluster #0 runs ALL gate/up tiles (num_clusters=1,
+    # standalone PASS config); down-proj falls back to WMMA. Precision isolation step 2.
+    if int(os.getenv('MK_UMMA_SINGLE_CLUSTER', 0)):
+        cxx_flags.append('-DMK_UMMA_SINGLE_CLUSTER')
+        nvcc_flags.append('-DMK_UMMA_SINGLE_CLUSTER')
 
     if int(os.getenv('ENABLE_FAST_DEBUG', 0)):
         cxx_flags.append('-DENABLE_FAST_DEBUG')

@@ -993,6 +993,20 @@ gmem_ptr 当场算 → 天然支持 gather。DeepEP dispatch 末尾存 hidden_st
   - **运行时 bug 2（已修）**：UMMA 内核内部 `__syncthreads()` 在 `if(thread_id<128)` 分支内 → 等全 800 线程 → 死锁。修复：新增 `umma_sync128()`（`barrier.sync 1, 128` named barrier，只同步参与的 128 线程），内核内两处 `__syncthreads` 换成它；`cluster_sync()` 保留。
   - **待验证的残留风险**：① arch `sm_103`(无 a) 下 tcgen05 是否合法（否则要 `10.3a` 重编）；② `cluster_sync()` 在"每 CTA 仅 128/800 线程活跃"下是否正确（可能仍 hang）；③ TMA Copy_Atom memcpy 到 device 后 descriptor 是否有效；④ ClusterSharedStorage 是否超 SMEM 预算；⑤ 测试 num_tokens 是否够凑满 256 触发 UMMA 路径（否则走 WMMA fallback，验证不到）。
   - 下一步：重编重跑，按现象（出数/OOB/hang）继续定位。
+- 2026-06-29：**S4.5 代码完成（待用户编译验证）**。把阶段2 down-proj 从 WMMA `device_gemm_bf16` 换成 UMMA 2CTA 纯 GEMM。
+  - **新增（`megakernel_compute_umma.cuh`）**：
+    - `make_weight_down_tma_atom` / `WeightDownTmaAtom_t`：W_down `[hidden, intermediate]=[N,K]` K-major 的 2CTA multicast TMA atom（与 up-proj 同 tile shape 256×256×64）。
+    - `make_act_tma_atom` / `ActTmaAtom_t`：act workspace `[M=256, intermediate]` 的 A 侧 TMA atom。
+    - `ComputeDownTmaAtoms` + `build_compute_down_tma_atoms`：per-expert W_down atom 数组。
+    - `umma_down_proj_tile`：2CTA 纯 GEMM `D = act @ W_down^T`，单 pass mainloop + TMEM→RMEM→cast bf16→GMEM 直写（无 SwiGLU）。复用同一 `umma_tmem_allocated`（与 up-proj 共享 TMEM alloc-once，都用 `Sm100TmemCapacityColumns` 全量分配）。
+  - **接入（`megakernel.cu`）**：
+    - `MegaKernelState` 加 `compute_down_tma`/`group_act_tma`。
+    - compute_worker GEMM3：`state->compute_down_tma != nullptr && batch==256` 时走 UMMA down（16 cluster 各算 d_tile=cluster_in_group），否则 WMMA fallback。
+    - host 端构建 W_down atoms + per-group act atoms（act = up_buf 区域，offset = `g*per_group_elems + input_stride + gate_stride`）并 cudaMemcpy 上传，与 S4.4 同一 enable 条件（hidden==intermediate 且 E≤64）。
+  - **待验证风险**：① TMEM 跨 up/down 复用是否正确（同一 alloc，两个 GEMM 顺序复用 accumulator）；② act workspace offset 与 kernel `up_buf` 实际地址是否一致；③ down-proj 输出与 WMMA 版数值对齐（fab6030 基线）。
+  - 验证方式：用户编译跑 `run_megakernel_v7_test.sh`（已加 nsys 支持，`ENABLE_NSYS=1`）。
+  - 下一步：S4.6 性能测量 + nsys/ncu。
+- **S4 当前状态**：S4.1-S4.5 代码完成，进入 S4.6 性能测量与精度对齐验证。
 
 ### I.9.9 2CTA vs 1CTA 决策与回退预案
 
@@ -1014,4 +1028,28 @@ gmem_ptr 当场算 → 天然支持 gather。DeepEP dispatch 末尾存 hidden_st
   - 1CTA = `SM100_MMA_F16BF16_SS`（M_tile=128），**不需要 cluster launch** → 不开 cluster，dispatch/combine 调度自由度恢复，S4.2 的性能下滑消失。
   - 1CTA 仍拿到 UMMA vs WMMA 的绝大部分收益（架构换代是大头），只是少了权重 multicast 那 1.2~1.5x。
   - 1CTA 是不依赖 cluster 的安全基线，这正是当初坚持「1CTA 先行、2CTA 后置」的原因。
+
+### I.9.11 DeepGEMM 迁移踩坑记录（dg_gemm_tile 精度隔离验证）
+
+将 DeepGEMM `sm100_bf16_gemm_impl` 迁移为 device 函数 `dg_gemm_tile`（per-tile 调用模型）后，搭建 standalone microkernel `compute_ref/mega_vs_wmma_gate.cu` 把它和 WMMA 参考（`device_gemm_bf16`）对比纯 gate GEMM 精度。以下是踩到的坑，按"现象 / 根因 / 修法"记录。
+
+**结论先行**：1-CTA 纯 gate GEMM `dg_gemm_tile<false,1>` 与 WMMA **逐元素 rel err = 0**（都 ~0.00166 vs FP32 ref）。GEMM 核心算法（TMA load + UMMA + epilogue store）正确，无需怀疑。下面的坑都是 **测试 harness 的坑，不是 GEMM 算法的坑**。
+
+1. **TMA descriptor 必须 `__grid_constant__`（致命 trap）**
+   - 现象：kernel 第一条 `UTMALDG.2D` 就 illegal instruction（trap）；compute-sanitizer 定位到 TMA load 指令。
+   - 根因：`CUtensorMap` 按普通 kernel 值参数传入时，descriptor 落在普通参数空间，不满足 `UTMALDG` 对 descriptor 地址的硬件要求。`umma_swiglu_ws_dg.cu`（PASS 版）用的是 `const __grid_constant__ cute::TmaDescriptor`。
+   - 修法：kernel 签名里所有 TMA descriptor 参数都加 `const __grid_constant__ CUtensorMap`。
+   - **对 megakernel 的提示**：megakernel 把 descriptor 存在 `MegaKernelState`（GMEM）里通过指针传，能跑通不 trap，说明 GMEM 里的 descriptor 地址可用；但 standalone 按值传必须 grid_constant。
+
+2. **TMEM 必须在 kernel 退出前 free（"tensor memory not completely freed"）**
+   - 现象：kernel 跑完后报 `tensor memory not completely freed`。
+   - 根因：`dg_gemm_tile` 内 `Allocator().allocate()` 只分配不释放（per-tile 模型把 free 留给调用方）。standalone 漏了 loop 后的 free。
+   - 修法：tile loop 结束后调一次 `Allocator1Sm().free(*tmem_ptr, kNumTmemCols)`。注意 `umma_dealloc` 假定 2-CTA 布局（`kDgRunMulticast`），1-CTA 验证时需按 1-CTA 的 `LOAD_BLOCK_N=128` 重算 smem 里 tmem_ptr 槽位偏移。
+
+3. **per-tile 模型删掉了 DeepGEMM 的 terminal drain（已在 I.9.8 修 hang 时处理）**
+   - DeepGEMM MMA warp 末尾的 `tmem_empty_barriers[...]->wait(accum_phase)` 依赖 persistent kernel 的终态，per-tile 模型下会死锁，已删除；相位接力靠 `accum_iter` 跨调用传递。
+
+4. **1-CTA descriptor 的 box 维度**：`LOAD_BLOCK_M=LOAD_BLOCK_N=128`（1-CTA 不切分），与 cuh 里 2-CTA 的 `kDgLoadBlockN=64` 不同，standalone 需用独立的 1-CTA descriptor builder（`c1_*_desc`），不能直接用 cuh 的 `dg_make_b_desc`（那是 2-CTA 尺寸）。
+
+**下一步（未完成）**：standalone 扩到 2-CTA（`dg_gemm_tile<false,2>` + cluster launch）验证 2-CTA gate 是否仍与 WMMA 一致。若 2-CTA 也 PASS，则 megakernel 精度 bug 不在 GEMM 算法，而在数据准备（A buffer 填充 / W layout / route_w 收集）或 SwiGLU / down-proj。
 - **待补 TODO**：做 1CTA vs 2CTA 的**控制变量 microbench**（M=256 同条件，仅 atom/cluster 不同，ncu 看 DRAM bytes 验证权重流量减半），量化 2CTA 真实增量——作为"是否值得为 2CTA 开 cluster"的决策依据。

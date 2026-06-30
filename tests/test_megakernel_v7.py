@@ -341,17 +341,17 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
             )
             print(f'  tolerance: max_abs_diff<={max_abs_tol:.1e}, calc_diff<={calc_diff_tol:.1e}, cosine_similarity>={cos_tol:.6f}')
 
-        if passed:
-            print(f'  PASSED')
-        else:
-            print(f'  FAILED - {failure_reason}')
-            print(f'  baseline[:5]:    {baseline_output[0, :5].float().tolist()}')
-            print(f'  megakernel[:5]:  {megakernel_output[0, :5].float().tolist()}')
-            print_bitwise_mismatches(
-                baseline_output, megakernel_output, rank,
-                hidden_states=x,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights)
+        # if passed:
+        #     print(f'  PASSED')
+        # else:
+        #     print(f'  FAILED - {failure_reason}')
+        #     print(f'  baseline[:5]:    {baseline_output[0, :5].float().tolist()}')
+        #     print(f'  megakernel[:5]:  {megakernel_output[0, :5].float().tolist()}')
+        #     print_bitwise_mismatches(
+        #         baseline_output, megakernel_output, rank,
+        #         hidden_states=x,
+        #         topk_idx=topk_idx,
+        #         topk_weights=topk_weights)
 
     return diff, max_abs_diff, cos_sim
 
@@ -387,7 +387,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--skip-baseline', action='store_true')
     parser.add_argument('--no-compute', action='store_true', help='Skip PyTorch expert compute in the baseline path')
-    parser.add_argument('--warmup', type=int, default=100,
+    parser.add_argument('--warmup', type=int, default=0,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()

@@ -192,7 +192,6 @@ struct MegaKernelState {
     umma::ComputeTmaAtoms* compute_tma;      // device ptr; wgate[e]/wup[e]
     umma::ComputeDownTmaAtoms* compute_down_tma;  // device ptr; wdown[e]
     umma::InputTmaAtom_t* group_input_tma;   // device array [num_compute_groups]
-    umma::ActTmaAtom_t* group_act_tma;       // device array [num_compute_groups] (act workspace for down-proj)
     int num_compute_groups;                  // for indexing group_input_tma / barriers
 
     // --- Compute output buffer ---
@@ -1641,55 +1640,62 @@ __device__ void compute_worker(
         const __nv_bfloat16* w_up   = &state->W_up[expert_id * intermediate * hidden];
         const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
 
-        // Fused gate+up GEMM with in-register SwiGLU epilogue:
-        //   act = silu(A@W_gate^T) * (A@W_up^T) * route_w
-        // gate/up accumulators stay in registers; only act ([M,intermediate])
-        // is written to GMEM (reusing up_buf), eliminating the gate_buf/up_buf
-        // round-trips and the standalone SwiGLU read-modify-write loop.
-        // M=batch_size so only real-token rows are computed/written, matching
-        // the downstream W_down GEMM which also uses M=batch_size.
-        if (state->compute_tma != nullptr) {
-            // S4.4 (route B2): UMMA 2CTA fused gate+up+SwiGLU, tile-level.
-            // group's 32 SMs = 16 2-CTA clusters; cluster c (= group_sm_idx/2)
-            // computes act[:, c*256:+256] for this expert. i_tile = c, 16 tiles
-            // = intermediate(4096)/256.
-            // IMPORTANT: ALL 800 threads enter the kernel (not just thread<128),
-            // because cute::cluster_sync() inside requires whole-CTA arrival and
-            // would deadlock if gated to 128 threads. The kernel internally guards
-            // the 128-thread compute work and keeps cluster_sync on the all-thread
-            // path. Only full batches (256) use this; tail uses WMMA fallback.
-            const int cluster_in_group = group_sm_idx / 2;   // 0..15
-            const int i_tile = cluster_in_group;             // 1:1 mapping (I=4096)
-            if (batch_size == COMPUTE_BATCH_SIZE && i_tile < (intermediate / umma::kTileN)) {
-                // One-shot diagnostic: print cluster alignment for first UMMA entry per SM
-                // if (thread_id == 0) {
-                //     static __shared__ int s_umma_logged;
-                //     if (group_sm_idx == 0) s_umma_logged = 0;
-                //     __syncwarp();
-                //     if (atomicCAS(&s_umma_logged, 0, 1) == 0) {
-                //         printf("[MK-UMMA-NEW] rank=%d block=%d sm_idx=%d group=%d cluster_in_grp=%d "
-                //                "i_tile=%d block_rank_in_cluster=%d batch=%d expert=%d\n",
-                //                state->rank, (int)blockIdx.x, compute_sm_idx, group_id,
-                //                cluster_in_group, i_tile, (int)cute::block_rank_in_cluster(),
-                //                batch_size, expert_id);
-                //     }
-                // }
-                // Force flush printf buffer before entering UMMA (hang will swallow unflushed prints)
-                // if (thread_id == 0) {
-                //     printf("[MK-UMMA-PRE-ENTER] block=%d i_tile=%d expert=%d\n",
-                //            (int)blockIdx.x, i_tile, expert_id);
-                // }
-                char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
-                umma::umma_up_swiglu_tile(
-                    state->group_input_tma[group_id],
-                    state->compute_tma->wgate[expert_id],
-                    state->compute_tma->wup[expert_id],
-                    i_tile, up_buf, s_route_w,
-                    batch_size, intermediate, hidden, cluster_smem, umma_tmem_allocated
-#ifdef MK_PERF_TRACE
-                    , (perf_leader ? &s_perf_up : nullptr)
+        // DeepGEMM-style gate/up path from compute_ref/umma_swiglu_ws_dg.cu:
+        // first materialize gate BF16, then run up GEMM with a SwiGLU epilogue
+        // that reads gate_buf. This preserves the verified BF16 precision path.
+        // umma_accum_iter tracks TMEM accumulator pipeline phase (tmem_full/tmem_empty
+        // barrier ring) across ALL three GEMMs (gate, up, down). Must NOT be reset
+        // between gate/up and down-proj — the barrier ring is initialized once and
+        // must stay in phase. Declared here so it spans both if-blocks below.
+        uint32_t umma_accum_iter = 0;
+
+        // MK_FORCE_WMMA: step-(1) isolation — force gate/up + down to the trusted
+        // WMMA path (device_gemm_swiglu_fused / device_gemm_bf16), bypassing the
+        // DeepGEMM UMMA path entirely. If end-to-end PASSes under this flag, the
+        // data preparation (input_buf gather / W layout / route_w) is correct and
+        // any precision bug is isolated to the UMMA outer layer (descriptors /
+        // tile schedule / cluster mapping).
+#ifdef MK_FORCE_WMMA
+        constexpr bool kUseUmmaGateUp = false;
+#else
+        constexpr bool kUseUmmaGateUp = true;
 #endif
-                    );
+        // MK_UMMA_SINGLE_CLUSTER: step-(2) isolation — only ONE 2-CTA cluster
+        // (group_sm_idx 0/1) runs ALL tiles (num_clusters=1), reproducing the
+        // standalone PASS config inside the real megakernel. The other 15 clusters
+        // skip the UMMA work. This verifies the 2-CTA DeepGEMM gate/up is correct
+        // on real megakernel data, isolated from the 16-cluster tile sharing.
+        // down-proj falls back to WMMA in this mode (step 2 isolates gate/up only).
+#ifdef MK_UMMA_SINGLE_CLUSTER
+        constexpr bool kUmmaSingleCluster = true;
+#else
+        constexpr bool kUmmaSingleCluster = false;
+#endif
+        if (kUseUmmaGateUp && state->compute_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
+            const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
+            const int m_tiles = (batch_size + umma::kDgBlockM - 1) / umma::kDgBlockM;
+            const int n_tiles = intermediate / umma::kDgBlockN;
+            const int total_tiles = m_tiles * n_tiles;
+            // step-2: single cluster (#0) does all tiles; step-3/default: 16 clusters share.
+            const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
+            const int tile_start   = kUmmaSingleCluster ? 0 : cluster_in_group;
+            const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+
+            if (cluster_active) {
+                for (int tile = tile_start; tile < total_tiles; tile += num_clusters) {
+                    umma::umma_up_swiglu_tile(
+                        &in_atom.a, &in_atom.gate_cd, &in_atom.act_cd,
+                        &state->compute_tma->wgate[expert_id],
+                        &state->compute_tma->wup[expert_id],
+                        tile, gate_buf, s_route_w,
+                        batch_size, intermediate, hidden, cluster_smem, umma_tmem_allocated, umma_accum_iter
+#ifdef MK_PERF_TRACE
+                        , (perf_leader ? &s_perf_up : nullptr)
+#endif
+                        );
+                }
             }
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
@@ -1708,22 +1714,31 @@ __device__ void compute_worker(
         if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
 #endif
 
-        // GEMM 3: [batch_size, intermediate] @ [hidden, intermediate]^T = down-proj
-        if (state->compute_down_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
-            // S4.5: UMMA 2CTA down-proj, tile-level (mirrors up-proj pattern).
+        // GEMM 3: down-proj D = act @ W_down^T, DeepGEMM 2-CTA path (same
+        // dg_gemm_tile as gate/up so TMEM allocator + umma_tmem_allocated stay
+        // consistent — no second allocator / handle location).
+        // Step-2 (MK_UMMA_SINGLE_CLUSTER) isolates gate/up only: down-proj uses
+        // WMMA fallback so the single-cluster gate/up result (in up_buf) is the
+        // only UMMA-produced tensor under test.
+        if (kUseUmmaGateUp && !kUmmaSingleCluster &&
+            state->compute_down_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / 2;
-            const int d_tile = cluster_in_group;
-            if (d_tile < (hidden / umma::kTileN)) {
-                char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
-                umma::umma_down_proj_tile(
-                    state->group_act_tma[group_id],
-                    state->compute_down_tma->wdown[expert_id],
-                    d_tile, down_buf,
-                    batch_size, hidden, intermediate, cluster_smem, umma_tmem_allocated
-#ifdef MK_PERF_TRACE
-                    , (perf_leader ? &s_perf_down : nullptr)
-#endif
-                    );
+            const int m_tiles = (batch_size + umma::kDgBlockM - 1) / umma::kDgBlockM;
+            const int n_tiles = hidden / umma::kDgBlockN;
+            const int total_tiles = m_tiles * n_tiles;
+            const int num_clusters = COMPUTE_GROUP_SIZE / 2;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+            // Reuse umma_accum_iter (declared above) — must continue from wherever
+            // gate+up passes left off so tmem_full/tmem_empty barrier ring stays in phase.
+
+            for (int tile = cluster_in_group; tile < total_tiles; tile += num_clusters) {
+                umma::umma_down_proj_tile_dg(
+                    &in_atom.act_a,
+                    &state->compute_down_tma->wdown[expert_id],
+                    &in_atom.down_cd,
+                    tile, batch_size, hidden, intermediate,
+                    cluster_smem, umma_tmem_allocated, umma_accum_iter);
             }
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
@@ -3598,7 +3613,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     umma::ComputeTmaAtoms* d_compute_tma = nullptr;
     umma::InputTmaAtom_t* d_group_input_tma = nullptr;
     umma::ComputeDownTmaAtoms* d_compute_down_tma = nullptr;
-    umma::ActTmaAtom_t* d_group_act_tma = nullptr;
     if (W_gate != nullptr && W_up != nullptr && hidden_dim == intermediate_dim &&
         num_local_experts <= umma::kMaxLocalExperts) {
         // Per-expert weight atoms.
@@ -3608,38 +3622,28 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMalloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_tma, &h_atoms, sizeof(umma::ComputeTmaAtoms), cudaMemcpyHostToDevice));
 
-        // Per-group A(input_buf) atoms. input_buf for group g starts at
-        // gemm_workspace + g*per_group_elems (the first input_stride region).
+        // Per-group A(input_buf) + gate/act/down workspace atoms. Layout per group:
+        //   [input_buf (M*hidden)] [gate_buf (M*I)] [up_buf/act (M*I)] [down_buf (M*hidden)]
         std::vector<umma::InputTmaAtom_t> h_in;
         h_in.reserve(num_compute_groups);
         for (int g = 0; g < num_compute_groups; ++g) {
             const __nv_bfloat16* in_g = gemm_workspace + (size_t)g * per_group_elems;
-            h_in.push_back(umma::make_input_tma_atom(in_g, COMPUTE_BATCH_SIZE, hidden_dim));
+            const __nv_bfloat16* gate_g = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+            const __nv_bfloat16* act_g  = gate_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
+            const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
+            h_in.push_back(umma::make_input_group_atoms(in_g, gate_g, act_g, down_g,
+                                                        COMPUTE_BATCH_SIZE, hidden_dim,
+                                                        intermediate_dim, hidden_dim));
         }
         CUDA_CHECK(cudaMalloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
         CUDA_CHECK(cudaMemcpy(d_group_input_tma, h_in.data(),
                               num_compute_groups * sizeof(umma::InputTmaAtom_t), cudaMemcpyHostToDevice));
 
-        // S4.5: Per-expert W_down TMA atoms
+        // Per-expert W_down raw TMA descriptors (DeepGEMM path; A/CD live in InputTmaAtom_t).
         umma::ComputeDownTmaAtoms h_down;
         umma::build_compute_down_tma_atoms(h_down, W_down, num_local_experts, hidden_dim, intermediate_dim);
         CUDA_CHECK(cudaMalloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_down_tma, &h_down, sizeof(umma::ComputeDownTmaAtoms), cudaMemcpyHostToDevice));
-
-        // S4.5: Per-group act workspace TMA atoms (act = up_buf region of gemm_workspace).
-        // up_buf for group g starts at gemm_workspace + g*per_group_elems + input_stride + gate_stride
-        // where input_stride = COMPUTE_BATCH_SIZE*hidden, gate_stride = COMPUTE_BATCH_SIZE*intermediate.
-        std::vector<umma::ActTmaAtom_t> h_act;
-        h_act.reserve(num_compute_groups);
-        for (int g = 0; g < num_compute_groups; ++g) {
-            const __nv_bfloat16* act_g = gemm_workspace + (size_t)g * per_group_elems
-                                         + (size_t)COMPUTE_BATCH_SIZE * hidden_dim
-                                         + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
-            h_act.push_back(umma::make_act_tma_atom(act_g, COMPUTE_BATCH_SIZE, intermediate_dim));
-        }
-        CUDA_CHECK(cudaMalloc(&d_group_act_tma, num_compute_groups * sizeof(umma::ActTmaAtom_t)));
-        CUDA_CHECK(cudaMemcpy(d_group_act_tma, h_act.data(),
-                              num_compute_groups * sizeof(umma::ActTmaAtom_t), cudaMemcpyHostToDevice));
     }
 
     // Output accumulator [num_tokens, hidden_dim] in float32
@@ -3792,7 +3796,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.compute_tma = d_compute_tma;
     host_state.compute_down_tma = d_compute_down_tma;
     host_state.group_input_tma = d_group_input_tma;
-    host_state.group_act_tma = d_group_act_tma;
     host_state.num_compute_groups = num_compute_groups;
 
     // Compute dimensions
