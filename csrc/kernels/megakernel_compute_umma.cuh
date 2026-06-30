@@ -206,6 +206,79 @@ inline CUtensorMap dg_make_cd_desc(const __nv_bfloat16* d, int M, int N) {
 
 static constexpr int kMaxLocalExperts = 64;
 
+// ---------------------------------------------------------------------------
+// MegaTileScheduler — megakernel-adapted persistent tile scheduler.
+//
+// Functionally identical to DeepGEMM sched::Scheduler<Normal>, but:
+//   - the "block index space" is the cluster index inside a compute group
+//     (cluster_idx in [0, num_clusters)) instead of grid-global blockIdx.x;
+//   - num_clusters (=16) replaces kNumSMs.
+// It reproduces DeepGEMM's `next_block_idx = (++current_iter)*kNumSMs + blockIdx.x`
+// persistent block assignment and the L2-swizzled (m,n) mapping
+// (get_swizzled_block_idx). Each warp role (TMA/MMA/epilogue) constructs its own
+// instance with the SAME (M, N, cluster_idx, num_clusters): because the sequence
+// is a deterministic integer progression, all three roles enumerate the IDENTICAL
+// tile order without any cross-warp communication; data hand-off is via mbarriers.
+//
+// BLOCK_M/BLOCK_N are compile-time (kDgBlockM/kDgBlockN). kIsMulticastOnA=false
+// (multicast on B/N) → swizzle groups on M, exactly mirroring DeepGEMM.
+struct MegaTileScheduler {
+    uint32_t num_m_blocks;
+    uint32_t num_n_blocks;
+    uint32_t num_blocks;
+    uint32_t num_blocks_in_group;     // set by get_swizzled_block_idx (unused on SM100)
+    int cluster_idx;                  // 0..num_clusters-1 (= cluster_in_group)
+    int num_clusters;                 // 16 (= COMPUTE_GROUP_SIZE/2)
+    int current_iter;                 // mirrors DeepGEMM scheduler.current_iter
+
+    static constexpr uint32_t BLOCK_M = kDgBlockM;
+    static constexpr uint32_t BLOCK_N = kDgBlockN;
+    static constexpr bool kIsMulticastOnA = kDgMcastOnA;          // false
+    // DeepGEMM picks 8 or 16 by usage; for our M-small/N-large shape mirror its
+    // default selection at compile time. group-on-M (kIsMulticastOnA=false).
+    static constexpr uint32_t kNum1DBlocksPerGroup = 16;
+
+    __device__ MegaTileScheduler(uint32_t shape_m, uint32_t shape_n,
+                                 int cluster_idx_, int num_clusters_)
+        : cluster_idx(cluster_idx_), num_clusters(num_clusters_), current_iter(-1) {
+        num_m_blocks = (shape_m + BLOCK_M - 1) / BLOCK_M;
+        num_n_blocks = (shape_n + BLOCK_N - 1) / BLOCK_N;
+        num_blocks = num_m_blocks * num_n_blocks;
+    }
+
+    // Verbatim DeepGEMM get_swizzled_block_idx (SM100 path, no SM90 multicast fix).
+    __device__ void get_swizzled_block_idx(uint32_t block_idx,
+                                           uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        // Swizzle for better L2 usage.
+        const auto primary_num_blocks   = kIsMulticastOnA ? num_n_blocks : num_m_blocks;
+        const auto secondary_num_blocks = kIsMulticastOnA ? num_m_blocks : num_n_blocks;
+        const auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
+        const auto group_idx = block_idx / num_blocks_per_group;
+        auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+        auto in_group_idx = block_idx % num_blocks_per_group;
+        num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
+
+        if constexpr (kIsMulticastOnA) {
+            m_block_idx = in_group_idx / num_blocks_in_group;
+            n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+        } else {
+            m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+            n_block_idx = in_group_idx / num_blocks_in_group;
+        }
+    }
+
+    // Returns false when this cluster has no more tiles. Mirrors DeepGEMM Normal path.
+    __device__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        const uint32_t next_block_idx =
+            static_cast<uint32_t>(++current_iter) * static_cast<uint32_t>(num_clusters)
+            + static_cast<uint32_t>(cluster_idx);
+        if (next_block_idx >= num_blocks)
+            return false;
+        get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+        return true;
+    }
+};
+
 // Per-expert raw TMA descriptors for W_gate and W_up ([I,d] = [N,K] K-major).
 struct ComputeTmaAtoms {
     int num_experts;
@@ -323,6 +396,85 @@ struct ClusterSharedStorage {
 //   m_block/n_block : tile coordinates (M/BLOCK_M, I/BLOCK_N)
 //   gate_ptr/route_ptr/stride_n : only used when fuse_swiglu (up pass)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// DgSmemLayout — shared SMEM/barrier layout for the DeepGEMM persistent GEMM.
+// Used by dg_init_barriers_tmem / dg_dealloc_tmem / dg_gemm_persistent so the
+// init-once, run-many, free-once split keeps the SAME smem offsets everywhere.
+// ---------------------------------------------------------------------------
+template <uint32_t kNumMulticast>
+struct DgSmemLayout {
+    static constexpr uint32_t BLOCK_M = kDgBlockM, BLOCK_N = kDgBlockN, BLOCK_K = kDgBlockK;
+    static constexpr bool kIsMulticastOnA = kDgMcastOnA;
+    static constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast : 1);
+    static constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
+    static constexpr uint32_t STORE_BLOCK_M = kDgStoreBlockM, STORE_BLOCK_N = kDgStoreBlockN;
+    static constexpr uint32_t kNumStages = kDgWsNumStages;
+    static constexpr uint32_t kNumEpilogueStages = kDgWsNumEpilogueStages;
+    static constexpr uint32_t kNumTMAStoreStages = kDgWsNumTmaStoreStages;
+    static constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cutlass::bfloat16_t);
+    static constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
+    static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(cutlass::bfloat16_t);
+    static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(cutlass::bfloat16_t);
+    static constexpr uint32_t UMMA_N = BLOCK_N;
+    static constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
+    static constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+    __device__ static Barrier* barrier_start(char* cluster_smem) {
+        uint8_t* sb = reinterpret_cast<uint8_t*>(cluster_smem);
+        return reinterpret_cast<Barrier*>(sb + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+    }
+    __device__ static uint32_t* tmem_ptr_in_smem(char* cluster_smem) {
+        return reinterpret_cast<uint32_t*>(barrier_start(cluster_smem) + kNumStages * 3 + kNumEpilogueStages * 2 + 1);
+    }
+};
+
+// dg_init_barriers_tmem — init mbarriers + allocate TMEM ONCE per task (4a).
+// Called by all GEMM warps (0..7) before the persistent loops.
+template <uint32_t kNumMulticast>
+__device__ void dg_init_barriers_tmem(char* cluster_smem) {
+    using namespace deep_gemm;
+    using L = DgSmemLayout<kNumMulticast>;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<L::kNumAccumTmemCols>();
+    const auto warp_idx = cutlass::canonical_warp_idx_sync();
+    auto bar = L::barrier_start(cluster_smem);
+    auto full_b  = utils::PatternVisitor([=](const uint32_t& i) { return bar + i; });
+    auto empty_b = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages + i); });
+    auto tf_b    = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages * 2 + i); });
+    auto te_b    = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages * 2 + L::kNumEpilogueStages + i); });
+
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    if (warp_idx == 1 and cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < L::kNumStages; ++ i) { full_b[i]->init(kNumMulticast); empty_b[i]->init(1); }
+        #pragma unroll
+        for (uint32_t i = 0; i < L::kNumEpilogueStages; ++ i) {
+            tf_b[i]->init(1);
+            te_b[i]->init(kNumMulticast * L::kNumUMMAStoreThreads);
+        }
+        cutlass::arch::fence_barrier_init();
+    } else if (warp_idx == 2) {
+        Allocator().allocate(kNumTmemCols, L::tmem_ptr_in_smem(cluster_smem));
+    }
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
+}
+
+// dg_dealloc_tmem — free TMEM ONCE per task (4a).
+template <uint32_t kNumMulticast>
+__device__ void dg_dealloc_tmem(char* cluster_smem) {
+    using namespace deep_gemm;
+    using L = DgSmemLayout<kNumMulticast>;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<L::kNumAccumTmemCols>();
+    const auto warp_idx = cutlass::canonical_warp_idx_sync();
+    __syncthreads();
+    if (warp_idx == 0)
+        Allocator().free(*L::tmem_ptr_in_smem(cluster_smem), kNumTmemCols);
+    __syncthreads();
+}
+
 template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1>
 __device__ void dg_gemm_tile(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
@@ -640,6 +792,243 @@ __device__ void dg_gemm_tile(
 #undef MK_DG_DBG
 }
 
+// ===========================================================================
+// dg_gemm_persistent — DeepGEMM persistent warp-specialized GEMM over a TILE
+// SEQUENCE (not a single tile). barriers/TMEM are init/alloc'd ONCE by the
+// caller (dg_init_barriers_tmem); the three warp roles each run their own
+// MegaTileScheduler and loop over all tiles this cluster owns, with ZERO
+// cluster sync between tiles — TMA pipeline rolls continuously across tiles.
+//
+// This mirrors compute_ref/sm100_bf16_gemm_dg_copy.cuh's `while(get_next_block)`
+// structure, the difference being the scheduler enumerates THIS cluster's tiles
+// (cluster_idx/num_clusters) instead of grid-global blocks, and there is no
+// `cudaGridDependencySynchronize` (device-function context).
+//
+//   accum_iter : persists the TMEM accumulator phase across tiles AND across the
+//                gate->up passes (caller threads it through both calls).
+//   A closing block_or_cluster_sync() ensures all warps finish before return.
+// ===========================================================================
+template <bool kFuseSwiGLU, uint32_t kNumMulticast>
+__device__ void dg_gemm_persistent(
+    const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter,
+    const cutlass::bfloat16_t* gate_ptr, const float* route_ptr, uint32_t stride_n) {
+
+    using namespace deep_gemm;
+    using L = DgSmemLayout<kNumMulticast>;
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+    constexpr uint32_t BLOCK_M = L::BLOCK_M, BLOCK_N = L::BLOCK_N, BLOCK_K = L::BLOCK_K;
+    constexpr bool kIsMulticastOnA = L::kIsMulticastOnA;
+    constexpr uint32_t LOAD_BLOCK_M = L::LOAD_BLOCK_M, LOAD_BLOCK_N = L::LOAD_BLOCK_N;
+    constexpr uint32_t STORE_BLOCK_M = L::STORE_BLOCK_M, STORE_BLOCK_N = L::STORE_BLOCK_N;
+    constexpr uint32_t kNumStages = L::kNumStages;
+    constexpr uint32_t kNumEpilogueStages = L::kNumEpilogueStages;
+    constexpr uint32_t kNumTMAStoreStages = L::kNumTMAStoreStages;
+    constexpr uint32_t LAYOUT_AD_M = 128;
+    constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
+    constexpr uint32_t UMMA_N = BLOCK_N;
+    constexpr uint32_t UMMA_K = 16;
+    constexpr uint32_t kNumUMMAStoreThreads = L::kNumUMMAStoreThreads;
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = L::SMEM_A_SIZE_PER_STAGE;
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = L::SMEM_B_SIZE_PER_STAGE;
+
+    const bool is_leader_cta = (kNumMulticast == 1) ? true : (cute::block_rank_in_cluster() == 0);
+    const auto warp_idx = cutlass::canonical_warp_idx_sync();
+    const auto lane_idx = ptx::get_lane_idx();
+
+    auto block_or_cluster_sync = [&]() {
+        if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+        else __syncthreads();
+    };
+
+    if (warp_idx == 0) {
+        cute::prefetch_tma_descriptor(desc_a);
+        cute::prefetch_tma_descriptor(desc_b);
+        cute::prefetch_tma_descriptor(desc_cd);
+    }
+
+    // ---- SMEM partition (same layout as dg_gemm_tile, via DgSmemLayout) ----
+    uint8_t* smem_buffer = reinterpret_cast<uint8_t*>(cluster_smem);
+    auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + i * L::SMEM_CD_SIZE_PER_STAGE);
+    });
+    auto smem_a = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + L::SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+    });
+    auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + L::SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+    });
+    auto bar = L::barrier_start(cluster_smem);
+    auto full_barriers      = utils::PatternVisitor([=](const uint32_t& i) { return bar + i; });
+    auto empty_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return bar + (kNumStages + i); });
+    auto tmem_full_barriers = utils::PatternVisitor([=](const uint32_t& i) { return bar + (kNumStages * 2 + i); });
+    auto tmem_empty_barriers= utils::PatternVisitor([=](const uint32_t& i) { return bar + (kNumStages * 2 + kNumEpilogueStages + i); });
+
+    const auto num_total_k_blocks = math::ceil_div<uint32_t>(shape_k, BLOCK_K);
+    const uint32_t cta_rank = (kNumMulticast > 1) ? cute::block_rank_in_cluster() : 0;
+
+    // Mainloop pipeline phases — roll CONTINUOUSLY across tiles (the key win).
+    uint32_t stage_idx = 0, phase = 0;
+    auto advance_pipeline = [&](uint32_t& k_block_idx) {
+        ++ k_block_idx;
+        stage_idx = (stage_idx + 1) % kNumStages;
+        phase ^= (stage_idx == 0);
+    };
+
+    if (warp_idx == 0 and cute::elect_one_sync()) {
+        // ================= TMA load warp =================
+        MegaTileScheduler sched(shape_m, shape_n, cluster_idx, num_clusters);
+        uint32_t m_block, n_block;
+        while (sched.get_next_block(m_block, n_block)) {
+            const uint32_t m_idx0 = m_block * BLOCK_M;
+            const uint32_t n_idx0 = n_block * BLOCK_N;
+            const uint32_t load_m_idx = m_idx0 + (kIsMulticastOnA ? cta_rank * LOAD_BLOCK_M : 0);
+            const uint32_t load_n_idx = n_idx0 + (kIsMulticastOnA ? 0 : cta_rank * LOAD_BLOCK_N);
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
+                tma::copy<BLOCK_K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
+                    desc_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                    desc_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+                constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
+                if (is_leader_cta)
+                    full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
+                else
+                    full_barriers[stage_idx]->arrive(0u);
+            }
+        }
+    } else if (warp_idx == 1 and is_leader_cta) {
+        // ================= MMA issue warp (leader CTA) =================
+        constexpr bool kDoMergeStages = (kNumStages >= 8);
+        constexpr uint32_t kNumMinStages = 8;
+        constexpr uint32_t kNumStagesPerMerge = kDoMergeStages ? kNumStages / kNumMinStages : 1;
+        constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
+
+        auto instr_desc = cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
+                                                      UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+        auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_ATOM_K, kDgSwizzleA>(smem_a[0], 0, 0);
+        auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_ATOM_K, kDgSwizzleB>(smem_b[0], 0, 0);
+        uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
+        uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
+        const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
+
+        auto umma_arrive = [](const uint64_t* barrier) {
+            if constexpr (kNumMulticast == 1) cutlass::arch::umma_arrive(barrier);
+            else { constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
+                   cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask); }
+        };
+
+        MegaTileScheduler sched(shape_m, shape_n, cluster_idx, num_clusters);
+        uint32_t m_block, n_block;
+        uint32_t local_accum = accum_iter;   // MMA advances its own copy
+        while (sched.get_next_block(m_block, n_block)) {
+            const uint32_t accum_stage_idx = local_accum % kNumEpilogueStages;
+            const uint32_t accum_phase_idx = (local_accum / kNumEpilogueStages) & 1;
+
+            tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+            ptx::tcgen05_after_thread_sync();
+
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                full_barriers[stage_idx]->wait(phase);
+                ptx::tcgen05_after_thread_sync();
+                const auto a_base = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
+                const auto b_base = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
+                if (cute::elect_one_sync()) {
+                    using mma_t = cute::conditional_t<kNumMulticast == 1,
+                                      ptx::SM100_MMA_F16BF16_SS, ptx::SM100_MMA_F16BF16_2x1SM_SS>;
+                    auto issue_umma = [&]<uint32_t kUMMAKIdx>() {
+                        constexpr uint32_t kAtomKIdx  = kUMMAKIdx * UMMA_K / BLOCK_ATOM_K;
+                        constexpr uint32_t kInnerKIdx = kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
+                        a_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
+                                        a_base, kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K, kInnerKIdx);
+                        b_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                                        b_base, kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K, kInnerKIdx);
+                        mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
+                                   kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
+                    };
+                    utils::for_each_static_until<BLOCK_K / UMMA_K>(
+                        std::make_integer_sequence<uint32_t, BLOCK_K / UMMA_K>(), issue_umma);
+                }
+                __syncwarp();
+                umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
+                if (k_block_idx == num_total_k_blocks - 1)
+                    umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
+                __syncwarp();
+            }
+            ++ local_accum;   // advance TMEM accumulator phase per tile (local copy)
+        }
+        // Terminal drain: after ALL tiles, wait the last tmem_empty so barriers are
+        // safe to reuse / deconstruct. This is DeepGEMM's post-loop drain — valid
+        // here because this is the END of the persistent loop (not per-tile).
+        if (kNumMulticast > 1 and local_accum > accum_iter) {
+            const uint32_t last = local_accum - 1;
+            tmem_empty_barriers[last % kNumEpilogueStages]->wait((last / kNumEpilogueStages) & 1);
+        }
+    } else if (warp_idx >= kDgWsNonEpiThreads / 32 and warp_idx < (kDgWsNonEpiThreads + kDgWsEpiThreads) / 32) {
+        // ================= Epilogue store warps =================
+        const auto epilogue_warp_idx = warp_idx - (kDgWsNonEpiThreads / 32);
+        const cute::TmaDescriptor& tensor_map_cd = *desc_cd;
+        uint32_t tma_stage_idx = 0;
+
+        MegaTileScheduler sched(shape_m, shape_n, cluster_idx, num_clusters);
+        uint32_t m_block, n_block;
+        uint32_t local_accum = accum_iter;   // epilogue advances its own copy
+        while (sched.get_next_block(m_block, n_block)) {
+            const uint32_t accum_stage_idx = local_accum % kNumEpilogueStages;
+            const uint32_t accum_phase_idx = (local_accum / kNumEpilogueStages) & 1;
+            const uint32_t m_idx0 = m_block * BLOCK_M;
+            const uint32_t n_idx0 = n_block * BLOCK_N;
+
+            tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+            ptx::tcgen05_after_thread_sync();
+            const auto tmem_base_addr = accum_stage_idx * UMMA_N;
+
+            if constexpr (kFuseSwiGLU) {
+                deep_gemm::sm100_store_swiglu_from_gate<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    GemmType::Normal, false, cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
+                (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
+                 epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
+                 tensor_map_cd, gate_ptr, route_ptr, stride_n);
+            } else {
+                epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    GemmType::Normal, false, cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
+                (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
+                 epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
+                 tensor_map_cd);
+            }
+            ++ local_accum;
+        }
+        // Drain all outstanding TMA stores before the closing sync (gate_buf must be
+        // globally visible before the up pass's SwiGLU reads it).
+        if (epilogue_warp_idx == 0)
+            cute::tma_store_wait<0>();
+    }
+
+    // Sync accum_iter across the caller: all roles must agree on the post-loop
+    // value so the NEXT persistent call (up pass / down) starts at the right phase.
+    // Every tile advanced accum_iter once; the MMA warp already did that in its
+    // local copy. Compute the deterministic total here for the shared reference.
+    {
+        MegaTileScheduler probe(shape_m, shape_n, cluster_idx, num_clusters);
+        uint32_t mb, nb, tiles_done = 0;
+        while (probe.get_next_block(mb, nb)) ++ tiles_done;
+        accum_iter += tiles_done;
+    }
+
+    // System-scope fence so a non-fused (gate) pass's BF16 GMEM store is visible
+    // to the next pass's SwiGLU GMEM reads across the cluster, then sync.
+    if constexpr (kFuseSwiGLU == false)
+        __threadfence();
+    block_or_cluster_sync();
+}
+
+
 // TMEM dealloc (call once after persistent loop). Allocator must match the run path.
 __device__ void umma_dealloc(char* cluster_smem) {
     using Allocator = cute::conditional_t<kDgRunMulticast == 1,
@@ -688,6 +1077,46 @@ __device__ void umma_up_swiglu_tile(
                        m_block, n_block, M, I, d,
                        cluster_smem, tmem_allocated, accum_iter,
                        reinterpret_cast<const cutlass::bfloat16_t*>(gate_out), route_w, (uint32_t)I);
+}
+
+// ===========================================================================
+// umma_up_swiglu_persistent — task-level persistent gate+up+SwiGLU for THIS
+// cluster. Replaces the per-tile umma_up_swiglu_tile loop in compute_worker.
+//
+// Caller must:
+//   - call dg_init_barriers_tmem<kNumMulticast>(cluster_smem) ONCE before this
+//   - call dg_dealloc_tmem<kNumMulticast>(cluster_smem) ONCE after this
+//
+// Structure (route 2, A1 precision path):
+//   gate persistent loop (all this cluster's tiles -> gate_buf)  [no SwiGLU]
+//   -> dg_gemm_persistent's closing fence+sync makes gate_buf visible
+//   up   persistent loop (all this cluster's tiles -> act_buf, SwiGLU reads gate_buf)
+//   accum_iter threads through both so the TMEM phase ring stays continuous.
+//
+//   cluster_idx  : cluster_in_group (0..num_clusters-1)
+//   num_clusters : COMPUTE_GROUP_SIZE/2 (16) for the 16-cluster sharing
+// ===========================================================================
+__device__ void umma_up_swiglu_persistent(
+    const CUtensorMap* desc_a, const CUtensorMap* desc_gate_cd, const CUtensorMap* desc_act_cd,
+    const CUtensorMap* desc_wgate, const CUtensorMap* desc_wup,
+    __nv_bfloat16* gate_out, const float* route_w,
+    int M, int I, int d,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter) {
+
+    // Pass 1: gate = A @ Wg^T -> gate_buf (BF16), persistent over all tiles.
+    dg_gemm_persistent<false, kDgRunMulticast>(
+        desc_a, desc_wgate, desc_gate_cd,
+        (uint32_t)M, (uint32_t)I, (uint32_t)d,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        nullptr, nullptr, 0);
+
+    // Pass 2: act = silu(gate)*(A @ Wu^T)*route -> act_buf, SwiGLU reads gate_buf.
+    dg_gemm_persistent<true, kDgRunMulticast>(
+        desc_a, desc_wup, desc_act_cd,
+        (uint32_t)M, (uint32_t)I, (uint32_t)d,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        reinterpret_cast<const cutlass::bfloat16_t*>(gate_out), route_w, (uint32_t)I);
 }
 
 

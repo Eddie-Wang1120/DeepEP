@@ -1673,29 +1673,27 @@ __device__ void compute_worker(
 #endif
         if (kUseUmmaGateUp && state->compute_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
-            const int m_tiles = (batch_size + umma::kDgBlockM - 1) / umma::kDgBlockM;
-            const int n_tiles = intermediate / umma::kDgBlockN;
-            const int total_tiles = m_tiles * n_tiles;
             // step-2: single cluster (#0) does all tiles; step-3/default: 16 clusters share.
             const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
-            const int tile_start   = kUmmaSingleCluster ? 0 : cluster_in_group;
             const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
             if (cluster_active) {
-                for (int tile = tile_start; tile < total_tiles; tile += num_clusters) {
-                    umma::umma_up_swiglu_tile(
-                        &in_atom.a, &in_atom.gate_cd, &in_atom.act_cd,
-                        &state->compute_tma->wgate[expert_id],
-                        &state->compute_tma->wup[expert_id],
-                        tile, gate_buf, s_route_w,
-                        batch_size, intermediate, hidden, cluster_smem, umma_tmem_allocated, umma_accum_iter
-#ifdef MK_PERF_TRACE
-                        , (perf_leader ? &s_perf_up : nullptr)
-#endif
-                        );
-                }
+                // Route-2 persistent: init barriers+TMEM once, run gate+up persistent
+                // (tile loop INSIDE the three warp roles, zero cluster sync between
+                // tiles), then dealloc once. accum_iter threads through gate->up.
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma::umma_up_swiglu_persistent(
+                    &in_atom.a, &in_atom.gate_cd, &in_atom.act_cd,
+                    &state->compute_tma->wgate[expert_id],
+                    &state->compute_tma->wup[expert_id],
+                    gate_buf, s_route_w,
+                    batch_size, intermediate, hidden,
+                    cluster_in_group, num_clusters,
+                    cluster_smem, umma_accum_iter);
+                umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = false;   // freed each task (4a)
             }
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
@@ -1714,13 +1712,13 @@ __device__ void compute_worker(
         if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
 #endif
 
-        // GEMM 3: down-proj D = act @ W_down^T, DeepGEMM 2-CTA path (same
-        // dg_gemm_tile as gate/up so TMEM allocator + umma_tmem_allocated stay
-        // consistent — no second allocator / handle location).
-        // Step-2 (MK_UMMA_SINGLE_CLUSTER) isolates gate/up only: down-proj uses
-        // WMMA fallback so the single-cluster gate/up result (in up_buf) is the
-        // only UMMA-produced tensor under test.
-        if (kUseUmmaGateUp && !kUmmaSingleCluster &&
+        // GEMM 3: down-proj D = act @ W_down^T.
+        // NOTE: gate/up are now task-level PERSISTENT (init/alloc TMEM once, free
+        // once per task). The old per-tile UMMA down path (umma_down_proj_tile_dg
+        // via dg_gemm_tile + umma_tmem_allocated) is incompatible with that
+        // lifecycle, so down-proj uses the WMMA fallback for now (down persistent
+        // is a later step). Forced off by `false &&`.
+        if (false && kUseUmmaGateUp && !kUmmaSingleCluster &&
             state->compute_down_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / 2;
             const int m_tiles = (batch_size + umma::kDgBlockM - 1) / umma::kDgBlockM;
