@@ -1619,6 +1619,14 @@ __device__ void compute_worker(
                    state->rank, sm_id, expert_id, i, s_recv_token_idx[i], s_topk_slot[i]);
 #endif
         }
+        // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
+        // can run at fixed M=256 for tail batches: padded input_buf rows are 0, and
+        // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
+        // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
+        // so padding rows never leave the kernel.
+        for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
+            s_route_w[i] = 0.0f;
+        }
         __syncthreads();
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
@@ -1672,7 +1680,12 @@ __device__ void compute_worker(
 #else
         constexpr bool kUmmaSingleCluster = false;
 #endif
-        if (kUseUmmaGateUp && state->compute_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
+        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
+        // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
+        // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
+        // reduce/signal all mask by batch_size, so padding never leaves the kernel.
+        // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
+        if (kUseUmmaGateUp && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
             // step-2: single cluster (#0) does all tiles; step-3/default: 16 clusters share.
             const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
@@ -1686,12 +1699,14 @@ __device__ void compute_worker(
                 // Replaces the old two-pass gate+up (saves one full GEMM mainloop,
                 // the second A load, and the inter-pass fence+cluster-sync). The
                 // SwiGLU fold is done below by the whole group after cluster work.
+                // M is fixed at COMPUTE_BATCH_SIZE (padded) so tail batches share the
+                // exact descriptors/tile schedule as full batches.
                 umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
                 umma::umma_gateup_concat_persistent(
                     &in_atom.a,
                     &state->compute_tma->wgateup[expert_id],
                     &in_atom.gu_cd,
-                    batch_size, intermediate, hidden,
+                    COMPUTE_BATCH_SIZE, intermediate, hidden,
                     cluster_in_group, num_clusters,
                     cluster_smem, umma_accum_iter);
                 umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
@@ -1706,13 +1721,52 @@ __device__ void compute_worker(
             // (cols [0,I)=gate, [I,2I)=up). Result written to up_buf (act), a
             // SEPARATE workspace region from GU (no read-after-write aliasing).
             // The down GEMM then reads act from up_buf.
-            for (int idx = group_thread_id; idx < batch_size * intermediate; idx += group_num_threads) {
-                int row = idx / intermediate;
-                int col = idx - row * intermediate;
-                float g = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + col]);
-                float u = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + intermediate + col]);
-                float silu = g * (1.0f / (1.0f + __expf(-g)));
-                up_buf[(int64_t)row * intermediate + col] = __float2bfloat16(silu * u * s_route_w[row]);
+            //
+            // Vectorized by 8 bf16 (int4) per thread: gate and up halves are each
+            // contiguous along col (relative to the row base), so an 8-wide chunk
+            // of gate cols and the matching 8-wide chunk of up cols are each a
+            // single int4 load. intermediate is a multiple of 8 (=4096), so the
+            // whole row is covered without a scalar remainder.
+            if ((intermediate & 7) == 0) {
+                const int vec_per_row = intermediate >> 3;         // int4 chunks per row
+                const int total_vec   = batch_size * vec_per_row;
+                for (int v = group_thread_id; v < total_vec; v += group_num_threads) {
+                    int row = v / vec_per_row;
+                    int cv  = v - row * vec_per_row;               // which 8-col chunk
+                    int col = cv << 3;
+                    const int64_t gu_row = (int64_t)row * (2 * intermediate);
+                    const __nv_bfloat162* gp = reinterpret_cast<const __nv_bfloat162*>(&gu_buf[gu_row + col]);
+                    const __nv_bfloat162* up = reinterpret_cast<const __nv_bfloat162*>(&gu_buf[gu_row + intermediate + col]);
+                    __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&up_buf[(int64_t)row * intermediate + col]);
+                    const float rw = s_route_w[row];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {                   // 4 bf16x2 = 8 elems
+                        float2 g2 = __bfloat1622float2(gp[j]);
+                        float2 u2 = __bfloat1622float2(up[j]);
+                        float a0 = (g2.x * (1.0f / (1.0f + __expf(-g2.x)))) * u2.x * rw;
+                        float a1 = (g2.y * (1.0f / (1.0f + __expf(-g2.y)))) * u2.y * rw;
+                        op[j] = __float22bfloat162_rn(make_float2(a0, a1));
+                    }
+                }
+            } else {
+                for (int idx = group_thread_id; idx < batch_size * intermediate; idx += group_num_threads) {
+                    int row = idx / intermediate;
+                    int col = idx - row * intermediate;
+                    float g = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + col]);
+                    float u = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + intermediate + col]);
+                    float silu = g * (1.0f / (1.0f + __expf(-g)));
+                    up_buf[(int64_t)row * intermediate + col] = __float2bfloat16(silu * u * s_route_w[row]);
+                }
+            }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            // Zero act padding rows [batch_size, COMPUTE_BATCH_SIZE) so the fixed-M
+            // down GEMM reads defined data. down output row m depends only on act
+            // row m (no M-mixing), so padding rows would only affect padding output
+            // rows (masked off anyway) — but clear them to avoid reading stale
+            // workspace from a previous task.
+            for (int idx = group_thread_id + batch_size * intermediate;
+                 idx < COMPUTE_BATCH_SIZE * intermediate; idx += group_num_threads) {
+                up_buf[idx] = __float2bfloat16(0.0f);
             }
             compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
         } else {
@@ -1733,8 +1787,11 @@ __device__ void compute_worker(
         // once, run the persistent down GEMM (tile loop inside the three warp
         // roles, zero cluster sync between tiles), dealloc once. A fresh accum
         // counter is used because gate/up already freed TMEM at their dealloc.
+        // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
+        // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
+        // are 0 and are masked off by the batch_size-bounded output/reduce below.
         if (kUseUmmaGateUp &&
-            state->compute_down_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
+            state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
             const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
             const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
@@ -1748,7 +1805,7 @@ __device__ void compute_worker(
                     &in_atom.act_a,
                     &state->compute_down_tma->wdown[expert_id],
                     &in_atom.down_cd,
-                    batch_size, hidden, intermediate,
+                    COMPUTE_BATCH_SIZE, hidden, intermediate,
                     cluster_in_group, num_clusters,
                     cluster_smem, down_accum_iter);
                 umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);

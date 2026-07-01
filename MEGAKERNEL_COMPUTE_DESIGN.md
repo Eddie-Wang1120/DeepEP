@@ -455,6 +455,30 @@ consumer group 内更高效 barrier；
 减少 scratch buffer 和全局内存往返。
 ```
 
+### 未来优化：gate/up interleaved layout + epilogue 内融合 SwiGLU
+
+当前 gate/up 已合成单趟 concat GEMM（Wgu=[Wg;Wu] 形状 [2I,d]，N=2I），
+输出 GU=[M,2I] 到 GMEM，再由一个独立 elementwise kernel 做 SwiGLU
+（`act=silu(GU[:, :I])*GU[:, I:]*route`）。这是 **concat layout**：gate[i] 与
+up[i] 在输出里相隔 I 列，落在不同的 epilogue N-tile，所以 SwiGLU **无法**在
+gateup GEMM 的 epilogue 里融合，只能事后独立跑，多一次 [M,2I] GMEM 往返。
+
+SonicMOE 的做法是 **interleaved layout**（`sonicmoe/functional/__init__.py:414`，
+`concat_layout=False` 默认）：权重排成 `[g0,u0,g1,u1,...]`，使 gate[i]/up[i]
+在输出里相邻、落在同一 epilogue tile，于是它的 `gemm_gated` 能在 GEMM epilogue
+里直接算 SwiGLU、零额外 GMEM 往返（`preact_out` 仅训练时落，用于 backward）。
+
+**未来若要吃到「SwiGLU 在 GEMM 内融合、零额外往返」的收益，对齐路线是切到
+interleaved layout**（而非把 SwiGLU fuse 进 down 的 swizzled SMEM——后者要处理
+2-CTA swizzle 布局，最易出错）。改动量约三块：
+1. host 侧权重重排：`[Wg;Wu]` -> 逐行交错 `[g0,u0,g1,u1,...]`；
+2. gateup GEMM 输出 layout 相应交错；
+3. epilogue（`sm100_store_swiglu`）按奇偶列取配对的 gate/up 做 in-TMEM SwiGLU，
+   直接输出 act[M,I]，省掉 GU 的 GMEM 写 + 独立 SwiGLU pass 的读。
+
+优先级：中。先量化独立 SwiGLU pass 在 perf 中的占比再决定；若占比小则不值得
+引入 interleaved 的权重重排与 epilogue 复杂度。
+
 ## 结论
 
 当前采用 1 个 scheduler SM、3 个动态 compute consumer group、每组 32 SM、每个 batch 128 token、按 dispatch round flush tail、per-token-ready 放行 combine 的方案。

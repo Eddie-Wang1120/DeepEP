@@ -22,6 +22,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+try:
+    import transformer_engine.pytorch as te
+    import transformer_engine.pytorch.ops as te_ops
+    from transformer_engine.pytorch import moe_permute_with_probs, moe_unpermute
+except ImportError:
+    te = None
+    te_ops = None
+    moe_permute_with_probs = None
+    moe_unpermute = None
+
 sys.path.insert(0, os.path.dirname(__file__))
 import deep_ep
 from utils import init_dist, calc_diff, create_grouped_scores
@@ -109,10 +119,89 @@ def moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights, W_gate, W_up, 
     return expert_out
 
 
+def _tokens_per_expert_tensor(tokens_per_expert, device):
+    if isinstance(tokens_per_expert, torch.Tensor):
+        return tokens_per_expert.to(device=device, dtype=torch.int32)
+    return torch.tensor(tokens_per_expert, device=device, dtype=torch.int32)
+
+
+def _get_te_workspace(workspace, key, shape, dtype, device):
+    tensor = workspace.get(key)
+    if tensor is None or tensor.shape != shape or tensor.dtype != dtype or tensor.device != device:
+        tensor = torch.empty(shape, dtype=dtype, device=device)
+        workspace[key] = tensor
+    return tensor
+
+
+def indices_to_routing_map(indices, probs, num_local_experts, workspace):
+    batch_size, topk = indices.shape
+    routing_map = _get_te_workspace(
+        workspace, 'routing_map', (batch_size, num_local_experts), torch.bool, indices.device)
+    probs_map = _get_te_workspace(
+        workspace, 'probs_map', (batch_size, num_local_experts), torch.float32, indices.device)
+    routing_map.zero_()
+    probs_map.zero_()
+
+    flat_indices = indices.reshape(-1)
+    valid_mask = flat_indices != -1
+    if valid_mask.any():
+        flat_token_ids = torch.arange(batch_size, device=indices.device).repeat_interleave(topk)
+        routing_map[flat_token_ids[valid_mask], flat_indices[valid_mask].long()] = True
+        probs_map[flat_token_ids[valid_mask], flat_indices[valid_mask].long()] = probs.float().reshape(-1)[valid_mask]
+    return routing_map, probs_map
+
+
+def build_te_grouped_experts(W_gate, W_up, W_down, experts_per_rank):
+    if te_ops is None:
+        raise RuntimeError('Transformer Engine ops are required for --baseline-impl te')
+    hidden = W_gate.shape[-1]
+    intermediate = W_gate.shape[1]
+    fc1 = te_ops.GroupedLinear(
+        experts_per_rank, hidden, intermediate * 2,
+        bias=False, device=W_gate.device, dtype=W_gate.dtype,
+        single_grouped_weight=True, single_grouped_bias=False,
+        accumulate_into_main_grad=False, delay_wgrad_compute=False,
+    )
+    scaled_act = te_ops.ScaledSwiGLU(glu_interleave_size=32)
+    fc2 = te_ops.GroupedLinear(
+        experts_per_rank, intermediate, hidden,
+        bias=False, device=W_down.device, dtype=W_down.dtype,
+        single_grouped_weight=True, single_grouped_bias=False,
+        accumulate_into_main_grad=False, delay_wgrad_compute=False,
+    )
+    fc1_chunks = []
+    for start in range(0, intermediate, 32):
+        fc1_chunks.append(W_gate[:, start:start + 32, :])
+        fc1_chunks.append(W_up[:, start:start + 32, :])
+    fc1_weight = torch.cat(fc1_chunks, dim=1).contiguous()
+    with torch.no_grad():
+        fc1.weight.copy_(fc1_weight)
+        fc2.weight.copy_(W_down.contiguous())
+    return te_ops.Sequential(fc1, scaled_act, fc2)
+
+
+def moe_compute_on_recv_te(recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list,
+                           te_experts, workspace, experts_per_rank):
+    """TE baseline aligned with sonic_te_compare_20260526: fused permute -> te_ops.Sequential -> fused unpermute."""
+    if moe_permute_with_probs is None or moe_unpermute is None:
+        raise RuntimeError('TE moe_permute_with_probs/moe_unpermute are required for --baseline-impl te')
+    routing_map, probs_map = indices_to_routing_map(
+        recv_topk_idx, recv_topk_weights, experts_per_rank, workspace)
+    num_out_tokens = int(_tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device).sum().item())
+    tokens_per_expert = _tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device)
+    permuted_x, permuted_probs, row_map = moe_permute_with_probs(
+        recv_x, probs_map, routing_map, num_out_tokens)
+    permuted_output = te_experts(permuted_x, tokens_per_expert, permuted_probs, tokens_per_expert)
+    return moe_unpermute(permuted_output, row_map, restore_shape=recv_x.shape)
+
+
 def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
-                          num_experts, experts_per_rank, buffer, config, local_rank, rank, no_compute):
+                          num_experts, experts_per_rank, buffer, config, local_rank, rank, no_compute,
+                          baseline_impl, te_experts=None, te_workspace=None):
     """
-    Baseline: DeepEP dispatch -> PyTorch expert compute -> DeepEP combine.
+    Baseline: DeepEP dispatch -> expert compute -> DeepEP combine.
+    baseline_impl='torch' keeps the original direct local-expert loop.
+    baseline_impl='te' mirrors Megatron's production TEGroupedMLP local permute + grouped GEMM path.
     Returns combined output [num_tokens, hidden] in bf16.
     """
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
@@ -137,6 +226,14 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
     if no_compute:
         combine_x = recv_x
+    elif baseline_impl == 'te':
+        if te_experts is None:
+            raise RuntimeError('te_experts must be prebuilt for --baseline-impl te')
+        if te_workspace is None:
+            te_workspace = {}
+        combine_x = moe_compute_on_recv_te(
+            recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list,
+            te_experts, te_workspace, experts_per_rank)
     else:
         combine_x = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
                                         W_gate, W_up, W_down, experts_per_rank)
@@ -251,11 +348,17 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     W_up = torch.randn(experts_per_rank, intermediate, hidden, dtype=torch.bfloat16, device='cuda') * 0.02
     W_down = torch.randn(experts_per_rank, hidden, intermediate, dtype=torch.bfloat16, device='cuda') * 0.02
 
+    te_experts = None
+    te_workspace = None
+    if args.baseline_impl == 'te' and not args.skip_baseline and not args.no_compute:
+        te_experts = build_te_grouped_experts(W_gate, W_up, W_down, experts_per_rank)
+        te_workspace = {}
+
     # Config for dispatch/combine (baseline path)
     config_num_sms = 24
     config = deep_ep.Config(config_num_sms, 1, 256, 16, 256)
 
-    # --- Path A: Baseline (DeepEP dispatch + PyTorch compute + DeepEP combine) ---
+    # --- Path A: Baseline (DeepEP dispatch + expert compute + DeepEP combine) ---
     baseline_output = None
     if not args.skip_baseline:
         if local_rank == 0:
@@ -266,14 +369,16 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
                 print(f'[Rank {rank}] Baseline warmup {w + 1}/{args.warmup}', flush=True)
             run_baseline_pipeline(
                 x, topk_idx, topk_weights, W_gate, W_up, W_down,
-                num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute)
+                num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute,
+                args.baseline_impl, te_experts, te_workspace)
         if args.warmup > 0:
             dist.barrier(group=group)
             torch.cuda.synchronize()
 
         baseline_output = run_baseline_pipeline(
             x, topk_idx, topk_weights, W_gate, W_up, W_down,
-            num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute)
+            num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute,
+            args.baseline_impl, te_experts, te_workspace)
     elif local_rank == 0:
         print(f'[Rank {rank}] Skipping baseline; only checking megakernel_forward completion', flush=True)
 
@@ -386,14 +491,20 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test MK-v7 persistent megakernel vs baseline')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--skip-baseline', action='store_true')
-    parser.add_argument('--no-compute', action='store_true', help='Skip PyTorch expert compute in the baseline path')
-    parser.add_argument('--warmup', type=int, default=0,
+    parser.add_argument('--no-compute', action='store_true', help='Skip expert compute in the baseline path')
+    parser.add_argument('--baseline-impl', choices=['torch', 'te'], default='te',
+                        help='Expert compute implementation for the baseline path')
+    parser.add_argument('--warmup', type=int, default=20,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 
     if os.environ.get('SKIP_BASELINE', '0') == '1':
         args.skip_baseline = True
+    if os.environ.get('BASELINE_IMPL') in ('torch', 'te'):
+        args.baseline_impl = os.environ['BASELINE_IMPL']
+    if args.baseline_impl == 'te' and te is None:
+        raise RuntimeError('--baseline-impl te requires transformer_engine to be installed')
 
     if args.mpirun:
         # mpirun direct mode: each process is one rank, one GPU
