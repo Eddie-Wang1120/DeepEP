@@ -175,6 +175,7 @@ struct MegaKernelState {
     int* compute_enqueue_done;          // set by scheduler after tail tasks are published
     int* expert_enqueue_cursor;         // [num_local_experts] how many slots have been enqueued
     int* compute_group_task_idx;        // [num_compute_groups] broadcast popped task idx to group SMs
+    int* compute_group_is_last;         // [num_compute_groups * COMPUTE_BATCH_SIZE] per-row last-flag broadcast for parallel finalize
 
     // --- Compute state ---
     int* compute_done_count;          // Atomic: how many experts have finished compute
@@ -1777,6 +1778,11 @@ __device__ void compute_worker(
 #endif
 
         // Per-token completion signal. One SM per group owns counters/ready publication.
+        // s_is_last[row] is the AUTHORITATIVE "this task is the last local expert for
+        // the token" flag, decided by the atomicAdd return value (unique across all
+        // tasks/groups). It is computed only on group_sm_idx==0 and lives in that SM's
+        // shared memory. To let the whole group finalize in parallel below, broadcast
+        // it to a group-shared GMEM scratch after the sync.
         if (group_sm_idx == 0 && thread_id < batch_size) {
             int recv_token_idx = s_recv_token_idx[thread_id];
             if (s_expected[thread_id] == 1) {
@@ -1785,6 +1791,9 @@ __device__ void compute_worker(
                 int done_cnt = atomicAdd(&state->token_compute_done[recv_token_idx], 1) + 1;
                 s_is_last[thread_id] = (done_cnt == s_expected[thread_id]);
             }
+            // Broadcast last-flag to group-shared GMEM so all group SMs can read it.
+            state->compute_group_is_last[group_id * COMPUTE_BATCH_SIZE + thread_id] =
+                s_is_last[thread_id];
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
@@ -1798,15 +1807,22 @@ __device__ void compute_worker(
         }
 #endif
 
-        if (group_sm_idx == 0) {
-            for (int idx = thread_id; idx < batch_size * hidden; idx += blockDim.x) {
-                int row = idx / hidden;
-                int h = idx - row * hidden;
-                if (s_is_last[row] && s_expected[row] > 1) {
-                    int recv_token_idx = s_recv_token_idx[row];
-                    state->compute_output[(int64_t)recv_token_idx * hidden + h] =
-                        __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
-                }
+        // FP32->BF16 finalize for multi-local-expert tokens. Parallelized across
+        // ALL group SMs (group_thread_id/group_num_threads). Previously only
+        // group_sm_idx==0 ran this while the other 15 SMs idled at the barrier,
+        // making it the p6b bottleneck. The last-flag is read from the group-shared
+        // GMEM scratch broadcast by group_sm_idx==0 above (s_is_last itself is only
+        // valid in SM0's shared memory). last is still authoritatively decided by the
+        // atomicAdd on SM0, so exactly one task finalizes each token — no double write
+        // and no non-atomic race across tasks/groups.
+        const int* group_is_last = &state->compute_group_is_last[group_id * COMPUTE_BATCH_SIZE];
+        for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
+            int row = idx / hidden;
+            int h = idx - row * hidden;
+            if (s_expected[row] > 1 && group_is_last[row]) {
+                int recv_token_idx = s_recv_token_idx[row];
+                state->compute_output[(int64_t)recv_token_idx * hidden + h] =
+                    __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
             }
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
@@ -3570,6 +3586,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(expert_enqueue_cursor, 0, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&compute_group_task_idx, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_task_idx, 0xff, num_compute_groups * sizeof(int)));
+    int* compute_group_is_last;
+    CUDA_CHECK(cudaMalloc(&compute_group_is_last, (size_t)num_compute_groups * COMPUTE_BATCH_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_group_is_last, 0, (size_t)num_compute_groups * COMPUTE_BATCH_SIZE * sizeof(int)));
 
     // Combine per-expert completion signals
     int* expert_compute_done;
@@ -3774,6 +3793,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.compute_enqueue_done = compute_enqueue_done;
     host_state.expert_enqueue_cursor = expert_enqueue_cursor;
     host_state.compute_group_task_idx = compute_group_task_idx;
+    host_state.compute_group_is_last = compute_group_is_last;
 
     // Expert weights
     host_state.W_gate = W_gate;
@@ -3989,6 +4009,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.compute_enqueue_done));
     CUDA_CHECK(cudaFree(host_state.expert_enqueue_cursor));
     CUDA_CHECK(cudaFree(host_state.compute_group_task_idx));
+    CUDA_CHECK(cudaFree(host_state.compute_group_is_last));
     CUDA_CHECK(cudaFree(host_state.combined_x));
     CUDA_CHECK(cudaFree(host_state.combined_topk_weights));
     CUDA_CHECK(cudaFree(host_state.compute_output));
