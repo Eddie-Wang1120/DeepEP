@@ -190,7 +190,8 @@ struct MegaKernelState {
     // Per-expert 2D multicast TMA atoms for W_gate/W_up, and per-group A(input_buf)
     // TMA atoms. Built on host (setup_compute_tma_v7), copied to device. nullptr
     // when UMMA compute is disabled (falls back to WMMA path).
-    umma::ComputeTmaAtoms* compute_tma;      // device ptr; wgate[e]/wup[e]
+    umma::ComputeTmaAtoms* compute_tma;      // device ptr; wgate[e]/wup[e]/wgateup[e]
+    __nv_bfloat16* compute_w_gateup;         // device concat weight [E,2I,d] (freed at teardown)
     umma::ComputeDownTmaAtoms* compute_down_tma;  // device ptr; wdown[e]
     umma::InputTmaAtom_t* group_input_tma;   // device array [num_compute_groups]
     int num_compute_groups;                  // for indexing group_input_tma / barriers
@@ -1524,15 +1525,14 @@ __device__ void compute_worker(
     // zero-filled so WMMA M tiles never read past valid token rows.
     const int padded_m = COMPUTE_BATCH_SIZE;
     const int input_stride = padded_m * hidden;
-    const int gate_stride = padded_m * intermediate;
-    const int up_stride = padded_m * intermediate;
+    const int gu_stride   = padded_m * (2 * intermediate);   // concat GU [M,2I]
+    const int act_stride  = padded_m * intermediate;         // SwiGLU fold result (down A)
     const int down_stride = padded_m * hidden;
-    const int gemm_stride = input_stride + gate_stride + up_stride + down_stride;
+    const int gemm_stride = input_stride + gu_stride + act_stride + down_stride;
     __nv_bfloat16* input_buf = state->gemm_workspace + group_id * gemm_stride;
-    __nv_bfloat16* gate_buf = input_buf + input_stride;   // unused after gate+up SwiGLU fusion (kept for workspace layout)
-    __nv_bfloat16* up_buf   = gate_buf + gate_stride;     // holds fused activation = silu(gate)*up*route_w
-    __nv_bfloat16* down_buf = up_buf + up_stride;
-    (void)gate_buf;
+    __nv_bfloat16* gu_buf   = input_buf + input_stride;   // concat GU [M,2I]: cols [0,I)=gate, [I,2I)=up
+    __nv_bfloat16* up_buf   = gu_buf + gu_stride;         // act = silu(gate)*up*route_w (down-proj A operand)
+    __nv_bfloat16* down_buf = up_buf + act_stride;
 
     __shared__ int s_recv_token_idx[COMPUTE_BATCH_SIZE];
     __shared__ int s_topk_slot[COMPUTE_BATCH_SIZE];
@@ -1681,15 +1681,16 @@ __device__ void compute_worker(
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
             if (cluster_active) {
-                // Route-2 persistent: init barriers+TMEM once, run gate+up persistent
-                // (tile loop INSIDE the three warp roles, zero cluster sync between
-                // tiles), then dealloc once. accum_iter threads through gate->up.
+                // Concat gate/up fusion: ONE persistent GEMM GU = A @ Wgu^T -> [M,2I]
+                // (gate_buf..up_buf region), then a separate SwiGLU elementwise pass.
+                // Replaces the old two-pass gate+up (saves one full GEMM mainloop,
+                // the second A load, and the inter-pass fence+cluster-sync). The
+                // SwiGLU fold is done below by the whole group after cluster work.
                 umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
-                umma::umma_up_swiglu_persistent(
-                    &in_atom.a, &in_atom.gate_cd, &in_atom.act_cd,
-                    &state->compute_tma->wgate[expert_id],
-                    &state->compute_tma->wup[expert_id],
-                    gate_buf, s_route_w,
+                umma::umma_gateup_concat_persistent(
+                    &in_atom.a,
+                    &state->compute_tma->wgateup[expert_id],
+                    &in_atom.gu_cd,
                     batch_size, intermediate, hidden,
                     cluster_in_group, num_clusters,
                     cluster_smem, umma_accum_iter);
@@ -1699,6 +1700,20 @@ __device__ void compute_worker(
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            // SwiGLU elementwise fold over the whole group: act[m,i] =
+            // silu(GU[m,i]) * GU[m,I+i] * route[m]. GU = [M,2I] in gu_buf
+            // (cols [0,I)=gate, [I,2I)=up). Result written to up_buf (act), a
+            // SEPARATE workspace region from GU (no read-after-write aliasing).
+            // The down GEMM then reads act from up_buf.
+            for (int idx = group_thread_id; idx < batch_size * intermediate; idx += group_num_threads) {
+                int row = idx / intermediate;
+                int col = idx - row * intermediate;
+                float g = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + col]);
+                float u = __bfloat162float(gu_buf[(int64_t)row * (2 * intermediate) + intermediate + col]);
+                float silu = g * (1.0f / (1.0f + __expf(-g)));
+                up_buf[(int64_t)row * intermediate + col] = __float2bfloat16(silu * u * s_route_w[row]);
+            }
             compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
         } else {
             device_gemm_swiglu_fused(input_buf, w_gate, w_up, up_buf, s_route_w,
@@ -1771,7 +1786,11 @@ __device__ void compute_worker(
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-        __threadfence_system();  // ensure output/reduce writes are visible before done counters
+        // device-scope fence: combine_worker reads compute_output via LOCAL TMA on the
+        // same GPU (different SM, same kernel launch), so device-scope visibility is
+        // sufficient. System scope would flush to the multi-GPU coherence domain, which
+        // nothing here consumes — pure overhead (was the p5b/p6c bottleneck).
+        __threadfence();  // ensure output/reduce writes are visible before done counters
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
@@ -1829,7 +1848,9 @@ __device__ void compute_worker(
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_sig_finalize_ns = globaltimer_ns();
 #endif
-        __threadfence_system();
+        // device-scope fence: same rationale as above — combine reads finalized
+        // compute_output locally on this GPU before combine_token_ready gates it.
+        __threadfence();
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_sig_fence_ns = globaltimer_ns();
@@ -3621,7 +3642,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(compute_output_f, 0, (size_t)max_total_recv_tokens * hidden_dim * sizeof(float)));
 
     // GEMM workspace: per-compute-group batched intermediates for M=128 compute batches.
-    size_t per_group_elems = (size_t)COMPUTE_BATCH_SIZE * (2 * hidden_dim + 2 * intermediate_dim);
+    // Layout: [input(M*hidden)][GU(M*2I): gate_buf+up_buf][act(M*I)][down(M*hidden)]
+    // GU holds the concat gate/up GEMM output [M,2I]; act holds the SwiGLU fold
+    // result (down-proj A operand); down holds the down-proj output.
+    size_t per_group_elems = (size_t)COMPUTE_BATCH_SIZE * (2 * hidden_dim + 3 * intermediate_dim);
     size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
 
@@ -3630,25 +3654,40 @@ MegaKernelState* allocate_megakernel_state_v7(
     umma::ComputeTmaAtoms* d_compute_tma = nullptr;
     umma::InputTmaAtom_t* d_group_input_tma = nullptr;
     umma::ComputeDownTmaAtoms* d_compute_down_tma = nullptr;
+    __nv_bfloat16* d_w_gateup = nullptr;
     if (W_gate != nullptr && W_up != nullptr && hidden_dim == intermediate_dim &&
         num_local_experts <= umma::kMaxLocalExperts) {
-        // Per-expert weight atoms.
+        // Per-expert weight atoms. Build a concat weight W_gateup [E, 2I, d] =
+        // [Wg;Wu] per expert on device, for the single-GEMM gate/up fusion.
+        CUDA_CHECK(cudaMalloc(&d_w_gateup,
+            (size_t)num_local_experts * 2 * intermediate_dim * hidden_dim * sizeof(__nv_bfloat16)));
+        for (int e = 0; e < num_local_experts; ++e) {
+            const __nv_bfloat16* wg_e = W_gate + (size_t)e * intermediate_dim * hidden_dim;
+            const __nv_bfloat16* wu_e = W_up   + (size_t)e * intermediate_dim * hidden_dim;
+            __nv_bfloat16* dst = d_w_gateup + (size_t)e * 2 * intermediate_dim * hidden_dim;
+            // rows [0,I) = Wg, rows [I,2I) = Wu (both [I,d] K-major, contiguous).
+            CUDA_CHECK(cudaMemcpy(dst, wg_e,
+                (size_t)intermediate_dim * hidden_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dst + (size_t)intermediate_dim * hidden_dim, wu_e,
+                (size_t)intermediate_dim * hidden_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+        }
         umma::ComputeTmaAtoms h_atoms;
-        umma::build_compute_tma_atoms(h_atoms, W_gate, W_up, num_local_experts,
+        umma::build_compute_tma_atoms(h_atoms, W_gate, W_up, d_w_gateup, num_local_experts,
                                       intermediate_dim, hidden_dim);
         CUDA_CHECK(cudaMalloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_tma, &h_atoms, sizeof(umma::ComputeTmaAtoms), cudaMemcpyHostToDevice));
 
-        // Per-group A(input_buf) + gate/act/down workspace atoms. Layout per group:
-        //   [input_buf (M*hidden)] [gate_buf (M*I)] [up_buf/act (M*I)] [down_buf (M*hidden)]
+        // Per-group A(input_buf) + GU/act/down workspace atoms. Layout per group:
+        //   [input_buf (M*hidden)] [GU (M*2I): gate..up] [act (M*I)] [down_buf (M*hidden)]
         std::vector<umma::InputTmaAtom_t> h_in;
         h_in.reserve(num_compute_groups);
         for (int g = 0; g < num_compute_groups; ++g) {
             const __nv_bfloat16* in_g = gemm_workspace + (size_t)g * per_group_elems;
-            const __nv_bfloat16* gate_g = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
-            const __nv_bfloat16* act_g  = gate_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
+            const __nv_bfloat16* gu_g   = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+            const __nv_bfloat16* act_g  = gu_g + (size_t)COMPUTE_BATCH_SIZE * (2 * intermediate_dim);
             const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
-            h_in.push_back(umma::make_input_group_atoms(in_g, gate_g, act_g, down_g,
+            // gate_buf_ptr passes GU base (gate half); act_buf_ptr passes act (down A).
+            h_in.push_back(umma::make_input_group_atoms(in_g, gu_g, act_g, down_g,
                                                         COMPUTE_BATCH_SIZE, hidden_dim,
                                                         intermediate_dim, hidden_dim));
         }
@@ -3812,6 +3851,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.output_accum = output_accum;
     // S4.4 (route B2): UMMA compute TMA atoms (nullptr if disabled -> WMMA fallback).
     host_state.compute_tma = d_compute_tma;
+    host_state.compute_w_gateup = d_w_gateup;
     host_state.compute_down_tma = d_compute_down_tma;
     host_state.group_input_tma = d_group_input_tma;
     host_state.num_compute_groups = num_compute_groups;
@@ -4020,6 +4060,8 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.combine_rdma_head_work));
     CUDA_CHECK(cudaFree(host_state.combine_nvl_head_work));
     CUDA_CHECK(cudaFree(host_state.gemm_workspace));
+    if (host_state.compute_w_gateup != nullptr)
+        CUDA_CHECK(cudaFree(host_state.compute_w_gateup));
     CUDA_CHECK(cudaFree(host_state.output_accum));
     CUDA_CHECK(cudaFree(host_state.send_rdma_head));
     CUDA_CHECK(cudaFree(host_state.send_nvl_head));

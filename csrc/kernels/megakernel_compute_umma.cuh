@@ -280,16 +280,20 @@ struct MegaTileScheduler {
 };
 
 // Per-expert raw TMA descriptors for W_gate and W_up ([I,d] = [N,K] K-major).
+// wgateup is the concat-weight descriptor [2I, d] = [Wg;Wu], for the single-GEMM
+// gate/up fusion (GU = A @ Wgu^T -> [M,2I], SwiGLU folded in a separate pass).
 struct ComputeTmaAtoms {
     int num_experts;
     int I;
     int d;
     CUtensorMap wgate[kMaxLocalExperts];
     CUtensorMap wup[kMaxLocalExperts];
+    CUtensorMap wgateup[kMaxLocalExperts];   // [2I, d] K-major concat(Wg,Wu)
 };
 
 inline void build_compute_tma_atoms(ComputeTmaAtoms& atoms,
                                      const __nv_bfloat16* W_gate, const __nv_bfloat16* W_up,
+                                     const __nv_bfloat16* W_gateup,
                                      int E, int I, int d) {
     EP_HOST_ASSERT(E <= kMaxLocalExperts);
     atoms.num_experts = E;
@@ -300,6 +304,10 @@ inline void build_compute_tma_atoms(ComputeTmaAtoms& atoms,
         const __nv_bfloat16* wu_e = W_up   + (size_t)e * I * d;
         atoms.wgate[e] = dg_make_b_desc(wg_e, I, d);
         atoms.wup[e]   = dg_make_b_desc(wu_e, I, d);
+        // Concat weight [2I, d] per expert. W_gateup is laid out per expert as
+        // [Wg (I,d) ; Wu (I,d)] contiguous, so stride between experts is 2*I*d.
+        const __nv_bfloat16* wgu_e = W_gateup + (size_t)e * (2 * I) * d;
+        atoms.wgateup[e] = dg_make_b_desc(wgu_e, 2 * I, d);
     }
 }
 
@@ -311,6 +319,7 @@ struct InputTmaAtom_t {
     CUtensorMap act_cd;   // up_buf    [M, I]   row-major CD
     CUtensorMap act_a;    // up_buf    [M, I]   K-major A (down-proj A operand)
     CUtensorMap down_cd;  // down_buf  [M, hidden] row-major CD (down-proj output)
+    CUtensorMap gu_cd;    // gate_buf  [M, 2I]  row-major CD (concat GU output = gate_buf..up_buf)
 };
 
 inline InputTmaAtom_t make_input_tma_atom(const __nv_bfloat16* input_buf_ptr, int M, int d) {
@@ -336,6 +345,10 @@ inline InputTmaAtom_t make_input_group_atoms(const __nv_bfloat16* input_buf_ptr,
     // down-proj: A = act_buf [M, I] (K=I), CD = down_buf [M, hidden].
     out.act_a   = dg_make_a_desc(act_buf_ptr, M, I);
     out.down_cd = dg_make_cd_desc(down_buf_ptr, M, hidden);
+    // Concat gate/up GEMM output GU = [M, 2I], written to a dedicated GU region
+    // (gate_buf_ptr is the GU base). cols [0,I)=gate, [I,2I)=up. A later SwiGLU
+    // pass folds this into act_buf (a separate region, no aliasing).
+    out.gu_cd   = dg_make_cd_desc(gate_buf_ptr, M, 2 * I);
     return out;
 }
 
@@ -1117,6 +1130,33 @@ __device__ void umma_up_swiglu_persistent(
         (uint32_t)M, (uint32_t)I, (uint32_t)d,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
         reinterpret_cast<const cutlass::bfloat16_t*>(gate_out), route_w, (uint32_t)I);
+}
+
+// ===========================================================================
+// umma_gateup_concat_persistent — SINGLE fused gate/up GEMM via concat weights.
+// GU = A @ Wgu^T -> [M, 2I] (cols [0,I)=gate, [I,2I)=up), written to gate_buf..
+// up_buf (contiguous). No SwiGLU here — a separate elementwise pass folds it.
+//
+// This replaces the two-pass umma_up_swiglu_persistent: one persistent GEMM with
+// N=2I instead of two GEMMs with N=I. Saves a full mainloop pass, the second A
+// TMA load, and the inter-pass fence+cluster-sync. dg_gemm_persistent is used
+// UNCHANGED (kFuseSwiGLU=false); the concat is purely in the descriptor shapes.
+//
+//   desc_a      : input_buf A [M, d] K-major
+//   desc_wgateup: concat weight Wgu [2I, d] K-major (in.wgateup for this expert)
+//   desc_gu_cd  : GU output [M, 2I] row-major CD (in.gu_cd -> gate_buf region)
+// ===========================================================================
+__device__ void umma_gateup_concat_persistent(
+    const CUtensorMap* desc_a, const CUtensorMap* desc_wgateup, const CUtensorMap* desc_gu_cd,
+    int M, int I, int d,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter) {
+
+    dg_gemm_persistent<false, kDgRunMulticast>(
+        desc_a, desc_wgateup, desc_gu_cd,
+        (uint32_t)M, (uint32_t)(2 * I), (uint32_t)d,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        nullptr, nullptr, 0);
 }
 
 
