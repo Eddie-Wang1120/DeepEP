@@ -455,29 +455,78 @@ consumer group 内更高效 barrier；
 减少 scratch buffer 和全局内存往返。
 ```
 
-### 未来优化：gate/up interleaved layout + epilogue 内融合 SwiGLU
+### 未来优化：64-block interleaved layout + gateup epilogue 内融合 SwiGLU
 
 当前 gate/up 已合成单趟 concat GEMM（Wgu=[Wg;Wu] 形状 [2I,d]，N=2I），
-输出 GU=[M,2I] 到 GMEM，再由一个独立 elementwise kernel 做 SwiGLU
+输出 GU=[M,2I] 到 GMEM，再由一个独立 elementwise pass 做 SwiGLU
 （`act=silu(GU[:, :I])*GU[:, I:]*route`）。这是 **concat layout**：gate[i] 与
-up[i] 在输出里相隔 I 列，落在不同的 epilogue N-tile，所以 SwiGLU **无法**在
-gateup GEMM 的 epilogue 里融合，只能事后独立跑，多一次 [M,2I] GMEM 往返。
+up[i] 在输出里相隔 I 列，通常落在不同 epilogue N-tile，所以 SwiGLU 不能直接
+在当前 gateup GEMM epilogue 里做，只能事后独立跑，多一次 GU 的 GMEM 往返。
 
-SonicMOE 的做法是 **interleaved layout**（`sonicmoe/functional/__init__.py:414`，
-`concat_layout=False` 默认）：权重排成 `[g0,u0,g1,u1,...]`，使 gate[i]/up[i]
-在输出里相邻、落在同一 epilogue tile，于是它的 `gemm_gated` 能在 GEMM epilogue
-里直接算 SwiGLU、零额外 GMEM 往返（`preact_out` 仅训练时落，用于 backward）。
+SonicMOE 的路线是 **interleaved layout**（`concat_layout=False` 默认）：把 gate/up
+配对放近，使 `gemm_gated` 可以在 GEMM epilogue 里直接算 SwiGLU。对 megakernel
+这边，推荐的后续版本不是 32-block，而是 **64-block interleave**：
 
-**未来若要吃到「SwiGLU 在 GEMM 内融合、零额外往返」的收益，对齐路线是切到
-interleaved layout**（而非把 SwiGLU fuse 进 down 的 swizzled SMEM——后者要处理
-2-CTA swizzle 布局，最易出错）。改动量约三块：
-1. host 侧权重重排：`[Wg;Wu]` -> 逐行交错 `[g0,u0,g1,u1,...]`；
-2. gateup GEMM 输出 layout 相应交错；
-3. epilogue（`sm100_store_swiglu`）按奇偶列取配对的 gate/up 做 in-TMEM SwiGLU，
-   直接输出 act[M,I]，省掉 GU 的 GMEM 写 + 独立 SwiGLU pass 的读。
+```text
+[g[0:64], u[0:64], g[64:128], u[64:128], ...]
+```
 
-优先级：中。先量化独立 SwiGLU pass 在 perf 中的占比再决定；若占比小则不值得
-引入 interleaved 的权重重排与 epilogue 复杂度。
+原因是当前 DeepGEMM CD swizzle 使用 128B 模式，`STORE_BLOCK_N = 128B / sizeof(bf16) = 64`，
+这是 epilogue store 的硬约束。64-block interleave 刚好让一个 gate block 和配对 up
+block 都是 64 列，和 `STORE_BLOCK_N=64` 对齐，不需要改 DeepGEMM mainloop，不需要在
+swizzled SMEM 里制造 32 列空洞，也避免 32-block layout 与 store 粒度冲突。
+
+后续实现应保持 DeepGEMM GEMM 结构不动，只改我们自己的 SwiGLU epilogue helper：
+
+1. host 侧权重重排为 64-block interleave：`[g64,u64,g64,u64,...]`；
+2. gateup GEMM 仍按 N=2I 计算，输出 tile 内 gate/up 以 64 列为单位相邻；
+3. epilogue 从 TMEM 做两次 load：当前 64 列 gate block + 同 tile 内相邻 64 列 up block；
+4. epilogue 内计算 `act=silu(gate)*up*route`，直接 TMA store 到 act[M,I] workspace；
+5. 删除 GU[M,2I] 的 GMEM 落地和独立 SwiGLU pass，只保留 act[M,I] 供 down GEMM 读取。
+
+预期收益主要来自省掉 GU 约 `[M,2I]` 的写回/读回和独立 SwiGLU pass。以当前形状估算，
+收益大概率是 single-digit us，低于 concat gate/up 和 tail-UMMA 这类主收益项。因此该项
+先记录为后续优化，当前不实现；等独立 SwiGLU pass 在 perf 中成为明确瓶颈后再做。
+
+### 未来优化：combine channel 内 expert-friendly token 排序
+
+当前 combine_worker 仍按 DeepEP compact token namespace 的 FIFO 顺序发送。compute 可以
+乱序完成不同 expert 的 batch，但 combine 在发送每个 token 前会等待：
+
+```text
+expected == 0: 该 token 本 rank 无 local expert，combine 可直接发送；
+expected == 1: 唯一 local expert 完成后发布 combine_token_ready；
+expected > 1: 所有 local expert contribution 都完成、float reduce finalize 到 bf16 后，
+              最后一个 contribution 才发布 combine_token_ready。
+```
+
+因此 channel 内 token 顺序会影响 head-of-line blocking：如果 FIFO 前面的 token 依赖慢
+expert，后面已经 ready 的 token 也不能越过它发送。
+
+后续可以考虑在 dispatch/metadata 层把 channel 内 token 顺序改成更适合 compute/combine
+协同的顺序，而不是改 combine 为乱序发送。原则是：combine 仍保持 FIFO/head-tail 协议，
+但 FIFO 中的 compact token namespace 由 dispatch 生成时做 expert-friendly 排列。
+
+一个保守的排序策略：
+
+```text
+1. expected == 0 的 token 放最前，避免无 compute token 被阻塞；
+2. expected == 1 的 token 按唯一 local expert id 分桶排序：expert0, expert1, ...；
+3. expected > 1 的 multi-local-expert token 单独放后面，或按 max local expert id 排序。
+```
+
+不能简单按最小 local expert id 排 multi-expert token。比如 token 同时命中 expert0 和
+expert7，如果放进 expert0 段，它仍必须等 expert7 完成后才能 ready，可能反过来堵住后面
+大量 expert0-only token。把 multi-expert token 单独后置，能让单 expert 快路径更顺。
+
+实现上这属于 dispatch/metadata 顺序优化，不是 combine_worker 局部改动。需要保证
+`gbl_channel_prefix_matrix`、`combine_gbl_channel_token_count`、`combined_rdma_head`、
+`combined_nvl_head`、`recv_token_source_info`、`token_compute_expected` 等都基于同一套
+排序后的 compact token namespace。只要这些 prefix/head 一致，combine_worker 可以不感知
+“按专家排序”这件事，仍按现有顺序协议发送。
+
+优先级：待评估。先通过 perf/trace 确认 `perf_comb_wait_ready_ns` 中是否主要来自
+channel FIFO 的 head-of-line blocking；若是，再做该排序优化。
 
 ## 结论
 
