@@ -1120,6 +1120,31 @@ __device__ void umma_up_swiglu_persistent(
 }
 
 
+// ===========================================================================
+// umma_down_persistent — task-level persistent down-proj GEMM for THIS cluster.
+// D = act @ W_down^T. Pure GEMM (no SwiGLU). Mirrors umma_up_swiglu_persistent
+// but a single pass. Caller must bracket with dg_init_barriers_tmem /
+// dg_dealloc_tmem exactly like gate/up.
+//
+//   desc_act_a  : up_buf [M, I] K-major A (in.act_a)
+//   desc_wdown  : W_down[expert] [hidden, I] = [N, K] K-major
+//   desc_down_cd: down_buf [M, hidden] row-major CD (in.down_cd)
+//   K == intermediate (I), N == hidden.
+//   accum_iter starts fresh at 0 (down runs after its own init_barriers_tmem).
+// ===========================================================================
+__device__ void umma_down_persistent(
+    const CUtensorMap* desc_act_a, const CUtensorMap* desc_wdown, const CUtensorMap* desc_down_cd,
+    int M, int hidden, int intermediate,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter) {
+
+    dg_gemm_persistent<false, kDgRunMulticast>(
+        desc_act_a, desc_wdown, desc_down_cd,
+        (uint32_t)M, (uint32_t)hidden, (uint32_t)intermediate,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        nullptr, nullptr, 0);
+}
+
 // DeepGEMM down-proj for one (m_block, n_block) tile: D = act @ W_down^T.
 // Pure GEMM (no SwiGLU); reuses dg_gemm_tile<false>. Shares the same TMEM
 // accum pipeline / accum_iter as the gate/up passes so the single

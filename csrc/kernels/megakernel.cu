@@ -1713,30 +1713,30 @@ __device__ void compute_worker(
 #endif
 
         // GEMM 3: down-proj D = act @ W_down^T.
-        // NOTE: gate/up are now task-level PERSISTENT (init/alloc TMEM once, free
-        // once per task). The old per-tile UMMA down path (umma_down_proj_tile_dg
-        // via dg_gemm_tile + umma_tmem_allocated) is incompatible with that
-        // lifecycle, so down-proj uses the WMMA fallback for now (down persistent
-        // is a later step). Forced off by `false &&`.
-        if (false && kUseUmmaGateUp && !kUmmaSingleCluster &&
+        // Same task-level PERSISTENT lifecycle as gate/up: init barriers+TMEM
+        // once, run the persistent down GEMM (tile loop inside the three warp
+        // roles, zero cluster sync between tiles), dealloc once. A fresh accum
+        // counter is used because gate/up already freed TMEM at their dealloc.
+        if (kUseUmmaGateUp &&
             state->compute_down_tma != nullptr && batch_size == COMPUTE_BATCH_SIZE) {
-            const int cluster_in_group = group_sm_idx / 2;
-            const int m_tiles = (batch_size + umma::kDgBlockM - 1) / umma::kDgBlockM;
-            const int n_tiles = hidden / umma::kDgBlockN;
-            const int total_tiles = m_tiles * n_tiles;
-            const int num_clusters = COMPUTE_GROUP_SIZE / 2;
+            const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
+            const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
+            const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
-            // Reuse umma_accum_iter (declared above) — must continue from wherever
-            // gate+up passes left off so tmem_full/tmem_empty barrier ring stays in phase.
 
-            for (int tile = cluster_in_group; tile < total_tiles; tile += num_clusters) {
-                umma::umma_down_proj_tile_dg(
+            if (cluster_active) {
+                uint32_t down_accum_iter = 0;
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma::umma_down_persistent(
                     &in_atom.act_a,
                     &state->compute_down_tma->wdown[expert_id],
                     &in_atom.down_cd,
-                    tile, batch_size, hidden, intermediate,
-                    cluster_smem, umma_tmem_allocated, umma_accum_iter);
+                    batch_size, hidden, intermediate,
+                    cluster_in_group, num_clusters,
+                    cluster_smem, down_accum_iter);
+                umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = false;
             }
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
