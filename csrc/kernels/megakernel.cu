@@ -62,7 +62,10 @@ enum TimeoutLogSite {
     kTimeoutLogDispatchChannel = 5,
     kTimeoutLogCombineRdmaCheck = 6,
     kTimeoutLogCombineNvlCheck = 7,
-    kTimeoutLogCount = 8,
+    kTimeoutLogCombineNvlSender = 8,
+    kTimeoutLogCombineForwarderRdma = 9,
+    kTimeoutLogCombineBarrier = 10,
+    kTimeoutLogCount = 11,
 };
 
 // Dispatch/combine constants. Original DeepEP computes num_rdma_ranks as
@@ -3791,10 +3794,14 @@ MegaKernelState* allocate_megakernel_state_v7(
     int scale_token_stride,
     int scale_hidden_stride,
     // --- Buffer sizing ---
-    int num_max_rdma_chunked_send_tokens,
-    int num_max_rdma_chunked_recv_tokens,
-    int num_max_nvl_chunked_send_tokens,
-    int num_max_nvl_chunked_recv_tokens,
+    int dispatch_num_max_rdma_chunked_send_tokens,
+    int dispatch_num_max_rdma_chunked_recv_tokens,
+    int dispatch_num_max_nvl_chunked_send_tokens,
+    int dispatch_num_max_nvl_chunked_recv_tokens,
+    int combine_num_max_rdma_chunked_send_tokens,
+    int combine_num_max_rdma_chunked_recv_tokens,
+    int combine_num_max_nvl_chunked_send_tokens,
+    int combine_num_max_nvl_chunked_recv_tokens,
     // --- Expert weights ---
     const __nv_bfloat16* W_gate,
     const __nv_bfloat16* W_up,
@@ -3854,18 +3861,30 @@ MegaKernelState* allocate_megakernel_state_v7(
     // protect the producer/consumer queue geometry used by dispatch and combine.
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
     EP_HOST_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
+    EP_HOST_ASSERT(hidden_dim * static_cast<int>(sizeof(__nv_bfloat16)) % static_cast<int>(sizeof(int4)) == 0);
+    EP_HOST_ASSERT(num_topk <= 32);
+    EP_HOST_ASSERT(num_experts > 0 and num_local_experts > 0);
+    EP_HOST_ASSERT(num_ranks > 0 and num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_logical_channels * 2 > 3);
     int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+
+    EP_HOST_ASSERT(dispatch_num_max_rdma_chunked_send_tokens > 0 and dispatch_num_max_rdma_chunked_recv_tokens > 0);
+    EP_HOST_ASSERT(dispatch_num_max_nvl_chunked_send_tokens > 0 and dispatch_num_max_nvl_chunked_recv_tokens > 0);
+    EP_HOST_ASSERT(dispatch_num_max_rdma_chunked_recv_tokens % dispatch_num_max_rdma_chunked_send_tokens == 0);
+    EP_HOST_ASSERT(dispatch_num_max_nvl_chunked_send_tokens < dispatch_num_max_nvl_chunked_recv_tokens);
 
     auto num_warps_per_forwarder = std::max(kNumCombineForwarderWarps / num_rdma_ranks, 1);
     int num_forwarder_warps = num_rdma_ranks * num_warps_per_forwarder;
     EP_HOST_ASSERT(num_rdma_ranks <= kNumCombineForwarderWarps);
     EP_HOST_ASSERT(num_forwarder_warps > NUM_MAX_NVL_PEERS and num_forwarder_warps % num_rdma_ranks == 0);
-    EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens % num_rdma_ranks == 0);
-    EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens / num_rdma_ranks >
-                   std::max(num_max_rdma_chunked_send_tokens, num_max_nvl_chunked_send_tokens));
-    EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens / num_rdma_ranks - num_warps_per_forwarder >= num_max_nvl_chunked_send_tokens);
-    EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens % num_rdma_ranks == 0);
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / num_rdma_ranks >
+                   std::max(combine_num_max_rdma_chunked_send_tokens, combine_num_max_nvl_chunked_send_tokens));
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / num_rdma_ranks - num_warps_per_forwarder >= combine_num_max_nvl_chunked_send_tokens);
+    EP_HOST_ASSERT(combine_num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
 
     // Signaling
     CUDA_CHECK(cudaMalloc(&expert_recv_count, num_local_experts * sizeof(int)));
@@ -4113,10 +4132,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.scale_hidden_stride = scale_hidden_stride;
 
     // Buffer sizing
-    host_state.num_max_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens;
-    host_state.num_max_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens;
-    host_state.num_max_nvl_chunked_send_tokens = num_max_nvl_chunked_send_tokens;
-    host_state.num_max_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens;
+    host_state.num_max_rdma_chunked_send_tokens = dispatch_num_max_rdma_chunked_send_tokens;
+    host_state.num_max_rdma_chunked_recv_tokens = dispatch_num_max_rdma_chunked_recv_tokens;
+    host_state.num_max_nvl_chunked_send_tokens = dispatch_num_max_nvl_chunked_send_tokens;
+    host_state.num_max_nvl_chunked_recv_tokens = dispatch_num_max_nvl_chunked_recv_tokens;
 
     // Topology
     host_state.rank = rank;
@@ -4334,10 +4353,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.combine_rdma_head_stride = combine_rdma_head_stride;
     host_state.combine_nvl_head_stride = combine_nvl_head_stride;
     host_state.combine_hidden = hidden_dim;  // in dtype units (bf16), not int4
-    host_state.num_max_combine_rdma_chunked_send_tokens = num_max_rdma_chunked_send_tokens;
-    host_state.num_max_combine_rdma_chunked_recv_tokens = num_max_rdma_chunked_recv_tokens;
-    host_state.num_max_combine_nvl_chunked_send_tokens = num_max_nvl_chunked_send_tokens;
-    host_state.num_max_combine_nvl_chunked_recv_tokens = num_max_nvl_chunked_recv_tokens;
+    host_state.num_max_combine_rdma_chunked_send_tokens = combine_num_max_rdma_chunked_send_tokens;
+    host_state.num_max_combine_rdma_chunked_recv_tokens = combine_num_max_rdma_chunked_recv_tokens;
+    host_state.num_max_combine_nvl_chunked_send_tokens = combine_num_max_nvl_chunked_send_tokens;
+    host_state.num_max_combine_nvl_chunked_recv_tokens = combine_num_max_nvl_chunked_recv_tokens;
     host_state.combine_bias_0 = nullptr;
     host_state.combine_bias_1 = nullptr;
 

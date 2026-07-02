@@ -1957,24 +1957,43 @@ torch::Tensor Buffer::megakernel_forward(
     int num_experts,
     int num_dispatch_sms,
     int num_combine_sms,
-    int total_sms) {
+    int total_sms,
+    const Config& dispatch_config,
+    const Config& combine_config) {
 #ifndef DISABLE_NVSHMEM
     pybind11::gil_scoped_release release;
 
     // Input validation
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
+    EP_HOST_ASSERT(W_gate.dim() == 3 and W_gate.is_contiguous());
+    EP_HOST_ASSERT(W_up.dim() == 3 and W_up.is_contiguous());
+    EP_HOST_ASSERT(W_down.dim() == 3 and W_down.is_contiguous());
     EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_gate.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_up.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(num_experts > 0);
+    EP_HOST_ASSERT(num_ranks > 0 and num_experts % num_ranks == 0);
 
     const int num_tokens = x.size(0);
     const int hidden_dim = x.size(1);
     const int hidden_int4 = hidden_dim * x.element_size() / sizeof(int4);
     const int num_topk = topk_idx.size(1);
-    const int intermediate_dim = W_gate.size(1);  // [num_experts, intermediate, hidden]
+    const int intermediate_dim = W_gate.size(1);  // [num_local_experts, intermediate, hidden]
     const int num_local_experts = num_experts / num_ranks;
+
+    EP_HOST_ASSERT(topk_idx.size(0) == num_tokens);
+    EP_HOST_ASSERT(topk_weights.size(0) == num_tokens);
+    EP_HOST_ASSERT(topk_weights.size(1) == num_topk);
+    EP_HOST_ASSERT((hidden_dim * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(W_gate.size(0) == num_local_experts and W_up.size(0) == num_local_experts and W_down.size(0) == num_local_experts);
+    EP_HOST_ASSERT(W_gate.size(2) == hidden_dim and W_up.size(2) == hidden_dim);
+    EP_HOST_ASSERT(W_gate.size(1) == W_up.size(1) and W_down.size(1) == hidden_dim);
+    EP_HOST_ASSERT(W_down.size(2) == intermediate_dim);
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
@@ -1993,14 +2012,19 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(num_dispatch_sms % 2 == 0);
     EP_HOST_ASSERT(active_total_sms % 2 == 0 && "S4.2: active_total_sms must be even for cluster_dim=2");
 
-    // Config for buffer sizing, aligned with tests/test_megakernel_v7.py DeepEP config
+    // MegaKernel uses the same DeepEP config objects as the baseline path, but
+    // keeps dispatch and combine parameters separate just like original DeepEP.
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
     const int num_logical_channels = num_physical_channels * 2;
     const int num_channels = num_logical_channels;
-    const int num_max_rdma_chunked_send_tokens = 16;
-    const int num_max_rdma_chunked_recv_tokens = 256;
-    const int num_max_nvl_chunked_send_tokens = 16;
-    const int num_max_nvl_chunked_recv_tokens = 256;
+    const int dispatch_num_max_rdma_chunked_send_tokens = dispatch_config.num_max_rdma_chunked_send_tokens;
+    const int dispatch_num_max_rdma_chunked_recv_tokens = dispatch_config.num_max_rdma_chunked_recv_tokens;
+    const int dispatch_num_max_nvl_chunked_send_tokens = dispatch_config.num_max_nvl_chunked_send_tokens;
+    const int dispatch_num_max_nvl_chunked_recv_tokens = dispatch_config.num_max_nvl_chunked_recv_tokens;
+    const int combine_num_max_rdma_chunked_send_tokens = combine_config.num_max_rdma_chunked_send_tokens;
+    const int combine_num_max_rdma_chunked_recv_tokens = combine_config.num_max_rdma_chunked_recv_tokens;
+    const int combine_num_max_nvl_chunked_send_tokens = combine_config.num_max_nvl_chunked_send_tokens;
+    const int combine_num_max_nvl_chunked_recv_tokens = combine_config.num_max_nvl_chunked_recv_tokens;
 
     // Step 1: Compute dispatch layout
     auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -2069,10 +2093,14 @@ torch::Tensor Buffer::megakernel_forward(
         }
     }
 
-    printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
+    printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d dispatch_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) combine_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
            rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
-           num_tokens, hidden_int4, num_topk, num_experts, num_local_experts, rdma_buffer_ptr,
-           buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
+           num_tokens, hidden_int4, num_topk, num_experts, num_local_experts,
+           dispatch_num_max_nvl_chunked_send_tokens, dispatch_num_max_nvl_chunked_recv_tokens,
+           dispatch_num_max_rdma_chunked_send_tokens, dispatch_num_max_rdma_chunked_recv_tokens,
+           combine_num_max_nvl_chunked_send_tokens, combine_num_max_nvl_chunked_recv_tokens,
+           combine_num_max_rdma_chunked_send_tokens, combine_num_max_rdma_chunked_recv_tokens,
+           rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
            moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
     printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p logical_rdma_cpm=%p recv_rdma_prefix=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
            rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
@@ -2105,9 +2133,9 @@ torch::Tensor Buffer::megakernel_forward(
         gbl_channel_prefix_matrix.data_ptr<int>(),
         recv_gbl_rank_prefix_sum.data_ptr<int>(),
         rdma_buffer_ptr,
-        num_max_rdma_chunked_recv_tokens,
+        dispatch_num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu,
-        num_max_nvl_chunked_recv_tokens,
+        dispatch_num_max_nvl_chunked_recv_tokens,
         barrier_signal_ptrs_gpu,
         rank,
         stream,
@@ -2122,23 +2150,24 @@ torch::Tensor Buffer::megakernel_forward(
                             num_topk_weights * static_cast<int>(sizeof(float)),
                         static_cast<int>(sizeof(int4)));
     };
-    auto get_rdma_bytes = [&](int num_topk_idx, int num_topk_weights) {
+    auto get_rdma_bytes = [&](int num_topk_idx, int num_topk_weights, int num_max_rdma_chunked_recv_tokens) {
         int64_t data_bytes = static_cast<int64_t>(get_num_bytes_per_token(num_topk_idx, num_topk_weights)) *
             num_max_rdma_chunked_recv_tokens * num_rdma_ranks * 2 * num_logical_channels;
         int64_t meta_bytes = static_cast<int64_t>(NUM_MAX_NVL_PEERS * 2 + 4) *
             num_rdma_ranks * 2 * num_logical_channels * sizeof(int);
         return data_bytes + meta_bytes;
     };
-    auto get_nvl_bytes = [&](int num_topk_idx, int num_topk_weights) {
+    auto get_nvl_bytes = [&](int num_topk_idx, int num_topk_weights, int num_max_nvl_chunked_recv_tokens) {
         int64_t data_bytes = static_cast<int64_t>(get_num_bytes_per_token(num_topk_idx, num_topk_weights)) *
             num_max_nvl_chunked_recv_tokens * NUM_MAX_NVL_PEERS * num_logical_channels;
         int64_t meta_bytes = static_cast<int64_t>(NUM_MAX_NVL_PEERS) *
             (2 * num_rdma_ranks + 2) * num_logical_channels * sizeof(int);
         return data_bytes + meta_bytes;
     };
-    EP_HOST_ASSERT(get_rdma_bytes(num_topk + 1, num_topk) + get_rdma_bytes(0, num_topk) <= num_rdma_bytes);
-    EP_HOST_ASSERT(get_nvl_bytes(num_topk + 1, num_topk) <= num_nvl_bytes);
-    EP_HOST_ASSERT(get_nvl_bytes(0, num_topk) <= num_nvl_bytes);
+    EP_HOST_ASSERT(get_rdma_bytes(num_topk + 1, num_topk, dispatch_num_max_rdma_chunked_recv_tokens) +
+                   get_rdma_bytes(0, num_topk, combine_num_max_rdma_chunked_recv_tokens) <= num_rdma_bytes);
+    EP_HOST_ASSERT(get_nvl_bytes(num_topk + 1, num_topk, dispatch_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
+    EP_HOST_ASSERT(get_nvl_bytes(0, num_topk, combine_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
 
     printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
            rank, *moe_recv_counter, *moe_recv_rdma_counter);
@@ -2201,10 +2230,14 @@ torch::Tensor Buffer::megakernel_forward(
         rank,
         0,  // scale_token_stride
         0,  // scale_hidden_stride
-        num_max_rdma_chunked_send_tokens,
-        num_max_rdma_chunked_recv_tokens,
-        num_max_nvl_chunked_send_tokens,
-        num_max_nvl_chunked_recv_tokens,
+        dispatch_num_max_rdma_chunked_send_tokens,
+        dispatch_num_max_rdma_chunked_recv_tokens,
+        dispatch_num_max_nvl_chunked_send_tokens,
+        dispatch_num_max_nvl_chunked_recv_tokens,
+        combine_num_max_rdma_chunked_send_tokens,
+        combine_num_max_rdma_chunked_recv_tokens,
+        combine_num_max_nvl_chunked_send_tokens,
+        combine_num_max_nvl_chunked_recv_tokens,
         reinterpret_cast<const __nv_bfloat16*>(W_gate.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(W_up.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
@@ -2316,7 +2349,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24,
              py::arg("num_combine_sms") = 24,
-             py::arg("total_sms") = 148)
+             py::arg("total_sms") = 148,
+             py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
+             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
 #ifdef MK_PERF_TRACE
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
 #endif

@@ -706,7 +706,8 @@ class Buffer:
     def megakernel_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                            W_gate: torch.Tensor, W_up: torch.Tensor, W_down: torch.Tensor,
                            num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
-                           total_sms: int = 148) -> torch.Tensor:
+                           total_sms: int = 148, dispatch_config: Optional[Config] = None,
+                           combine_config: Optional[Config] = None) -> torch.Tensor:
         """
         Fused MoE MegaKernel: dispatch + TensorCore GEMM + SwiGLU + combine in a single persistent kernel.
 
@@ -721,9 +722,14 @@ class Buffer:
             num_dispatch_sms: number of SMs for dispatch phase (unused, reserved)
             num_combine_sms: number of SMs for combine phase (unused, reserved)
             total_sms: total SMs to launch (should match GPU SM count)
+            dispatch_config: DeepEP dispatch Config; defaults to get_dispatch_config(num_ranks)
+            combine_config: DeepEP combine Config; defaults to get_combine_config(num_ranks)
 
         Returns:
             output: [num_tokens, hidden], bf16
         """
+        dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
+        combine_config = combine_config or self.get_combine_config(self.group_size)
         return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gate, W_up, W_down,
-                                              num_experts, num_dispatch_sms, num_combine_sms, total_sms)
+                                              num_experts, num_dispatch_sms, num_combine_sms, total_sms,
+                                              dispatch_config, combine_config)

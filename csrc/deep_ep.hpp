@@ -315,7 +315,9 @@ public:
         int num_experts,
         int num_dispatch_sms,
         int num_combine_sms,
-        int total_sms);
+        int total_sms,
+        const Config& dispatch_config,
+        const Config& combine_config);
 
 #ifdef MK_PERF_TRACE
     // Baseline perf trace state: accumulated across dispatch/combine calls, dumped on request.
