@@ -455,6 +455,46 @@ consumer group 内更高效 barrier；
 减少 scratch buffer 和全局内存往返。
 ```
 
+### 当前 compute_worker perf 观察：256x2048x3072
+
+> 记录时间：2026-07-01。本文档前半部分仍保留了一些早期设计参数（例如 128-token batch、1 scheduler SM、固定 800 threads/block）。当前代码路径以 `megakernel.cu` 为准：`COMPUTE_BATCH_SIZE=256`，scheduler 已支持多 lane，gate/up 走 concat UMMA，down 走 UMMA。RDMA rank 数不再写死，host 端按原始 DeepEP 方式用 `num_ranks / NUM_MAX_NVL_PEERS` 计算，并通过 `SWITCH_RDMA_RANKS` 选择 `moe_megakernel_v7<kNumRDMARanks>` specialization；block threads 由 `MegaKernelRdmaConfig<kNumRDMARanks>` 推导。
+
+在 `batch_size=256, hidden=2048, intermediate=3072` 的 full-batch case 下，放开 `hidden_dim == intermediate_dim` 限制后，compute 已经回到 UMMA 快路径。代表性 perf：
+
+```text
+p1_meta_us             2.656
+p2_input_load_us       17.888
+p3_gateup_gemm_us      72.416
+p4_down_gemm_us        34.208
+p5_output_us           22.144
+p6_signal_us           39.392
+
+p3a_up_compute_us      45.312
+p3b_up_barrier_us      27.104
+p4a_down_compute_us    25.184
+p4b_down_barrier_us     9.024
+p5a_out_compute_us      6.880
+p5b_out_barrier_us     15.264
+p6a_donecount_us        7.456
+p6b_fp32finalize_us    12.032
+p6c_fence_us            6.528
+p6d_publish_us         13.376
+p6b_multi_expert_rows   0
+```
+
+结论：当前最大问题不再是 GEMM fallback。GEMM 本体约 `p3a+p4a=70.5us`，而 barrier/output/signal 相关开销接近 `90us`。优化优先级应转向 task 内同步、无效 finalize、ready publish 和输入/输出搬运。
+
+当前可确认的优化点：
+
+1. **已实现：跳过无效 fp32 finalize**：当本 task 无 multi-local-expert finalize row 时（`s_has_multi_finalize == 0`），`p6b_fp32finalize_us` 是空扫 `batch_size * hidden` 元素，没有任何写出。当前由每个 SM 的 `thread_id==0` 从 group-shared 广播的 `compute_group_is_last` 统计 `multi_rows`，写本 SM 的 `s_has_multi_finalize` 再 `__syncthreads()`；为 0 时跳过 finalize loop 及其 group sync。由于没有新的 finalize 写入，也跳过后续第二次 `__threadfence()` 及对应 group sync。预期节省约 `p6b+p6c ~= 18us`。判定源是同一份 GMEM 广播，所有 SM 结论一致，group sync 保持配对。
+2. **已实现：满 batch 跳过 act padding barrier**：full batch 下 `batch_size == COMPUTE_BATCH_SIZE`，`up_buf` padding 清零循环无实际写入。当前仅在 `batch_size < COMPUTE_BATCH_SIZE` 时做 padding 及对应 `compute_group_sync`，full batch 直接跳过，降低 `p3b_up_barrier_us`。
+3. **已实现：ready publish 并行化**：`combine_token_ready` 的 release store 从原来仅 `group_sm_idx==0` 负责最多 256 个 row，改为基于 group-shared `compute_group_is_last`，由整个 group 按 `group_thread_id/group_num_threads` 分摊。每个 row 的 last-flag 仍由 SM0 的 atomicAdd 权威决定，语义不变，目标是降低 `p6d_publish_us`。
+4. **output/fence 路径谨慎优化**：`p5a_out_compute_us=6.9us`，`p5b_out_barrier_us=15.3us`，说明输出写本身不重，重在 group barrier/fence。这里涉及“所有 writer 的 output 对 combine 可见”正确性，不能简单改成单线程 fence；需要单独验证内存可见性后再动。
+5. **input gather 是长期结构性优化**：`p2_input_load_us=17.9us` 来自从 compact `combine_input[token, hidden]` gather 到 contiguous `input_buf`。长期可以让 dispatch 直接写 expert-local contiguous input buffer，减少 compute_worker 这次搬运，但会触及 dispatch/metadata buffer ownership，改动面大于 signal 局部优化。
+6. **接通 UMMA 内部 perf**：当前 `up_setup_us/up_tma_wait_us/up_mma_wait_us/...` 和 down 对应字段全为 0，说明 `umma::UmmaPerf` 尚未接到 `umma_gateup_concat_persistent/umma_down_persistent` 内部。若后续继续优化 GEMM 本体，应先把这组计时真正填上。
+
+短期建议先做前两项：跳过 `p6b_multi_expert_rows==0` 的 finalize/fence，以及 full-batch 跳过无效 padding barrier。这两项改动局部、风险低，预计能把单 task 从约 `188us` 压到 `160us` 附近。
+
 ### 未来优化：64-block interleaved layout + gateup epilogue 内融合 SwiGLU
 
 当前 gate/up 已合成单趟 concat GEMM（Wgu=[Wg;Wu] 形状 [2I,d]，N=2I），

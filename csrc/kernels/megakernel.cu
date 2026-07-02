@@ -65,25 +65,23 @@ enum TimeoutLogSite {
     kTimeoutLogCount = 8,
 };
 
-// Dispatch constants (matching internode.cu)
-constexpr int MK_NUM_RDMA_RANKS = 2;            // 2 nodes
-
-// Combine constants (matching DeepEP internode.cu combine kernel)
-// For kNumRDMARanks=2, kNumCombineForwarderWarps=24:
-//   kNumWarpsPerForwarder = 24/2 = 12
-//   kNumForwarders = 2*12 = 24
-//   kNumRDMAReceivers = 24 - 8 = 16
-// Sender SM: 8 NVL senders + 16 RDMA receivers + 1 coordinator = 25 warps (800 threads)
-// Forwarder SM: 24 forwarders + 1 coordinator = 25 warps (800 threads)
+// Dispatch/combine constants. Original DeepEP computes num_rdma_ranks as
+// num_ranks / NUM_MAX_NVL_PEERS, then uses SWITCH_RDMA_RANKS to select the
+// compile-time kNumRDMARanks specialization.
 constexpr int kNumCombineForwarderWarps = 24;
-constexpr int kNumCombineWarpsPerForwarder = kNumCombineForwarderWarps / MK_NUM_RDMA_RANKS;  // 12
-constexpr int kNumCombineForwarders = MK_NUM_RDMA_RANKS * kNumCombineWarpsPerForwarder;      // 24
-constexpr int kNumCombineRDMAReceivers = kNumCombineForwarders - NUM_MAX_NVL_PEERS;          // 16
 constexpr int kNumCombineTMABytesPerSenderWarp = 16384;
 // Per forwarder warp: 2 stages * (sizeof(int4)*32 * (NUM_MAX_NVL_PEERS+1) + 16)
 constexpr int kNumCombineTMABytesPerForwarderWarp = 9248;
-constexpr int kNumTopkCombineRDMARanks = MK_NUM_RDMA_RANKS;  // get_num_topk_rdma_ranks(2)=2
-constexpr int kMegaKernelNumThreads = (kNumCombineForwarders + 1) * 32;
+
+template <int kNumRDMARanks>
+struct MegaKernelRdmaConfig {
+    static constexpr int kNumCombineWarpsPerForwarder =
+        (kNumCombineForwarderWarps / kNumRDMARanks > 0) ? kNumCombineForwarderWarps / kNumRDMARanks : 1;
+    static constexpr int kNumCombineForwarders = kNumRDMARanks * kNumCombineWarpsPerForwarder;
+    static constexpr int kNumCombineRDMAReceivers = kNumCombineForwarders - NUM_MAX_NVL_PEERS;
+    static constexpr int kNumTopkCombineRDMARanks = internode::get_num_topk_rdma_ranks(kNumRDMARanks);
+    static constexpr int kMegaKernelNumThreads = (kNumCombineForwarders + 1) * 32;
+};
 
 // SM Role assignment (configured at launch time)
 enum class SmRole {
@@ -486,27 +484,28 @@ __device__ void device_gemm_swiglu_fused(
 //   - Odd SM (!is_forwarder): kRDMASender + kRDMASenderCoordinator + kNVLReceivers
 //
 // Template params instantiated for MK-v7:
-//   kLowLatencyMode=false, kNumRDMARanks=2, kCachedMode=false,
-//   kNumTMABytesPerWarp=16384, kNumDispatchRDMASenderWarps=7
+//   kLowLatencyMode=false, kCachedMode=false,
+//   kNumTMABytesPerWarp=16384, kNumDispatchRDMASenderWarps=7.
+//   kNumRDMARanks is selected at launch by SWITCH_RDMA_RANKS.
 //
 // Only difference from DeepEP: In NVLReceivers section, after copying token
 // data to recv_x, we also route tokens to expert storage + signal compute SMs.
 // ============================================================================
 
 // Instantiated template constants
-constexpr int kNumRDMARanks = MK_NUM_RDMA_RANKS;  // 2
 constexpr int kNumDispatchRDMASenderWarps = 7;
-constexpr int kNumTopkRDMARanks = 2;
 constexpr int kNumTMABytesPerWarp = 16384;
 constexpr bool kLowLatencyMode = false;
 constexpr bool kCachedMode = false;
 
+template <int kNumRDMARanks>
 __device__ void dispatch_worker_v2(
     int sm_id,
     int dispatch_sm_idx,  // 0-based index among all dispatch SMs
     MegaKernelState* state
 ) {
     using namespace internode;
+    constexpr int kNumTopkRDMARanks = internode::get_num_topk_rdma_ranks(kNumRDMARanks);
     const auto num_sms = state->num_dispatch_sms;
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -1638,6 +1637,7 @@ __device__ void compute_worker(
     __shared__ int s_topk_slot[COMPUTE_BATCH_SIZE];
     __shared__ int s_expected[COMPUTE_BATCH_SIZE];
     __shared__ int s_is_last[COMPUTE_BATCH_SIZE];
+    __shared__ int s_has_multi_finalize;
     // Per-row route weight, gathered once and consumed inside the fused
     // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
     __shared__ float s_route_w[COMPUTE_BATCH_SIZE];
@@ -1899,12 +1899,15 @@ __device__ void compute_worker(
             // down GEMM reads defined data. down output row m depends only on act
             // row m (no M-mixing), so padding rows would only affect padding output
             // rows (masked off anyway) — but clear them to avoid reading stale
-            // workspace from a previous task.
-            for (int idx = group_thread_id + batch_size * intermediate;
-                 idx < COMPUTE_BATCH_SIZE * intermediate; idx += group_num_threads) {
-                up_buf[idx] = __float2bfloat16(0.0f);
+            // workspace from a previous task. Full batches leave no padding rows,
+            // so skip the clear + its group sync entirely.
+            if (batch_size < COMPUTE_BATCH_SIZE) {
+                for (int idx = group_thread_id + batch_size * intermediate;
+                     idx < COMPUTE_BATCH_SIZE * intermediate; idx += group_num_threads) {
+                    up_buf[idx] = __float2bfloat16(0.0f);
+                }
+                compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
             }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
         } else {
             device_gemm_swiglu_fused(input_buf, w_gate, w_up, up_buf, s_route_w,
                                      batch_size, batch_size, hidden, intermediate,
@@ -2008,15 +2011,24 @@ __device__ void compute_worker(
                 s_is_last[thread_id];
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
-#ifdef MK_PERF_TRACE
-        if (perf_leader) {
-            perf_sig_donecount_ns = globaltimer_ns();
-            // Count rows that actually do the fp32->bf16 finalize (multi-local-expert tokens).
+        // Each SM decides, from the group-shared broadcast, whether any row in this
+        // task does the fp32->bf16 finalize (multi-local-expert token). If none do,
+        // the whole finalize loop + its second device fence are pure overhead and
+        // are skipped. The decision reads the shared GMEM broadcast (same source for
+        // every SM), so all SMs agree and the group syncs stay matched.
+        const int* group_is_last = &state->compute_group_is_last[group_id * COMPUTE_BATCH_SIZE];
+        if (thread_id == 0) {
             int multi_rows = 0;
             for (int row = 0; row < batch_size; ++row)
-                if (s_is_last[row] && s_expected[row] > 1) ++multi_rows;
-            s_perf_multi_expert_rows = multi_rows;
+                if (group_is_last[row] && s_expected[row] > 1) ++multi_rows;
+            s_has_multi_finalize = (multi_rows != 0);
+#ifdef MK_PERF_TRACE
+            if (perf_leader) s_perf_multi_expert_rows = multi_rows;
+#endif
         }
+        __syncthreads();
+#ifdef MK_PERF_TRACE
+        if (perf_leader) perf_sig_donecount_ns = globaltimer_ns();
 #endif
 
         // FP32->BF16 finalize for multi-local-expert tokens. Parallelized across
@@ -2027,30 +2039,38 @@ __device__ void compute_worker(
         // valid in SM0's shared memory). last is still authoritatively decided by the
         // atomicAdd on SM0, so exactly one task finalizes each token — no double write
         // and no non-atomic race across tasks/groups.
-        const int* group_is_last = &state->compute_group_is_last[group_id * COMPUTE_BATCH_SIZE];
-        for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
-            int row = idx / hidden;
-            int h = idx - row * hidden;
-            if (s_expected[row] > 1 && group_is_last[row]) {
-                int recv_token_idx = s_recv_token_idx[row];
-                state->compute_output[(int64_t)recv_token_idx * hidden + h] =
-                    __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
+        if (s_has_multi_finalize) {
+            for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
+                int row = idx / hidden;
+                int h = idx - row * hidden;
+                if (s_expected[row] > 1 && group_is_last[row]) {
+                    int recv_token_idx = s_recv_token_idx[row];
+                    state->compute_output[(int64_t)recv_token_idx * hidden + h] =
+                        __float2bfloat16(state->compute_output_f[(int64_t)recv_token_idx * hidden + h]);
+                }
             }
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
         }
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_sig_finalize_ns = globaltimer_ns();
 #endif
-        // device-scope fence: same rationale as above — combine reads finalized
-        // compute_output locally on this GPU before combine_token_ready gates it.
-        __threadfence();
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        // device-scope fence: only needed when finalize wrote new compute_output
+        // after the p5 output fence. When no multi-expert row exists, all ready rows
+        // were already written and fenced in p5, so skip this fence + its group sync.
+        if (s_has_multi_finalize) {
+            __threadfence();
+            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        }
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_sig_fence_ns = globaltimer_ns();
 #endif
 
-        if (group_sm_idx == 0 && thread_id < batch_size && s_is_last[thread_id]) {
-            st_release_sys_global(&state->combine_token_ready[s_recv_token_idx[thread_id]], 1);
+        // Publish combine-ready. Parallelized across the whole group using the
+        // group-shared last-flag broadcast, instead of loading SM0 with up to 256
+        // release stores. Each row's last-flag is authoritative in group_is_last.
+        for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
+            if (group_is_last[row])
+                st_release_sys_global(&state->combine_token_ready[s_recv_token_idx[row]], 1);
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
@@ -2118,9 +2138,10 @@ __device__ void compute_worker(
 // Polls per-expert compute_done signals, then runs the full combine protocol.
 // SM pairing: even SM = NVLSender + RDMAReceiver + Coordinator
 //             odd SM  = NVLAndRDMAForwarder + Coordinator
-// Template constants: kNumRDMARanks=2, kNumCombineForwarderWarps=24
+// Template constants: kNumRDMARanks is selected at launch by SWITCH_RDMA_RANKS.
 // ============================================================================
 
+template <int kNumRDMARanks>
 __device__ void combine_worker_v2(
     int combine_sm_idx,       // 0-based index among combine SMs
     MegaKernelState* state
@@ -2134,7 +2155,7 @@ __device__ void combine_worker_v2(
     const int num_logical_channels = state->num_logical_channels;
     EP_DEVICE_ASSERT(num_channels == state->num_dispatch_channels);  // physical channel counts must match for queue reuse
     const int num_ranks = state->num_ranks;
-    constexpr int kNumRDMARanks_C = MK_NUM_RDMA_RANKS;
+    constexpr int kNumRDMARanks_C = kNumRDMARanks;
     const int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
 
     if (threadIdx.x == 0 && combine_sm_idx == 0) {
@@ -2157,10 +2178,11 @@ __device__ void combine_worker_v2(
     // --- DeepEP combine kernel logic begins (direct port from internode.cu L1741-2269) ---
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
-    constexpr int kNumForwarders_C = kNumCombineForwarders;           // 24
-    constexpr int kNumWarpsPerForwarder_C = kNumCombineWarpsPerForwarder;  // 12
-    constexpr int kNumRDMAReceivers_C = kNumCombineRDMAReceivers;    // 16
-    constexpr int kNumTopkRDMARanks_C = kNumTopkCombineRDMARanks;    // 2
+    using RdmaCfg = MegaKernelRdmaConfig<kNumRDMARanks>;
+    constexpr int kNumForwarders_C = RdmaCfg::kNumCombineForwarders;
+    constexpr int kNumWarpsPerForwarder_C = RdmaCfg::kNumCombineWarpsPerForwarder;
+    constexpr int kNumRDMAReceivers_C = RdmaCfg::kNumCombineRDMAReceivers;
+    constexpr int kNumTopkRDMARanks_C = RdmaCfg::kNumTopkCombineRDMARanks;
 
     const auto sm_id = combine_sm_idx;
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
@@ -3183,7 +3205,8 @@ __device__ void combine_worker_v2(
 // Main MegaKernel Entry Point
 // ============================================================================
 
-__global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
+template <int kNumRDMARanks>
+__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) moe_megakernel_v7(
     MegaKernelState* state
 ) {
     const int sm_id = blockIdx.x;
@@ -3227,11 +3250,11 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
 
     switch (role) {
         case SmRole::kDispatch:
-            dispatch_worker_v2(sm_id, role_idx, state);
+            dispatch_worker_v2<kNumRDMARanks>(sm_id, role_idx, state);
             break;
 
         case SmRole::kCombine:
-            combine_worker_v2(role_idx, state);
+            combine_worker_v2<kNumRDMARanks>(role_idx, state);
             break;
 
         case SmRole::kScheduler:
@@ -3255,34 +3278,38 @@ __global__ void __launch_bounds__(kMegaKernelNumThreads, 1) moe_megakernel_v7(
 static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms);
 #endif
 
-void launch_megakernel_v7(
+template <int kNumRDMARanks>
+static void launch_megakernel_v7_case(
     MegaKernelState* device_state,
+    const MegaKernelState& host_state,
     int total_sms,
     int smem_size,
     cudaStream_t stream
 ) {
-    printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d block_threads=%d smem_size=%d stream=%p\n",
-           device_state, total_sms, kMegaKernelNumThreads, smem_size, stream);
+    using RdmaCfg = MegaKernelRdmaConfig<kNumRDMARanks>;
+    constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
+    const int num_ranks = host_state.num_ranks;
+
+    printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d num_rdma_ranks=%d block_threads=%d smem_size=%d stream=%p\n",
+           device_state, total_sms, num_ranks, kNumRDMARanks, kThreads, smem_size, stream);
     if (smem_size > 48 * 1024) {
-        cudaFuncSetAttribute(moe_megakernel_v7,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem_size);
+        CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7<kNumRDMARanks>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_size));
         printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
     }
 
+    EP_HOST_ASSERT(total_sms % 2 == 0 && "S4.2: total_sms must be even for cluster_dim=2");
+    EP_HOST_ASSERT(host_state.num_combine_sms % 2 == 0);
+    EP_HOST_ASSERT(host_state.num_combine_sms > 0);
+    EP_HOST_ASSERT(kThreads >= (RdmaCfg::kNumCombineForwarders + 1) * 32);
+
 #ifndef DISABLE_SM90_FEATURES
-    // S4.2: enable cluster launch (cluster_dim=2) for the whole grid. Compute will
-    // later use 2-CTA clusters (2x1SM UMMA); dispatch/combine do not call any cluster
-    // API and are unaffected (see MEGAKERNEL_COMPUTE_DESIGN.md I.5/I.9.7-S4.2).
-    // cluster_dim divides gridDim only if total_sms is even — assert instead of
-    // silently falling back, so an odd SM layout is caught at launch.
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = total_sms;
-    cfg.blockDim = kMegaKernelNumThreads;
+    cfg.blockDim = kThreads;
     cfg.dynamicSmemBytes = smem_size;
     cfg.stream = stream;
-
-    EP_HOST_ASSERT(total_sms % 2 == 0 && "S4.2: total_sms must be even for cluster_dim=2");
 
     cudaLaunchAttribute attr[2];
     attr[0].id = cudaLaunchAttributeCooperative;
@@ -3293,14 +3320,32 @@ void launch_megakernel_v7(
     attr[1].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 2;
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe_megakernel_v7, device_state));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));  // 同步后才能看到 printf 输出
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe_megakernel_v7<kNumRDMARanks>, device_state));
 #else
-    moe_megakernel_v7<<<total_sms, kMegaKernelNumThreads, smem_size, stream>>>(device_state);
-    CUDA_CHECK(cudaGetLastError());
-
+    moe_megakernel_v7<kNumRDMARanks><<<total_sms, kThreads, smem_size, stream>>>(device_state);
 #endif
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void launch_megakernel_v7(
+    MegaKernelState* device_state,
+    int total_sms,
+    int smem_size,
+    cudaStream_t stream
+) {
+    MegaKernelState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    const int num_ranks = host_state.num_ranks;
+    EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
+
+#define MEGAKERNEL_LAUNCH_CASE(num_rdma_ranks) \
+    launch_megakernel_v7_case<num_rdma_ranks>(device_state, host_state, total_sms, smem_size, stream); \
+    break
+
+    SWITCH_RDMA_RANKS(MEGAKERNEL_LAUNCH_CASE);
+
+#undef MEGAKERNEL_LAUNCH_CASE
 
 #ifdef MK_PERF_TRACE
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -3811,7 +3856,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
     int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
-    EP_HOST_ASSERT(num_rdma_ranks == MK_NUM_RDMA_RANKS);
 
     auto num_warps_per_forwarder = std::max(kNumCombineForwarderWarps / num_rdma_ranks, 1);
     int num_forwarder_warps = num_rdma_ranks * num_warps_per_forwarder;
@@ -3922,12 +3966,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
 
     // --- S4.4 (route B2): build UMMA compute TMA atoms on host, upload to device ---
-    // Only when hidden==intermediate (first version, I.9.0) and weights present.
+    // Gate/up uses A[M, hidden] x Wgu[2 * intermediate, hidden]^T.
+    // Down uses act[M, intermediate] x W_down[hidden, intermediate]^T.
     umma::ComputeTmaAtoms* d_compute_tma = nullptr;
     umma::InputTmaAtom_t* d_group_input_tma = nullptr;
     umma::ComputeDownTmaAtoms* d_compute_down_tma = nullptr;
     __nv_bfloat16* d_w_gateup = nullptr;
-    if (W_gate != nullptr && W_up != nullptr && hidden_dim == intermediate_dim &&
+    if (W_gate != nullptr && W_up != nullptr && W_down != nullptr &&
         num_local_experts <= umma::kMaxLocalExperts) {
         // Per-expert weight atoms. Build a concat weight W_gateup [E, 2I, d] =
         // [Wg;Wu] per expert on device, for the single-GEMM gate/up fusion.
