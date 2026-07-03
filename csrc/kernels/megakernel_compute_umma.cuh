@@ -141,8 +141,14 @@ static constexpr uint32_t kDgSwizzleB   = 128;
 static constexpr uint32_t kDgSwizzleCD  = 128;
 static constexpr bool     kDgMcastOnA   = false;
 static constexpr uint32_t kDgKAlign     = 128;
-// Force 2-CTA DeepGEMM for now (perf-first; precision validated separately).
-static constexpr uint32_t kDgRunMulticast = 2;
+// MK_COMPUTE_KERNEL: 1 selects 1-CTA UMMA; 2 selects 2-CTA UMMA.
+// Mode 0 (WMMA) still compiles this header, so keep the UMMA constants valid.
+#ifndef MK_COMPUTE_KERNEL
+#define MK_COMPUTE_KERNEL 2
+#endif
+static_assert(MK_COMPUTE_KERNEL >= 0 && MK_COMPUTE_KERNEL <= 2,
+              "MK_COMPUTE_KERNEL must be 0 (WMMA), 1 (1-CTA UMMA), or 2 (2-CTA UMMA)");
+static constexpr uint32_t kDgRunMulticast = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
 static constexpr uint32_t kDgLoadBlockM = kDgBlockM / (kDgMcastOnA ? kDgRunMulticast : 1);
 static constexpr uint32_t kDgLoadBlockN = kDgBlockN / (kDgMcastOnA ? 1 : kDgRunMulticast);
 static constexpr uint32_t kDgStoreBlockM = (kDgBlockM < 128 ? kDgBlockM : 128);              // 128

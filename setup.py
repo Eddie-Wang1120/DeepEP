@@ -116,17 +116,13 @@ if __name__ == '__main__':
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
 
-    # MK_FORCE_WMMA: force compute_worker gate/up + down to the WMMA path,
-    # bypassing the DeepGEMM UMMA path (precision isolation, step 1).
-    if int(os.getenv('MK_FORCE_WMMA', 0)):
-        cxx_flags.append('-DMK_FORCE_WMMA')
-        nvcc_flags.append('-DMK_FORCE_WMMA')
+    # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
+    #   0 = WMMA, 1 = 1-CTA UMMA, 2 = 2-CTA UMMA (default)
+    mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '2'))
+    assert mk_compute_kernel in (0, 1, 2), 'MK_COMPUTE_KERNEL must be 0, 1, or 2'
+    cxx_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
+    nvcc_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
 
-    # MK_UMMA_SINGLE_CLUSTER: only cluster #0 runs ALL gate/up tiles (num_clusters=1,
-    # standalone PASS config); down-proj falls back to WMMA. Precision isolation step 2.
-    if int(os.getenv('MK_UMMA_SINGLE_CLUSTER', 0)):
-        cxx_flags.append('-DMK_UMMA_SINGLE_CLUSTER')
-        nvcc_flags.append('-DMK_UMMA_SINGLE_CLUSTER')
 
     if int(os.getenv('ENABLE_FAST_DEBUG', 0)):
         cxx_flags.append('-DENABLE_FAST_DEBUG')

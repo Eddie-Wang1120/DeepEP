@@ -1997,10 +1997,9 @@ torch::Tensor Buffer::megakernel_forward(
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
-    // S4.2: scheduler region uses 2 SMs so the launched grid is even (cluster_dim=2).
-    // dispatch/combine are even, compute is a multiple of 32 (even); 2 schedulers keep the
-    // sum even without a hacky padding SM. Only scheduler SM #0 does work; #1 idles
-    // (see compute_scheduler_worker gating in megakernel.cu).
+    constexpr int compute_cluster_dim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+    // Scheduler region keeps 2 SMs for layout compatibility; only scheduler SM #0
+    // does work today, #1 idles (see compute_scheduler_worker gating in megakernel.cu).
     constexpr int compute_scheduler_sms = 2;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
@@ -2010,7 +2009,7 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_combine_sms % 2 == 0);
     EP_HOST_ASSERT(num_dispatch_sms % 2 == 0);
-    EP_HOST_ASSERT(active_total_sms % 2 == 0 && "S4.2: active_total_sms must be even for cluster_dim=2");
+    EP_HOST_ASSERT(compute_cluster_dim == 1 || (active_total_sms % 2 == 0 && "active_total_sms must be even for MK_COMPUTE_KERNEL=2 cluster_dim=2"));
 
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.

@@ -6,6 +6,14 @@
 #define NUM_MAX_LOCAL_EXPERTS 1024
 #define NUM_BUFFER_ALIGNMENT_BYTES 128
 
+// Megakernel compute implementation selector:
+//   0 = WMMA, 1 = 1-CTA UMMA, 2 = 2-CTA UMMA
+#ifndef MK_COMPUTE_KERNEL
+#define MK_COMPUTE_KERNEL 2
+#endif
+static_assert(MK_COMPUTE_KERNEL >= 0 && MK_COMPUTE_KERNEL <= 2,
+              "MK_COMPUTE_KERNEL must be 0 (WMMA), 1 (1-CTA UMMA), or 2 (2-CTA UMMA)");
+
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
 

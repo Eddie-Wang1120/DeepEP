@@ -45,9 +45,10 @@ namespace megakernel {
 // Configuration
 // ============================================================================
 
-constexpr int COMPUTE_BATCH_SIZE = 256;  // Tokens per expert batch before triggering GEMM (S4.1: 128->256 for 2x1SM M_tile=256)
+constexpr int COMPUTE_BATCH_SIZE = 256;  // Tokens per expert batch before triggering GEMM; UMMA paths use fixed padded M=256.
 constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
-constexpr int COMPUTE_SCHEDULER_SMS = 2; // Scheduler region (S4.2: 2 so launched grid is even for cluster_dim=2; only #0 works, #1 idles)
+constexpr int COMPUTE_SCHEDULER_SMS = 2; // Scheduler region; only #0 does scheduler work today, #1 idles.
+constexpr int MK_COMPUTE_CLUSTER_DIM = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
@@ -1797,60 +1798,42 @@ __device__ void compute_worker(
         // must stay in phase. Declared here so it spans both if-blocks below.
         uint32_t umma_accum_iter = 0;
 
-        // MK_FORCE_WMMA: step-(1) isolation — force gate/up + down to the trusted
-        // WMMA path (device_gemm_swiglu_fused / device_gemm_bf16), bypassing the
-        // DeepGEMM UMMA path entirely. If end-to-end PASSes under this flag, the
-        // data preparation (input_buf gather / W layout / route_w) is correct and
-        // any precision bug is isolated to the UMMA outer layer (descriptors /
-        // tile schedule / cluster mapping).
-#ifdef MK_FORCE_WMMA
-        constexpr bool kUseUmmaGateUp = false;
-#else
-        constexpr bool kUseUmmaGateUp = true;
-#endif
-        // MK_UMMA_SINGLE_CLUSTER: step-(2) isolation — only ONE 2-CTA cluster
-        // (group_sm_idx 0/1) runs ALL tiles (num_clusters=1), reproducing the
-        // standalone PASS config inside the real megakernel. The other 15 clusters
-        // skip the UMMA work. This verifies the 2-CTA DeepGEMM gate/up is correct
-        // on real megakernel data, isolated from the 16-cluster tile sharing.
-        // down-proj falls back to WMMA in this mode (step 2 isolates gate/up only).
-#ifdef MK_UMMA_SINGLE_CLUSTER
-        constexpr bool kUmmaSingleCluster = true;
-#else
-        constexpr bool kUmmaSingleCluster = false;
-#endif
+        // MK_COMPUTE_KERNEL selects the compute implementation at compile time:
+        //   0 = WMMA gate/up + WMMA down
+        //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
+        //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
+        constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+        constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
+
         // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
         // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
         // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
         // reduce/signal all mask by batch_size, so padding never leaves the kernel.
         // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
-        if (kUseUmmaGateUp && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
-            const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
-            // step-2: single cluster (#0) does all tiles; step-3/default: 16 clusters share.
-            const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
-            const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
+        if (kUseUmmaCompute && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
-            if (cluster_active) {
-                // Concat gate/up fusion: ONE persistent GEMM GU = A @ Wgu^T -> [M,2I]
-                // (gate_buf..up_buf region), then a separate SwiGLU elementwise pass.
-                // Replaces the old two-pass gate+up (saves one full GEMM mainloop,
-                // the second A load, and the inter-pass fence+cluster-sync). The
-                // SwiGLU fold is done below by the whole group after cluster work.
-                // M is fixed at COMPUTE_BATCH_SIZE (padded) so tail batches share the
-                // exact descriptors/tile schedule as full batches.
-                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
-                umma::umma_gateup_concat_persistent(
-                    &in_atom.a,
-                    &state->compute_tma->wgateup[expert_id],
-                    &in_atom.gu_cd,
-                    COMPUTE_BATCH_SIZE, intermediate, hidden,
-                    cluster_in_group, num_clusters,
-                    cluster_smem, umma_accum_iter);
-                umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
-                umma_tmem_allocated = false;   // freed each task (4a)
-            }
+            // Concat gate/up fusion: ONE persistent GEMM GU = A @ Wgu^T -> [M,2I]
+            // (gate_buf..up_buf region), then a separate SwiGLU elementwise pass.
+            // Replaces the old two-pass gate+up (saves one full GEMM mainloop,
+            // the second A load, and the inter-pass fence+cluster-sync). The
+            // SwiGLU fold is done below by the whole group after cluster work.
+            // M is fixed at COMPUTE_BATCH_SIZE (padded) so tail batches share the
+            // exact descriptors/tile schedule as full batches.
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_gateup_concat_persistent(
+                &in_atom.a,
+                &state->compute_tma->wgateup[expert_id],
+                &in_atom.gu_cd,
+                COMPUTE_BATCH_SIZE, intermediate, hidden,
+                cluster_in_group, num_clusters,
+                cluster_smem, umma_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma_tmem_allocated = false;   // freed each task (4a)
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -1932,27 +1915,24 @@ __device__ void compute_worker(
         // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
         // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
         // are 0 and are masked off by the batch_size-bounded output/reduce below.
-        if (kUseUmmaGateUp &&
+        if (kUseUmmaCompute &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
-            const int cluster_in_group = group_sm_idx / 2;   // 0..15 2-CTA clusters
-            const int num_clusters = kUmmaSingleCluster ? 1 : (COMPUTE_GROUP_SIZE / 2);
-            const bool cluster_active = kUmmaSingleCluster ? (cluster_in_group == 0) : true;
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
-            if (cluster_active) {
-                uint32_t down_accum_iter = 0;
-                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
-                umma::umma_down_persistent(
-                    &in_atom.act_a,
-                    &state->compute_down_tma->wdown[expert_id],
-                    &in_atom.down_cd,
-                    COMPUTE_BATCH_SIZE, hidden, intermediate,
-                    cluster_in_group, num_clusters,
-                    cluster_smem, down_accum_iter);
-                umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
-                umma_tmem_allocated = false;
-            }
+            uint32_t down_accum_iter = 0;
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_down_persistent(
+                &in_atom.act_a,
+                &state->compute_down_tma->wdown[expert_id],
+                &in_atom.down_cd,
+                COMPUTE_BATCH_SIZE, hidden, intermediate,
+                cluster_in_group, num_clusters,
+                cluster_smem, down_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma_tmem_allocated = false;
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
@@ -3302,7 +3282,7 @@ static void launch_megakernel_v7_case(
         printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
     }
 
-    EP_HOST_ASSERT(total_sms % 2 == 0 && "S4.2: total_sms must be even for cluster_dim=2");
+    EP_HOST_ASSERT(MK_COMPUTE_CLUSTER_DIM == 1 || (total_sms % 2 == 0 && "total_sms must be even for MK_COMPUTE_KERNEL=2 cluster_dim=2"));
     EP_HOST_ASSERT(host_state.num_combine_sms % 2 == 0);
     EP_HOST_ASSERT(host_state.num_combine_sms > 0);
     EP_HOST_ASSERT(kThreads >= (RdmaCfg::kNumCombineForwarders + 1) * 32);
@@ -3318,7 +3298,7 @@ static void launch_megakernel_v7_case(
     attr[0].id = cudaLaunchAttributeCooperative;
     attr[0].val.cooperative = 1;
     attr[1].id = cudaLaunchAttributeClusterDimension;
-    attr[1].val.clusterDim.x = 2;
+    attr[1].val.clusterDim.x = MK_COMPUTE_CLUSTER_DIM;
     attr[1].val.clusterDim.y = 1;
     attr[1].val.clusterDim.z = 1;
     cfg.attrs = attr;
