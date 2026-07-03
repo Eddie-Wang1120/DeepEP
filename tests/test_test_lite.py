@@ -251,10 +251,11 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     return combined_x
 
 
-def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
+def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
                             num_experts, buffer, config, local_rank, rank):
     """
     MegaKernel v7: single persistent kernel (dispatch + compute + combine fused).
+    W_gateup is pairwise interleaved as [g0, u0, g1, u1, ...].
     Returns output [num_tokens, hidden] in bf16.
     """
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -269,7 +270,7 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
     result = buffer.megakernel_forward(
         x, topk_idx, topk_weights,
-        W_gate, W_up, W_down,
+        W_gateup, W_down,
         num_experts,
         num_dispatch_sms,
         num_dispatch_sms,  # num_combine_sms = num_dispatch_sms
@@ -350,6 +351,10 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     W_gate = torch.randn(experts_per_rank, intermediate, hidden, dtype=torch.bfloat16, device='cuda') * 0.02
     W_up = torch.randn(experts_per_rank, intermediate, hidden, dtype=torch.bfloat16, device='cuda') * 0.02
     W_down = torch.randn(experts_per_rank, hidden, intermediate, dtype=torch.bfloat16, device='cuda') * 0.02
+    W_gateup = torch.empty(experts_per_rank, 2 * intermediate, hidden, dtype=torch.bfloat16, device='cuda')
+    W_gateup[:, 0::2, :] = W_gate
+    W_gateup[:, 1::2, :] = W_up
+    W_gateup = W_gateup.contiguous()
 
     te_experts = None
     te_workspace = None
@@ -398,14 +403,14 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         if local_rank == 0:
             print(f'[Rank {rank}] MegaKernel warmup {w + 1}/{args.warmup}', flush=True)
         run_megakernel_pipeline(
-            x, topk_idx, topk_weights, W_gate, W_up, W_down,
+            x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, buffer, config, local_rank, rank)
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
 
     megakernel_output = run_megakernel_pipeline(
-        x, topk_idx, topk_weights, W_gate, W_up, W_down,
+        x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts, buffer, config, local_rank, rank)
 
     if args.skip_baseline:

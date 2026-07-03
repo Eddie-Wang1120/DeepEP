@@ -704,7 +704,7 @@ class Buffer:
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     def megakernel_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                           W_gate: torch.Tensor, W_up: torch.Tensor, W_down: torch.Tensor,
+                           W_gateup: torch.Tensor, W_down: torch.Tensor,
                            num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
                            total_sms: int = 148, dispatch_config: Optional[Config] = None,
                            combine_config: Optional[Config] = None) -> torch.Tensor:
@@ -715,8 +715,7 @@ class Buffer:
             x: input tokens [num_tokens, hidden], bf16
             topk_idx: expert assignments [num_tokens, topk], int32
             topk_weights: routing weights [num_tokens, topk], float32
-            W_gate: gate weights [num_local_experts, intermediate, hidden], bf16
-            W_up: up weights [num_local_experts, intermediate, hidden], bf16
+            W_gateup: pairwise interleaved gate/up weights [num_local_experts, 2 * intermediate, hidden], bf16
             W_down: down weights [num_local_experts, hidden, intermediate], bf16
             num_experts: total number of experts across all ranks
             num_dispatch_sms: number of SMs for dispatch phase (unused, reserved)
@@ -730,6 +729,6 @@ class Buffer:
         """
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
-        return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gate, W_up, W_down,
+        return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gateup, W_down,
                                               num_experts, num_dispatch_sms, num_combine_sms, total_sms,
                                               dispatch_config, combine_config)

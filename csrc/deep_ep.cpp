@@ -1951,8 +1951,7 @@ torch::Tensor Buffer::megakernel_forward(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
-    const torch::Tensor& W_gate,
-    const torch::Tensor& W_up,
+    const torch::Tensor& W_gateup,
     const torch::Tensor& W_down,
     int num_experts,
     int num_dispatch_sms,
@@ -1967,12 +1966,10 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
-    EP_HOST_ASSERT(W_gate.dim() == 3 and W_gate.is_contiguous());
-    EP_HOST_ASSERT(W_up.dim() == 3 and W_up.is_contiguous());
+    EP_HOST_ASSERT(W_gateup.dim() == 3 and W_gateup.is_contiguous());
     EP_HOST_ASSERT(W_down.dim() == 3 and W_down.is_contiguous());
     EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(W_gate.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(W_up.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(W_gateup.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
@@ -1983,17 +1980,17 @@ torch::Tensor Buffer::megakernel_forward(
     const int hidden_dim = x.size(1);
     const int hidden_int4 = hidden_dim * x.element_size() / sizeof(int4);
     const int num_topk = topk_idx.size(1);
-    const int intermediate_dim = W_gate.size(1);  // [num_local_experts, intermediate, hidden]
+    const int intermediate_dim = W_gateup.size(1) / 2;
     const int num_local_experts = num_experts / num_ranks;
 
     EP_HOST_ASSERT(topk_idx.size(0) == num_tokens);
     EP_HOST_ASSERT(topk_weights.size(0) == num_tokens);
     EP_HOST_ASSERT(topk_weights.size(1) == num_topk);
     EP_HOST_ASSERT((hidden_dim * x.element_size()) % sizeof(int4) == 0);
-    EP_HOST_ASSERT(W_gate.size(0) == num_local_experts and W_up.size(0) == num_local_experts and W_down.size(0) == num_local_experts);
-    EP_HOST_ASSERT(W_gate.size(2) == hidden_dim and W_up.size(2) == hidden_dim);
-    EP_HOST_ASSERT(W_gate.size(1) == W_up.size(1) and W_down.size(1) == hidden_dim);
-    EP_HOST_ASSERT(W_down.size(2) == intermediate_dim);
+    EP_HOST_ASSERT(W_gateup.size(0) == num_local_experts and W_down.size(0) == num_local_experts);
+    EP_HOST_ASSERT(W_gateup.size(1) % 2 == 0);
+    EP_HOST_ASSERT(W_gateup.size(2) == hidden_dim);
+    EP_HOST_ASSERT(W_down.size(1) == hidden_dim and W_down.size(2) == intermediate_dim);
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
@@ -2237,8 +2234,7 @@ torch::Tensor Buffer::megakernel_forward(
         combine_num_max_rdma_chunked_recv_tokens,
         combine_num_max_nvl_chunked_send_tokens,
         combine_num_max_nvl_chunked_recv_tokens,
-        reinterpret_cast<const __nv_bfloat16*>(W_gate.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(W_up.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(W_gateup.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
         num_dispatch_sms,
         num_forwarder_sms,
@@ -2342,8 +2338,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("x"),
              py::arg("topk_idx"),
              py::arg("topk_weights"),
-             py::arg("W_gate"),
-             py::arg("W_up"),
+             py::arg("W_gateup"),
              py::arg("W_down"),
              py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24,

@@ -11,10 +11,9 @@
 //
 // USAGE (in megakernel.cu, an nvcc TU):
 //   - MegaKernelState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
-//   - Host: build_compute_tma_atoms(host_struct, W_gate, W_up, E, I, d); upload.
-//   - Device (compute_worker stage1, per 2-CTA cluster): call
-//       umma_up_swiglu_tile(input_tma, wgate_tma, wup_tma, i_tile,
-//                           gate_out, act_out, route_w_ptr, ...);
+//   - Host: build_compute_tma_atoms(host_struct, W_gateup, E, I, d); upload.
+//   - Device (compute_worker stage1, per 1-CTA/2-CTA cluster): call
+//       umma_gateup_interleaved_persistent(...).
 
 #pragma once
 
@@ -285,20 +284,19 @@ struct MegaTileScheduler {
     }
 };
 
-// Per-expert raw TMA descriptors for W_gate and W_up ([I,d] = [N,K] K-major).
-// wgateup is the concat-weight descriptor [2I, d] = [Wg;Wu], for the single-GEMM
-// gate/up fusion (GU = A @ Wgu^T -> [M,2I], SwiGLU folded in a separate pass).
+// Per-expert raw TMA descriptors for interleaved gate/up weights.
+// wgateup is [2I,d] = [g0,u0,g1,u1,...], for the single-GEMM gate/up +
+// in-TMEM SwiGLU epilogue.
 struct ComputeTmaAtoms {
     int num_experts;
     int I;
     int d;
-    CUtensorMap wgate[kMaxLocalExperts];
-    CUtensorMap wup[kMaxLocalExperts];
-    CUtensorMap wgateup[kMaxLocalExperts];   // [2I, d] K-major concat(Wg,Wu)
+    CUtensorMap wgate[kMaxLocalExperts];      // legacy, unused by interleaved path
+    CUtensorMap wup[kMaxLocalExperts];        // legacy, unused by interleaved path
+    CUtensorMap wgateup[kMaxLocalExperts];    // [2I, d] K-major interleaved(g0,u0,...)
 };
 
 inline void build_compute_tma_atoms(ComputeTmaAtoms& atoms,
-                                     const __nv_bfloat16* W_gate, const __nv_bfloat16* W_up,
                                      const __nv_bfloat16* W_gateup,
                                      int E, int I, int d) {
     EP_HOST_ASSERT(E <= kMaxLocalExperts);
@@ -306,26 +304,21 @@ inline void build_compute_tma_atoms(ComputeTmaAtoms& atoms,
     atoms.I = I;
     atoms.d = d;
     for (int e = 0; e < E; ++e) {
-        const __nv_bfloat16* wg_e = W_gate + (size_t)e * I * d;
-        const __nv_bfloat16* wu_e = W_up   + (size_t)e * I * d;
-        atoms.wgate[e] = dg_make_b_desc(wg_e, I, d);
-        atoms.wup[e]   = dg_make_b_desc(wu_e, I, d);
-        // Concat weight [2I, d] per expert. W_gateup is laid out per expert as
-        // [Wg (I,d) ; Wu (I,d)] contiguous, so stride between experts is 2*I*d.
         const __nv_bfloat16* wgu_e = W_gateup + (size_t)e * (2 * I) * d;
         atoms.wgateup[e] = dg_make_b_desc(wgu_e, 2 * I, d);
     }
 }
 
-// Per-group A(input_buf [M,d]) and CD(act/gate workspace [M,I]) descriptors.
-// CD descriptors target the gate_buf and up_buf regions of gemm_workspace.
+// Per-group A(input_buf [M,d]) and workspace descriptors.
+// act_cd is the direct output of the interleaved SwiGLU epilogue; gu_cd is kept
+// for legacy tile helpers and reserved scratch layout compatibility.
 struct InputTmaAtom_t {
     CUtensorMap a;        // input_buf [M, d]   K-major A
     CUtensorMap gate_cd;  // gate_buf  [M, I]   row-major CD
     CUtensorMap act_cd;   // up_buf    [M, I]   row-major CD
     CUtensorMap act_a;    // up_buf    [M, I]   K-major A (down-proj A operand)
     CUtensorMap down_cd;  // down_buf  [M, hidden] row-major CD (down-proj output)
-    CUtensorMap gu_cd;    // gate_buf  [M, 2I]  row-major CD (concat GU output = gate_buf..up_buf)
+    CUtensorMap gu_cd;    // gate_buf  [M, 2I]  row-major CD (reserved GU scratch / legacy helpers)
 };
 
 inline InputTmaAtom_t make_input_tma_atom(const __nv_bfloat16* input_buf_ptr, int M, int d) {
@@ -351,9 +344,8 @@ inline InputTmaAtom_t make_input_group_atoms(const __nv_bfloat16* input_buf_ptr,
     // down-proj: A = act_buf [M, I] (K=I), CD = down_buf [M, hidden].
     out.act_a   = dg_make_a_desc(act_buf_ptr, M, I);
     out.down_cd = dg_make_cd_desc(down_buf_ptr, M, hidden);
-    // Concat gate/up GEMM output GU = [M, 2I], written to a dedicated GU region
-    // (gate_buf_ptr is the GU base). cols [0,I)=gate, [I,2I)=up. A later SwiGLU
-    // pass folds this into act_buf (a separate region, no aliasing).
+    // Reserved GU scratch descriptor for legacy helpers; the interleaved path stores
+    // act directly through act_cd and does not write this region.
     out.gu_cd   = dg_make_cd_desc(gate_buf_ptr, M, 2 * I);
     return out;
 }
@@ -494,7 +486,7 @@ __device__ void dg_dealloc_tmem(char* cluster_smem) {
     __syncthreads();
 }
 
-template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1>
+template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1, bool kFuseSwiGLUInterleaved = false>
 __device__ void dg_gemm_tile(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
     int m_block, int n_block,
@@ -768,9 +760,18 @@ __device__ void dg_gemm_tile(
         tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
         ptx::tcgen05_after_thread_sync();
         const auto tmem_base_addr = accum_stage_idx * UMMA_N;
-        MK_DG_DBG("EPI[%d]: store begin fuse=%d", (int)epilogue_warp_idx, (int)kFuseSwiGLU);
+        MK_DG_DBG("EPI[%d]: store begin fuse=%d interleaved=%d", (int)epilogue_warp_idx,
+                  (int)kFuseSwiGLU, (int)kFuseSwiGLUInterleaved);
 
-        if constexpr (kFuseSwiGLU) {
+        if constexpr (kFuseSwiGLUInterleaved) {
+            deep_gemm::sm100_store_swiglu_interleaved<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                GemmType::Normal, false,
+                cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
+            (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
+             epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
+             tensor_map_cd, route_ptr);
+        } else if constexpr (kFuseSwiGLU) {
             deep_gemm::sm100_store_swiglu_from_gate<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                 kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
                 GemmType::Normal, false,
@@ -827,7 +828,7 @@ __device__ void dg_gemm_tile(
 //                gate->up passes (caller threads it through both calls).
 //   A closing block_or_cluster_sync() ensures all warps finish before return.
 // ===========================================================================
-template <bool kFuseSwiGLU, uint32_t kNumMulticast>
+template <bool kFuseSwiGLU, uint32_t kNumMulticast, bool kFuseSwiGLUInterleaved = false>
 __device__ void dg_gemm_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -1006,7 +1007,14 @@ __device__ void dg_gemm_persistent(
             ptx::tcgen05_after_thread_sync();
             const auto tmem_base_addr = accum_stage_idx * UMMA_N;
 
-            if constexpr (kFuseSwiGLU) {
+            if constexpr (kFuseSwiGLUInterleaved) {
+                deep_gemm::sm100_store_swiglu_interleaved<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    GemmType::Normal, false, cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
+                (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
+                 epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
+                 tensor_map_cd, route_ptr);
+            } else if constexpr (kFuseSwiGLU) {
                 deep_gemm::sm100_store_swiglu_from_gate<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
                     GemmType::Normal, false, cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
@@ -1139,30 +1147,22 @@ __device__ void umma_up_swiglu_persistent(
 }
 
 // ===========================================================================
-// umma_gateup_concat_persistent — SINGLE fused gate/up GEMM via concat weights.
-// GU = A @ Wgu^T -> [M, 2I] (cols [0,I)=gate, [I,2I)=up), written to gate_buf..
-// up_buf (contiguous). No SwiGLU here — a separate elementwise pass folds it.
-//
-// This replaces the two-pass umma_up_swiglu_persistent: one persistent GEMM with
-// N=2I instead of two GEMMs with N=I. Saves a full mainloop pass, the second A
-// TMA load, and the inter-pass fence+cluster-sync. dg_gemm_persistent is used
-// UNCHANGED (kFuseSwiGLU=false); the concat is purely in the descriptor shapes.
-//
-//   desc_a      : input_buf A [M, d] K-major
-//   desc_wgateup: concat weight Wgu [2I, d] K-major (in.wgateup for this expert)
-//   desc_gu_cd  : GU output [M, 2I] row-major CD (in.gu_cd -> gate_buf region)
+// umma_gateup_interleaved_persistent — SINGLE gate/up GEMM + in-TMEM SwiGLU.
+// Wgu rows are element-interleaved [g0,u0,g1,u1,...]. The GEMM accumulates
+// GU[M,2I] in TMEM, then the epilogue collapses every (gate,up) pair to act[M,I]
+// and stores directly to desc_act_cd. No GU round-trip through GMEM is needed.
 // ===========================================================================
-__device__ void umma_gateup_concat_persistent(
-    const CUtensorMap* desc_a, const CUtensorMap* desc_wgateup, const CUtensorMap* desc_gu_cd,
-    int M, int I, int d,
+__device__ void umma_gateup_interleaved_persistent(
+    const CUtensorMap* desc_a, const CUtensorMap* desc_wgateup, const CUtensorMap* desc_act_cd,
+    const float* route_w, int M, int I, int d,
     int cluster_idx, int num_clusters,
     char* cluster_smem, uint32_t& accum_iter) {
 
-    dg_gemm_persistent<false, kDgRunMulticast>(
-        desc_a, desc_wgateup, desc_gu_cd,
+    dg_gemm_persistent<false, kDgRunMulticast, true>(
+        desc_a, desc_wgateup, desc_act_cd,
         (uint32_t)M, (uint32_t)(2 * I), (uint32_t)d,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
-        nullptr, nullptr, 0);
+        nullptr, route_w, 0);
 }
 
 

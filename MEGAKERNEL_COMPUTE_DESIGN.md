@@ -71,9 +71,7 @@ active    = 145 SM
 每个 batch 执行完整 MoE FFN：
 
 ```text
-W_gate GEMM
-W_up GEMM
-SwiGLU
+W_gateup GEMM + interleaved SwiGLU epilogue
 W_down GEMM
 ```
 
@@ -81,8 +79,8 @@ W_down GEMM
 
 ```text
 A: [128, hidden]
-W_gate/W_up: [intermediate, hidden]
-W_down: [hidden, intermediate]
+W_gateup: [2 * intermediate, hidden]  # rows [g0,u0,g1,u1,...]
+W_down:   [hidden, intermediate]
 hidden = 4096
 intermediate = 4096
 dtype = BF16
@@ -95,12 +93,14 @@ dtype = BF16
 现有 `device_gemm_bf16`（megakernel.cu:251）语义是 `C = A @ B^T`：A 取 `row_major`，B 取 `col_major`，即 `C[M,N] = A[M,K] @ B[N,K]^T`。三次 GEMM 的映射：
 
 ```text
-gate = A @ W_gate^T
-  A      : [M, hidden]              (row_major)
-  W_gate : [intermediate, hidden]   (B = [N=intermediate, K=hidden], col_major)
-  -> gate: [M, intermediate]
+GU = A @ W_gateup^T
+  A        : [M, hidden]                  (row_major)
+  W_gateup : [2 * intermediate, hidden]   (B = [N=2I, K=hidden], col_major)
+             row 2j=gate[j], row 2j+1=up[j]
+  -> GU    : [M, 2 * intermediate]        (TMEM only in UMMA path)
 
-up   = A @ W_up^T   （同 gate 形状）
+act = silu(GU[:, 0::2]) * GU[:, 1::2] * route_w
+  -> act   : [M, intermediate]
 
 down = act @ W_down^T
   act    : [M, intermediate]        (row_major)
@@ -108,7 +108,7 @@ down = act @ W_down^T
   -> down: [M, hidden]
 ```
 
-三次都满足 `C=A@B^T` 的 col_major B 语义，可直接复用 `device_gemm_bf16`。约束：
+gate/up 和 down 都满足 `C=A@B^T` 的 col_major B 语义；gate/up 统一通过 interleaved `W_gateup` 表达，不再在 megakernel API / state 中保留分离的 `W_gate/W_up`。约束：
 
 ```text
 K 维（hidden / intermediate）必须是 WMMA_K(16) 的倍数；
@@ -419,11 +419,11 @@ group_phase[consumer_id]
 每个 consumer group 需要中间 scratch：
 
 ```text
-gate_scratch[consumer, 128, intermediate]
-up_scratch[consumer, 128, intermediate]
+gu_scratch[consumer, 128, 2 * intermediate]  # reserved legacy scratch, UMMA interleaved path no longer materializes GU
+act_scratch[consumer, 128, intermediate]
 ```
 
-SwiGLU 后可覆盖 `up_scratch` 为 activation，供 `W_down` 使用。
+UMMA interleaved 路径直接在 epilogue 中把 TMEM 内的 `[gate,up]` 折成 `act_scratch`，供 `W_down` 使用；WMMA fallback 也从同一份 `W_gateup` 读 gate/up，仅作为 fallback materialize 临时值。
 
 对于 3 个 consumer group，BF16 scratch 开销大致为数 MB，第一版可以接受。
 
@@ -450,14 +450,14 @@ combine 用 per-token-ready 等待；
 per-logical-channel tail flush；
 更细粒度 CTA-level work queue；
 更高效的多 local expert reduce；
-W_gate/W_up/SwiGLU/W_down fusion；
+W_gateup/SwiGLU epilogue/W_down fusion；
 consumer group 内更高效 barrier；
 减少 scratch buffer 和全局内存往返。
 ```
 
 ### 当前 compute_worker perf 观察：256x2048x3072
 
-> 记录时间：2026-07-01。本文档前半部分仍保留了一些早期设计参数（例如 128-token batch、1 scheduler SM、固定 800 threads/block）。当前代码路径以 `megakernel.cu` 为准：`COMPUTE_BATCH_SIZE=256`，scheduler 已支持多 lane，gate/up 走 concat UMMA，down 走 UMMA。RDMA rank 数不再写死，host 端按原始 DeepEP 方式用 `num_ranks / NUM_MAX_NVL_PEERS` 计算，并通过 `SWITCH_RDMA_RANKS` 选择 `moe_megakernel_v7<kNumRDMARanks>` specialization；block threads 由 `MegaKernelRdmaConfig<kNumRDMARanks>` 推导。
+> 记录时间：2026-07-01；2026-07-03 更新 SwiGLU 路径。本文档前半部分仍保留了一些早期设计参数（例如 128-token batch、1 scheduler SM、固定 800 threads/block）。当前代码路径以 `megakernel.cu` 为准：`COMPUTE_BATCH_SIZE=256`，scheduler 已支持多 lane，gate/up 走 interleaved `W_gateup` + fused SwiGLU epilogue，down 走 UMMA。RDMA rank 数不再写死，host 端按原始 DeepEP 方式用 `num_ranks / NUM_MAX_NVL_PEERS` 计算，并通过 `SWITCH_RDMA_RANKS` 选择 `moe_megakernel_v7<kNumRDMARanks>` specialization；block threads 由 `MegaKernelRdmaConfig<kNumRDMARanks>` 推导。
 
 在 `batch_size=256, hidden=2048, intermediate=3072` 的 full-batch case 下，放开 `hidden_dim == intermediate_dim` 限制后，compute 已经回到 UMMA 快路径。代表性 perf：
 
@@ -1212,3 +1212,153 @@ gmem_ptr 当场算 → 天然支持 gather。DeepEP dispatch 末尾存 hidden_st
 
 **下一步（未完成）**：standalone 扩到 2-CTA（`dg_gemm_tile<false,2>` + cluster launch）验证 2-CTA gate 是否仍与 WMMA 一致。若 2-CTA 也 PASS，则 megakernel 精度 bug 不在 GEMM 算法，而在数据准备（A buffer 填充 / W layout / route_w 收集）或 SwiGLU / down-proj。
 - **待补 TODO**：做 1CTA vs 2CTA 的**控制变量 microbench**（M=256 同条件，仅 atom/cluster 不同，ncu 看 DRAM bytes 验证权重流量减半），量化 2CTA 真实增量——作为"是否值得为 2CTA 开 cluster"的决策依据。
+
+### I.9.12 up/gate gather 路径对照：QuACK / DeepGEMM / int4 pre-gather
+
+本节记录 2026-07-03 对 SonicMoE/QuACK gather4 结论的复核。起点问题是：SonicMoE 博客认为 up/gate 最优应为 **1-CTA + gather4**，down-proj 用 **2-CTA**；但本仓 `compute_ref/bench_gateup_gather.cu` 早期实测里，`1-CTA gather4` 明显慢于 `int4 gather + 2-CTA`。后续确认这不是单纯的 1CTA/2CTA GEMM 差距，也不是 multicast 本身解释得了，关键在 **A 的 gather/load 路径不同**。
+
+#### 对照对象先澄清
+
+当前容易混淆的三个 baseline：
+
+```text
+QuACK TMA gather4:
+  scattered GMEM A -> TMA gather4 -> SMEM -> UMMA
+
+QuACK non-gather4 / cp.async gather:
+  scattered GMEM A -> per-thread indirect cute.copy/cp.async -> SMEM -> UMMA
+
+DeepGEMM Config A / int4 pre-gather:
+  scattered GMEM A -> int4 gather kernel -> contiguous GMEM input buffer -> ordinary TMA -> SMEM -> UMMA
+```
+
+因此 QuACK 的 `--gather_A` 但不加 `--use_tma_gather` **不是**本仓 Config A 那种 `int4 gather` 预聚合；它仍是在 GEMM kernel 内直接从 scattered GMEM 按 row index 搬到 SMEM，只是不用 TMA gather4，而走 per-thread/cp.async 风格的间接 copy。
+
+#### QuACK 环境与实测结果
+
+QuACK 当前 `pyproject.toml` pin 的 CuTe DSL 是：
+
+```text
+nvidia-cutlass-dsl==4.6.0.dev0
+```
+
+主环境原本是 `4.4.1`，直接跑 QuACK 会遇到 `ReductionKind`、`OperandMajorMode`、`iket`、pointer API 等版本不匹配。最终处理方式：
+
+```text
+main env:  回滚到 nvidia-cutlass-dsl==4.4.1
+mega_env:  安装 nvidia-cutlass-dsl==4.6.0.dev0，用于 QuACK benchmark
+```
+
+QuACK benchmark 命令（B30Z，未固定 32 SM）：
+
+```bash
+/root/paddlejob/share-storage/gpfs/system-public/wangjinheng/harness_dist_research/mega_env/bin/python \
+  benchmarks/benchmark_gemm.py \
+  --mnkl 256,6144,2048,1 \
+  --tile_shape_mnk 128,128,64 \
+  --cluster_shape_mnk 1,1,1 \
+  --gather_A --use_tma_gather --varlen_m --persistent \
+  --warmup_iterations 5 --iterations 10 \
+  --ab_dtype BFloat16 --d_dtype BFloat16 \
+  --skip_ref_check
+```
+
+结果：
+
+```text
+QuACK 1-CTA TMA gather4:      0.017 ms, 371.6 TFLOP/s, 1693 GB/s, PASS
+```
+
+同配置去掉 `--use_tma_gather`：
+
+```bash
+/root/paddlejob/share-storage/gpfs/system-public/wangjinheng/harness_dist_research/mega_env/bin/python \
+  benchmarks/benchmark_gemm.py \
+  --mnkl 256,6144,2048,1 \
+  --tile_shape_mnk 128,128,64 \
+  --cluster_shape_mnk 1,1,1 \
+  --gather_A --varlen_m --persistent \
+  --warmup_iterations 5 --iterations 10 \
+  --ab_dtype BFloat16 --d_dtype BFloat16 \
+  --skip_ref_check
+```
+
+结果：
+
+```text
+QuACK 1-CTA cp.async gather:  0.019 ms, 344.3 TFLOP/s, 1569 GB/s, PASS
+TMA gather4 / cp.async gather: ~1.08x
+```
+
+注意：这里已测的是 `cluster_shape_mnk=1,1,1`，即 **1-CTA QuACK gather4 vs 1-CTA QuACK cp.async gather**。尚未实测 QuACK 的 2-CTA non-gather/cp.async-gather 配置，不能把上述 `344.3 TFLOP/s` 写成 2-CTA 结果。
+
+#### QuACK 代码路径结论
+
+QuACK `gemm_sm100.py` 中 A 的 load 分支为：
+
+```python
+if const_expr(self.use_tma_gather):
+    copy_A = copy_utils.gather_m_get_tma_copy_fn(...)
+else:
+    tiled_copy_A = self._make_gmem_tiled_copy_A(...)
+    thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
+    copy_A = copy_utils.gather_m_get_copy_fn(...)
+```
+
+`gather_m_get_tma_copy_fn` 会先把 row indices 从 SMEM preload 到 RMEM，然后每 4 行发一条 TMA gather4：
+
+```python
+tSR_rAIdx = load_s2r(tSR_sAIdx)
+row_indices = [tSR_rAIdx[v, m] for v in range(4)]
+with cute.arch.elect_one():
+    tma_gather4_load_fn(smem_ptr, tma_bar_ptr, col_idx, row_indices)
+```
+
+底层 PTX 形态是：
+
+```ptx
+cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{1|2}
+```
+
+`gather_m_get_copy_fn` 则是 per-thread 间接 copy：每个线程从 `gsAIdx[row_idx]` 取源行号，再把对应 GMEM row slice 通过 `cute.copy(thr_copy_A, ...)` 搬到 SMEM。它不生成中间 contiguous GMEM buffer。
+
+#### DeepGEMM microkernel gather4 调试结论
+
+`compute_ref/bench_gateup_gather.cu` 对比的是：
+
+```text
+Config A: int4 gather kernel -> dInbuf contiguous -> DeepGEMM 2-CTA ordinary GEMM
+Config B: scattered A + row_idx -> DeepGEMM 1-CTA TMA gather4 GEMM
+```
+
+早期 Config B 很慢的主因不是 1-CTA 纯 GEMM 算力不足。我们已用纯 GEMM 控制变量确认 1-CTA/2-CTA 本身在小 shape 下可接近；真正瓶颈在 gather4 发射过于串行，集中在单个 load warp。后续对 `compute_ref/sm100_bf16_gemm_dg_gather.cuh` 做了两类关键修正：
+
+1. gather4 PTX 与 QuACK 对齐为 `shared::cta` + `cta_group::{1|2}` 形态，去掉不必要的 cluster scope/cache-hint 变体。
+2. 保留 DeepGEMM 原始 warp role，不把 MMA/epilogue 职责打乱；只让原本 idle 或 stall 的 warp 协助发射 gather4，包括 warp2/warp3/高编号 roleless warps，warp1 MMA 与 epilogue warps 4-7 不参与。
+
+实测提升：
+
+```text
+M=256,  SMS=32:   1-CTA gather4 约 65.6 -> 180.9 TFLOP/s
+M=8192, SMS=132:  1-CTA gather4 约 284.7 -> 901.9 TFLOP/s
+```
+
+这说明 DeepGEMM gather4 原实现确实没把 gather4 issue 并行度打满；多 warp 发射后大幅改善。但 `int4 gather + 2CTA` 在现有 harness 中仍然更高，原因包括：Config A 的 A 已经是 contiguous GMEM，ordinary TMA load 更友好；同时 2CTA 有 B-side multicast/M_tile=256 的优势。这个对比不是 QuACK `TMA gather4 vs cp.async gather` 那种同 kernel 内 copy-path 对比。
+
+#### cp.async gather vs int4 pre-gather 的预期
+
+两者快慢取决于形状和是否复用 gathered A：
+
+- `cp.async gather`：省掉 pre-gather kernel 和中间 GMEM 写回，L2 局部性更接近 SonicMoE/QuACK；但每个 GEMM tile 内线程要做间接地址计算，A 的 scattered load 合并度通常不如 contiguous TMA。
+- `int4 pre-gather`：多一个 kernel 和一次 GMEM materialization，但后续 GEMM 看到的是 contiguous A，可以走普通 TMA，主 GEMM 更干净；如果同一 gathered A 被 gate/up/down 或多个 tile 复用，预聚合成本更容易摊销。
+- 对本仓当前 `bench_gateup_gather.cu` 的 Config A，`int4 pre-gather + 2CTA` 是很强 baseline，不能用 QuACK non-gather4 的 1-CTA cp.async 结果直接替代。
+
+#### 对 megakernel/microkernel 的设计影响
+
+1. **不要把 QuACK non-gather4 等同于本仓 int4 gather**。QuACK non-gather4 是 in-kernel scattered GMEM -> SMEM；本仓 Config A 是 pre-kernel scattered -> contiguous GMEM，再 ordinary GEMM。
+2. **TMA gather4 仍是更适合长期 in-kernel gather fusion 的路径**。QuACK 同配置下 TMA gather4 比 cp.async gather 快约 8%，且代码结构与 SonicMoE 结论一致。
+3. **当前 DeepGEMM gather4 的剩余差距要按 load 路径分析，不应再归因到纯 1CTA GEMM 或 multicast 单因素**。后续 ncu 应重点看 TMA issue、barrier stall、A/B bytes、L2 hit、MMA active。
+4. **在当前 DeepGEMM microkernel 上加 cp.async gather 可做，但不是小 patch**：需要新增独立 A load path、per-thread indirect GMEM layout、SMEM swizzle 写入、cp.async pipeline/barrier，并与现有 TMA B load + UMMA mainloop 对齐。建议只作为 compile-time experimental path，不要混进当前 TMA gather4 修复。
+5. **后续若要复核 SonicMoE 的精确 claim**，需要补两个控制变量实验：
+   - QuACK 固定 SM 数（例如 32 SM）下的 1-CTA gather4 / cp.async gather。
+   - QuACK 或 DeepGEMM 中同 shape 的 2-CTA non-gather/cp.async-gather 配置，避免把 1-CTA QuACK non-gather 误当成 2-CTA 数据。
