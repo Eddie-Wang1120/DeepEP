@@ -65,7 +65,7 @@ active    = 145 SM
 主路径 batch size：
 
 ```text
-128 tokens / expert / batch
+256 tokens / expert / batch
 ```
 
 每个 batch 执行完整 MoE FFN：
@@ -78,7 +78,7 @@ W_down GEMM
 典型形状：
 
 ```text
-A: [128, hidden]
+A: [256, hidden]
 W_gateup: [2 * intermediate, hidden]  # rows [g0,u0,g1,u1,...]
 W_down:   [hidden, intermediate]
 hidden = 4096
@@ -88,7 +88,7 @@ dtype = BF16
 
 ### GEMM 形状与转置约定（必须与现有 device_gemm_bf16 一致）
 
-当前代码按 `COMPUTE_BATCH_SIZE=128` 聚合/flush work unit，并用 `M=batch_size` 的 batched GEMM 执行 FFN。full batch 为 `M=128`；tail batch 复用同一路径，workspace 固定预留 128 行并将 `[batch_size,128)` 行清零，避免 WMMA `load_matrix_sync` 在 M 维 tile 读取时越界。
+当前代码按 `COMPUTE_BATCH_SIZE=256` 聚合/flush work unit，并用 `M=batch_size` 的 batched GEMM 执行 FFN。full batch 为 `M=256`；tail batch 复用同一路径，workspace 固定预留 256 行并将 `[batch_size,256)` 行清零，避免 WMMA/UMMA 在 M 维 tile 读取时越界。
 
 现有 `device_gemm_bf16`（megakernel.cu:251）语义是 `C = A @ B^T`：A 取 `row_major`，B 取 `col_major`，即 `C[M,N] = A[M,K] @ B[N,K]^T`。三次 GEMM 的映射：
 
@@ -398,8 +398,7 @@ NUM_TIMEOUT_CYCLES >= 整个 dispatch + 最慢 expert compute 的总时长上界
 一个 32-SM consumer group 处理一个 batch 时，阶段之间需要同步：
 
 ```text
-W_gate/W_up GEMM 完成
--> SwiGLU
+W_gateup GEMM + interleaved SwiGLU epilogue 完成
 -> W_down GEMM
 -> 写回 combine_input
 -> publish ready
@@ -419,8 +418,8 @@ group_phase[consumer_id]
 每个 consumer group 需要中间 scratch：
 
 ```text
-gu_scratch[consumer, 128, 2 * intermediate]  # reserved legacy scratch, UMMA interleaved path no longer materializes GU
-act_scratch[consumer, 128, intermediate]
+gu_scratch[consumer, 256, 2 * intermediate]  # reserved legacy scratch, UMMA interleaved path no longer materializes GU
+act_scratch[consumer, 256, intermediate]
 ```
 
 UMMA interleaved 路径直接在 epilogue 中把 TMEM 内的 `[gate,up]` 折成 `act_scratch`，供 `W_down` 使用；WMMA fallback 也从同一份 `W_gateup` 读 gate/up，仅作为 fallback materialize 临时值。
@@ -491,52 +490,76 @@ p6b_multi_expert_rows   0
 3. **已实现：ready publish 并行化**：`combine_token_ready` 的 release store 从原来仅 `group_sm_idx==0` 负责最多 256 个 row，改为基于 group-shared `compute_group_is_last`，由整个 group 按 `group_thread_id/group_num_threads` 分摊。每个 row 的 last-flag 仍由 SM0 的 atomicAdd 权威决定，语义不变，目标是降低 `p6d_publish_us`。
 4. **output/fence 路径谨慎优化**：`p5a_out_compute_us=6.9us`，`p5b_out_barrier_us=15.3us`，说明输出写本身不重，重在 group barrier/fence。这里涉及“所有 writer 的 output 对 combine 可见”正确性，不能简单改成单线程 fence；需要单独验证内存可见性后再动。
 5. **input gather 是长期结构性优化**：`p2_input_load_us=17.9us` 来自从 compact `combine_input[token, hidden]` gather 到 contiguous `input_buf`。长期可以让 dispatch 直接写 expert-local contiguous input buffer，减少 compute_worker 这次搬运，但会触及 dispatch/metadata buffer ownership，改动面大于 signal 局部优化。
-6. **接通 UMMA 内部 perf**：当前 `up_setup_us/up_tma_wait_us/up_mma_wait_us/...` 和 down 对应字段全为 0，说明 `umma::UmmaPerf` 尚未接到 `umma_gateup_concat_persistent/umma_down_persistent` 内部。若后续继续优化 GEMM 本体，应先把这组计时真正填上。
+6. **接通 UMMA 内部 perf**：当前 `up_setup_us/up_tma_wait_us/up_mma_wait_us/...` 和 down 对应字段全为 0，说明 `umma::UmmaPerf` 尚未接到 `umma_gateup_interleaved_persistent/umma_down_persistent` 内部。若后续继续优化 GEMM 本体，应先把这组计时真正填上。
 
 短期建议先做前两项：跳过 `p6b_multi_expert_rows==0` 的 finalize/fence，以及 full-batch 跳过无效 padding barrier。这两项改动局部、风险低，预计能把单 task 从约 `188us` 压到 `160us` 附近。
 
-### interleaved gate/up + epilogue 内融合 SwiGLU（已在 microkernel 验证，学 quack）
+### interleaved gate/up + epilogue 内融合 SwiGLU（已落 megakernel，学 quack）
 
-**背景 / 当前默认路径的问题。**
-当前 megakernel 默认走 `umma_gateup_concat_persistent`：gate/up 合成单趟 concat
-GEMM（Wgu=[Wg;Wu] 形状 [2I,d]，N=2I），输出 GU=[M,2I] 到 GMEM，再由一个独立
-elementwise pass 做 SwiGLU（`act=silu(GU[:, :I])*GU[:, I:]*route`）。这是
-**concat layout**：gate[i] 与 up[i] 在输出里相隔 I 列，落在不同 epilogue N-tile，
-所以 SwiGLU 不能在 GEMM epilogue 里做，只能事后独立跑，多一次 GU≈[M,2I] 的
-GMEM 写回 + 读回 + 一次独立 kernel 启动/同步。
+**背景 / concat 路径的问题。**
+旧 megakernel UMMA gate/up 走 concat layout：单趟 GEMM 计算 `GU=[gate|up]`，输出
+`GU[M,2I]` 到 GMEM，再由独立 elementwise pass 做
+`act=silu(GU[:, :I])*GU[:, I:]*route`。concat layout 里 gate[i] 与 up[i] 在输出中相隔
+`I` 列，通常落在不同 epilogue N-tile，所以 SwiGLU 不能直接在 GEMM epilogue 中配对，
+会多一次 `GU[M,2I]` 写回、读回和一次 task 内同步。
 
-**quack 的思路（本次学习并落地）。**
+**quack 的思路。**
 quack `GemmGatedMixin.epi_visit_subtile`（`quack/quack/gemm_act.py:247`）能纯寄存器
-融合 SwiGLU，前提是**权重按 N 方向交错**（`layout_utils.py:concat_to_interleave`）：
-把 `[g0..g_{I-1}|u0..u_{I-1}]` 重排成 `[g0,u0,g1,u1,...]`。交错后 gate/up 在累加器里
-相邻，epilogue `flat_divide(2)` → 偶数位=gate、奇数位=up，寄存器内算 `silu(g)*u`，
-输出宽度减半，gate/up 全程不落 GMEM。
+融合 SwiGLU，前提是权重按 N 方向交错：把 `[g0..g_{I-1}|u0..u_{I-1}]` 重排成
+`[g0,u0,g1,u1,...]`。交错后 gate/up 在累加器里相邻，epilogue `flat_divide(2)` 后
+偶数位=gate、奇数位=up，寄存器/TMEM 内计算 `silu(g)*u*route`，输出宽度减半，
+gate/up 全程不落 GMEM。
 
-**我们的实现（element 交错 gran=1，最贴近 quack）。**
-保持 DeepGEMM GEMM 主循环 / tile scheduler / 2-CTA multicast / TMEM pipeline 完全不动，
-只改权重布局 + 新增一个融合 store epilogue：
+**当前落地实现（element 交错 gran=1）。**
+megakernel 现在统一消费 pairwise interleaved `W_gateup`，不再在 megakernel API / state 中保留
+分离的 `W_gate/W_up`：
 
-1. host 侧权重 **element 交错**：`Wgu[2j]=Wg[j]`, `Wgu[2j+1]=Wu[j]`（形状仍 [2I,d]）；
-   于是 GEMM 输出 tile 的 TMEM 第 `2j` 列=gate_j、`2j+1` 列=up_j。
-2. gateup GEMM 仍按 N=2I 计算，B 描述符不变。
-3. 新增 `sm100_store_swiglu_interleaved`（`compute_ref/sm100_bf16_gemm_dg_copy.cuh`）：
-   每个输出 bank group 做两次 `SM100_TMEM_LOAD_32dp32b8x`（拿到 `[g,u,g,u,...]`），
-   寄存器内算 `act=silu(gate)*up*route`，输出**半宽** act，走标准 128B-swizzle bf16
-   store（等价 `sm100_store_cd`），act 列 = `n_idx/2`。
-4. `sm100_bf16_gemm_impl` 加模板开关 `kFuseSwiGLUInterleaved`，在 epilogue 分发处接上。
-5. 落 megakernel 时删除 GU[M,2I] 的 GMEM 落地和独立 SwiGLU pass，只保留 act[M,I]。
+```text
+W_gateup: [num_local_experts, 2 * intermediate, hidden]
+row 2j   = W_gate[j]
+row 2j+1 = W_up[j]
+```
 
-> 备注：早先文档设想的是 **64-block interleave**（对齐 `STORE_BLOCK_N=64`，改动最小）。
-> 实测下来 element 交错（gran=1）与 quack 完全一致、最易验证，且 store 侧仅需两次 TMEM
-> load 即可配对，因此最终采用 gran=1。64-block 方案作为等价备选保留。
+Python 测试侧负责生成最终布局，和 `compute_ref/umma_swiglu_interleave_dg.cu` 一致：
 
-**1-CTA 与 2-CTA 都适配（已验证）。**
-交错是沿 **N** 方向、element 粒度；SM100 的 2-CTA(2x1SM) 拆的是 **M**（或 mcast-on-B 的
-N-tile），二者正交——每个 CTA 本地仍持有完整的交错 N-tile，`flat_divide` 配对不被劈开。
-融合逻辑写在 per-CTA 的寄存器 epilogue，与 MMA 用几个 CTA 无关。microkernel harness
-`compute_ref/umma_swiglu_interleave_dg.cu` 同一份代码分别以 cluster dim 1/2 启动，
-对拍 WMMA 融合 + FP32 CPU 参考：多形状（M=256/512，K/I=4096/2048/1024）下 1-CTA/2-CTA
-相对 FP32 误差均 ~3.3e-3（与 WMMA 同量级），相对 WMMA ~5e-9，全部 PASS。
+```python
+W_gateup[:, 0::2, :] = W_gate
+W_gateup[:, 1::2, :] = W_up
+W_gateup = W_gateup.contiguous()
+```
+
+C++/CUDA 侧不再临时 `cudaMemcpy2D` 重排权重，`ComputeTmaAtoms::wgateup[e]` 直接指向这份
+`[2I,d]` 权重。UMMA gate/up GEMM 仍按 `N=2I` 计算，B descriptor 不需要特殊 stride；
+新增/复用 `sm100_store_swiglu_interleaved`（`compute_ref/sm100_bf16_gemm_dg_copy.cuh`）在
+store epilogue 中从 TMEM 读取相邻 `[gate,up]`，计算 `act=silu(gate)*up*route`，只写
+半宽 `act[M,I]` 到 `act_cd`，随后作为 down-proj 的 A。
+
+实现入口：
+
+- `megakernel_compute_umma.cuh`：`umma_gateup_interleaved_persistent(...)` 调
+  `dg_gemm_persistent<false, kDgRunMulticast, true>(...)`，其中 `kFuseSwiGLUInterleaved=true`。
+- `megakernel.cu`：UMMA 路径用 `state->compute_tma->wgateup[expert_id]` + `in_atom.act_cd`；
+  旧 `GU[M,2I]` GMEM 落地和独立 SwiGLU fold 已删除。
+- WMMA fallback 也读取同一份 `W_gateup`：gate 行使用 `(2 * j)`，up 行使用 `(2 * j + 1)`，
+  B 矩阵 leading dimension 为 `2 * K`。因此整个 megakernel compute 路径没有分离
+  `W_gate/W_up` 权重入口。
+
+**1-CTA 与 2-CTA 都适配。**
+交错沿 **N** 方向、element 粒度；SM100 的 2-CTA(2x1SM) 协作主要影响 M 方向和 B multicast，
+不破坏同一 N-tile 内的 `[gate,up]` 相邻配对。当前通过 `MK_COMPUTE_KERNEL` 选择：
+
+```text
+0 = WMMA gateup + SwiGLU fallback + WMMA down
+1 = 1-CTA UMMA interleaved gateup + 1-CTA UMMA down
+2 = 2-CTA UMMA interleaved gateup + 2-CTA UMMA down（默认）
+```
+
+注意 gate/up 和 down 必须使用同一种 CTA mode，因为 CUDA launch 的 `clusterDim` 是全 kernel
+级别配置；不能在同一个 megakernel launch 中混用 1-CTA gate/up 和 2-CTA down。
+
+microkernel harness `compute_ref/umma_swiglu_interleave_dg.cu` 同一份 interleaved 权重分别以
+cluster dim 1/2 启动，对拍 WMMA 融合 + FP32 CPU 参考：多形状（M=256/512，K/I=4096/2048/1024）
+下 1-CTA/2-CTA 相对 FP32 误差均约 `3.3e-3`（与 WMMA 同量级），相对 WMMA 约 `5e-9`，全部 PASS。
 
 **性能实测（B30Z，K=2048 I=3072 N=2I=6144，concat 计时含独立 SwiGLU pass 才公平）。**
 bench 脚本 `compute_ref/bench_gateup_swiglu.cu`（M/SM 可调，写法沿用 bench_gateup_gather.cu）：
@@ -547,17 +570,14 @@ bench 脚本 `compute_ref/bench_gateup_swiglu.cu`（M/SM 可调，写法沿用 b
 - M=2048, SM=132: concat ~628 → interleaved ~1010 TFLOPS（**+61%**，接近 1 PFLOPS）
 
 结论：
-1. interleaved 全面优于 concat，大 M 收益最明显（省掉 GU[M,2I] 写回/读回 + 独立 SwiGLU
-   pass 的启动/同步）。
+1. interleaved 全面优于 concat，大 M 收益最明显，主要来自省掉 `GU[M,2I]` 写回/读回和独立
+   SwiGLU pass 的 task 内同步。
 2. 1-CTA vs 2-CTA 在小规模基本持平；只有 M 大且 SM 充分利用（M=2048/SM=132）时 2-CTA
-   凭 B 权重 multicast 再快 ~10%（1010 vs 917）。
-3. concat 下 1-CTA/2-CTA 几乎无差异，说明其瓶颈在独立 SwiGLU pass 的 GMEM 往返而非 GEMM。
+   凭 B 权重 multicast 再快约 10%（1010 vs 917）。
+3. concat 下 1-CTA/2-CTA 几乎无差异，说明瓶颈在独立 SwiGLU pass 的 GMEM 往返而非 GEMM。
 
-**落 megakernel 建议**：优先 2-CTA interleaved（大 batch 最优），小 batch 用 1-CTA
-interleaved 亦可，两者都远好于当前默认 concat 路径。改动集中在
-`umma_gateup_concat_persistent` 的权重构造（改 gran=1 交错）、`dg_gemm_persistent`
-（`kFuseSwiGLUInterleaved=true`、CD 换 act_cd）、以及删除 megakernel.cu:1888-1929
-那段独立 SwiGLU fold。
+> 备注：早先设想过 **64-block interleave**（对齐 `STORE_BLOCK_N=64`，改动最小）。实测后最终采用
+> element 交错（gran=1）：它与 quack 完全一致、最易验证，且 epilogue 侧可直接按相邻元素配对。
 
 ### 未来优化：combine channel 内 expert-friendly token 排序
 
@@ -766,20 +786,22 @@ channel FIFO 的 head-of-line blocking；若是，再做该排序优化。
 
 ## H. 变更记录
 
-### 2026-07-03｜interleaved gate/up + epilogue 内融合 SwiGLU（microkernel 已验证，学 quack）
-- **动机**：默认 `umma_gateup_concat_persistent` 是 concat layout（GU[M,2I] 落 GMEM + 独立 SwiGLU pass），gate/up 相隔 I 列无法在 epilogue 融合，多一次 GU 的 GMEM 写回/读回和 kernel 启动。学 quack `GemmGatedMixin`（`quack/quack/gemm_act.py:247` + `layout_utils.concat_to_interleave`）的 N 方向交错思路，把 SwiGLU 折进 GEMM epilogue。
-- **改动文件（仅 compute_ref，未动 megakernel）**：
+### 2026-07-03｜interleaved gate/up + epilogue 内融合 SwiGLU（已落 megakernel，学 quack）
+- **动机**：旧 `umma_gateup_concat_persistent` 是 concat layout（GU[M,2I] 落 GMEM + 独立 SwiGLU pass），gate/up 相隔 I 列无法在 epilogue 融合，多一次 GU 的 GMEM 写回/读回和 task 内同步。学 quack `GemmGatedMixin`（`quack/quack/gemm_act.py:247` + `layout_utils.concat_to_interleave`）的 N 方向交错思路，把 SwiGLU 折进 GEMM epilogue。
+- **改动文件**：
   - `compute_ref/sm100_bf16_gemm_dg_copy.cuh`：新增 `sm100_store_swiglu_interleaved`（element 交错 gran=1，从 TMEM 直接读 gate/up 配对，寄存器内 `silu(g)*u*route`，半宽 bf16 store）；`sm100_bf16_gemm_impl` 加模板开关 `kFuseSwiGLUInterleaved` 并在 epilogue 分发接上。
   - `compute_ref/umma_swiglu_interleave_dg.cu`：正确性 harness，同代码分别以 cluster dim 1/2 启动，对拍 WMMA 融合 + FP32 CPU 参考。
   - `compute_ref/bench_gateup_swiglu.cu`：4 配置性能 bench（1-CTA/2-CTA × concat/interleaved），M 与 SM 可调，写法沿用 bench_gateup_gather.cu；concat 计时含独立 SwiGLU pass 以保证公平。
-- **权重布局**：`Wgu[2j]=Wg[j]`, `Wgu[2j+1]=Wu[j]`（element 交错，形状仍 [2I,d]）→ TMEM 第 2j 列=gate、2j+1 列=up。（早先设想的 64-block 方案等价，作备选保留；gran=1 与 quack 一致、最易验证。）
-- **1-CTA / 2-CTA 都适配**：交错沿 N，2-CTA(2x1SM) 拆 M，正交；融合在 per-CTA 寄存器 epilogue，与 MMA CTA 数无关。
-- **正确性（B30Z）**：多形状（M=256/512，K/I=4096/2048/1024）1-CTA/2-CTA 相对 FP32 误差 ~3.3e-3（与 WMMA 同级），相对 WMMA ~5e-9，全 PASS。
+  - `csrc/kernels/megakernel_compute_umma.cuh`：新增 `umma_gateup_interleaved_persistent`，通过 `dg_gemm_persistent<false, kDgRunMulticast, true>` 接入 interleaved epilogue。
+  - `csrc/kernels/megakernel.cu` / `csrc/deep_ep.cpp` / `deep_ep/buffer.py` / tests：megakernel API 收敛为 `W_gateup + W_down`，删除 host 侧临时重排和独立 SwiGLU fold。
+- **权重布局**：`W_gateup[2j]=W_gate[j]`, `W_gateup[2j+1]=W_up[j]`（element 交错，形状 `[E_local,2I,d]`）→ TMEM 第 2j 列=gate、2j+1 列=up。Python 测试侧生成最终布局，C++ 侧直接消费。
+- **1-CTA / 2-CTA / WMMA 都适配**：交错沿 N，2-CTA(2x1SM) 拆 M，正交；融合在 per-CTA epilogue，与 MMA CTA 数无关。WMMA fallback 也从同一份 `W_gateup` 按 `(2j)/(2j+1)` 行读取，不再有分离权重入口。
+- **正确性（B30Z microkernel）**：多形状（M=256/512，K/I=4096/2048/1024）1-CTA/2-CTA 相对 FP32 误差 ~3.3e-3（与 WMMA 同级），相对 WMMA ~5e-9，全 PASS。
 - **性能（B30Z，K=2048 I=3072 N=6144）**：
   - M=256/SM=32：153→217 TFLOPS（+41%）；M=256/SM=132：316→354（+12%）。
   - M=2048/SM=32：193→349（+81%）；M=2048/SM=132：628→1010（+61%，近 1 PFLOPS）。
   - 结论：interleaved 全面优于 concat，大 M 收益最大；2-CTA 仅在 M 大且 SM 满载时较 1-CTA 再快 ~10%（B multicast）；concat 的 1/2-CTA 无差异，瓶颈在独立 SwiGLU pass 的 GMEM 往返。
-- **状态**：microkernel 已实现并验证；**尚未落 megakernel**。落地改动集中在 `umma_gateup_concat_persistent` 权重构造（改 gran=1 交错）+ `dg_gemm_persistent`（`kFuseSwiGLUInterleaved=true`、CD 换 act_cd）+ 删除 megakernel.cu:1888-1929 独立 SwiGLU fold。建议优先 2-CTA interleaved。
+- **状态**：megakernel 已迁移到 interleaved `W_gateup` 路径。`MK_COMPUTE_KERNEL=0/1/2` 分别选择 WMMA、1-CTA UMMA、2-CTA UMMA；gate/up 和 down 必须使用同一 CTA mode，因为 launch `clusterDim` 是全 kernel 级别配置。
 
 ### 2026-06-26｜SwiGLU 融进 epilogue（WMMA 版，已完成，待编译验证）
 - **改动文件**：`csrc/kernels/megakernel.cu`（仅此文件）。
@@ -808,7 +830,7 @@ channel FIFO 的 head-of-line blocking；若是，再做该排序优化。
 
 ### I.0 调研结论（前置事实，已确认）
 - **编译**：`setup.py` 用 `TORCH_CUDA_ARCH_LIST` 驱动，已加 `10.0`（setup.py:74）；`nvcc -rdc=true`。**未链接 CUTLASS/CuTe**，CUDA 自带 `include/cccl` 可能有部分 CuTe（setup.py:55-57）。
-- **权重布局**：`W_gate/W_up = [E_local, intermediate, hidden]`，`W_down = [E_local, hidden, intermediate]`，连续 BF16，host 端无转置（megakernel.cu:181-183；test_megakernel_v7.py 用 `W_gate[e].T` 做参考）。
+- **权重布局**：当前 megakernel 统一使用 `W_gateup = [E_local, 2 * intermediate, hidden]`（rows `[g0,u0,g1,u1,...]`）和 `W_down = [E_local, hidden, intermediate]`，连续 BF16；Python 测试侧仍可保留分离 `W_gate/W_up` 用于 reference，但传入 megakernel 前必须先交错成 `W_gateup`。
 - **GEMM 调用点**：`compute_worker` 内两处——`device_gemm_swiglu_fused`(gate+up+SwiGLU) 和 `device_gemm_bf16`(down)（megakernel.cu:1575/1581）。
 - **线程组织**：`COMPUTE_GROUP_SIZE=32` SM 协作一个 batch，`blockDim=kMegaKernelNumThreads=(24+1)*32=800`（25 warps/SM），`group_num_warps=800`，跨 SM 用全局 `compute_group_sync`（megakernel.cu:45-47, 1454-1475）。
 - **现有低层原语**：仓库已有 TMA / `cp.async`（combine 路径 internode.cu）、`__threadfence` / `st_*_release` / `atomicCAS`；**无 tcgen05 / mbarrier(cluster) / wgmma / cute:: 的现成用法**。
@@ -1064,9 +1086,9 @@ gmem_ptr 当场算 → 天然支持 gather。DeepEP dispatch 末尾存 hidden_st
 - = 文档 I.9.9 的 1CTA 回退路线，但用异步 TMA 替代 cooperative_copy（load/MMA 可重叠）。放弃 2CTA 权重 multicast（少 1.2~1.5x）。
 
 **B2（CuTe tiled TMA + descriptor，有 2CTA multicast）**：
-- host（`megakernel.cu` 的 `__host__` 函数，非 deep_ep.cpp，避免 g++ 编 CuTe）为 **每个 expert 各建一个 2D `[I,d]` `SM100_TMA_2SM_LOAD_MULTICAST` atom**（W_gate/W_up 各 E 个），存进 `ComputeTmaAtoms`（device 可见），device 按 expert_id 选 atom。
-- **关键决策（避免 3D TMA）**：不建 3D `[E,I,d]` descriptor（CuTe 3D batched multicast TMA 无确证样例）。改为 **per-expert 2D descriptor**——每个就是 tutorial 04 / stage 3' 验证过的 2D `[N,K]` multicast atom，零新未知。代价：host 建 2E 个 descriptor、state 存 2E 个（每个 128B，E≤64 可接受）。
-- **A 的处理（选甲，已定）**：A 也走 TMA，但**指向 per-group 连续 input_buf workspace**（沿用现有 gather→input_buf 拷贝）。device 内核结构 = 已验证的 3' microkernel 几乎照搬（A/Wg/Wu 三个 TMA + 双 pass + SwiGLU）。**不做 gather fusion**（见下方后续优化）。
+- host（`megakernel.cu` 的 `__host__` 函数，非 deep_ep.cpp，避免 g++ 编 CuTe）为 **每个 expert 各建一个 2D `[2I,d]` `SM100_TMA_2SM_LOAD_MULTICAST` atom**（`W_gateup` 各 E 个），存进 `ComputeTmaAtoms`（device 可见），device 按 expert_id 选 atom。
+- **关键决策（避免 3D TMA）**：不建 3D `[E,2I,d]` descriptor（CuTe 3D batched multicast TMA 无确证样例）。改为 **per-expert 2D descriptor**——每个就是 tutorial 04 / stage 3' 验证过的 2D `[N,K]` multicast atom，零新未知。代价：host 建 E 个 descriptor、state 存 E 个（每个 128B，E≤64 可接受）。
+- **A 的处理（选甲，已定）**：A 也走 TMA，但**指向 per-group 连续 input_buf workspace**（沿用现有 gather→input_buf 拷贝）。device 内核结构 = 已验证的 interleaved microkernel 几乎照搬（A/W_gateup TMA + fused SwiGLU epilogue）。**不做 gather fusion**（见下方后续优化）。
 - 拿到 2CTA 权重 multicast（B-side HBM/SMEM 流量减半）。需 cluster launch（S4.2 那套，dispatch/combine 降速）。
 - 实现要点：① per-expert 2D descriptor，device 按 expert_id 选；② `ComputeTmaAtoms` 按值含 Copy_Atom 数组，随 state 在 device global mem 可见；③ A 的 TMA atom 指向 input_buf（per-group workspace，地址 launch 前确定，host 建）。
 

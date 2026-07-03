@@ -1236,8 +1236,12 @@ __device__ void dispatch_worker_v2(
                 auto* src_data = reinterpret_cast<const __nv_bfloat16*>(tma_buffer);
 
                 // Copy token data to DeepEP compact combine-input namespace.
-                for (int h = lane_id; h < state->hidden_dim; h += 32)
-                    state->combine_input[recv_token_idx * state->hidden_dim + h] = src_data[h];
+                const int hidden_int4 = state->hidden_dim * sizeof(__nv_bfloat16) / sizeof(int4);
+                const int4* src_i4 = reinterpret_cast<const int4*>(src_data);
+                int4* dst_i4 = reinterpret_cast<int4*>(state->combine_input) +
+                    (int64_t)recv_token_idx * hidden_int4;
+                for (int v = lane_id; v < hidden_int4; v += 32)
+                    dst_i4[v] = src_i4[v];
 
 
                 // Fill topk weights/src_meta, publish this token's local expert count, then
@@ -1769,12 +1773,16 @@ __device__ void compute_worker(
         if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
 #endif
 
-        for (int idx = group_thread_id; idx < input_stride; idx += group_num_threads) {
-            int row = idx / hidden;
-            int h = idx - row * hidden;
-            input_buf[idx] = (row < batch_size)
-                ? state->combine_input[(int64_t)s_recv_token_idx[row] * hidden + h]
-                : __float2bfloat16(0.0f);
+        const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
+        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
+        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
+        int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
+        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
+            input_buf_i4[idx] = (row < batch_size)
+                ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
+                : make_int4(0, 0, 0, 0);
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
@@ -1887,16 +1895,34 @@ __device__ void compute_worker(
         if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
 #endif
 
-        // expected==1 can store directly; multi-local-expert tokens reduce through float atomics.
-        for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
-            int row = idx / hidden;
-            int h = idx - row * hidden;
-            int recv_token_idx = s_recv_token_idx[row];
+        // expected==1 can store directly with vectorized 16B stores; multi-local-expert
+        // tokens keep the scalar float atomic accumulation semantics.
+        const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
+        int4* out_i4 = reinterpret_cast<int4*>(state->compute_output);
+        for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
             if (s_expected[row] == 1) {
-                state->compute_output[(int64_t)recv_token_idx * hidden + h] = down_buf[idx];
-            } else {
-                atomicAdd(&state->compute_output_f[(int64_t)recv_token_idx * hidden + h],
-                          __bfloat162float(down_buf[idx]));
+                int recv_token_idx = s_recv_token_idx[row];
+                out_i4[(int64_t)recv_token_idx * hidden_int4 + v] = down_i4[idx];
+            }
+        }
+        if (thread_id == 0) {
+            int multi_rows = 0;
+            for (int row = 0; row < batch_size; ++row)
+                if (s_expected[row] > 1) ++multi_rows;
+            s_has_multi_finalize = (multi_rows != 0);
+        }
+        __syncthreads();
+        if (s_has_multi_finalize) {
+            for (int idx = group_thread_id; idx < batch_size * hidden; idx += group_num_threads) {
+                int row = idx / hidden;
+                if (s_expected[row] > 1) {
+                    int h = idx - row * hidden;
+                    int recv_token_idx = s_recv_token_idx[row];
+                    atomicAdd(&state->compute_output_f[(int64_t)recv_token_idx * hidden + h],
+                              __bfloat162float(down_buf[idx]));
+                }
             }
         }
 #ifdef MK_PERF_TRACE
