@@ -1384,3 +1384,284 @@ M=8192, SMS=132:  1-CTA gather4 约 284.7 -> 901.9 TFLOP/s
 5. **后续若要复核 SonicMoE 的精确 claim**，需要补两个控制变量实验：
    - QuACK 固定 SM 数（例如 32 SM）下的 1-CTA gather4 / cp.async gather。
    - QuACK 或 DeepGEMM 中同 shape 的 2-CTA non-gather/cp.async-gather 配置，避免把 1-CTA QuACK non-gather 误当成 2-CTA 数据。
+
+## II. Signal/Reduce 重构：把 same-rank multi-expert reduce 移进 combine（对齐 mega_moe）
+
+### II.1 动机（为什么必须做）
+
+MK_PERF_TRACE 实测：绝大多数 compute task 的 `p6_task_has_multi == 1` 且 `p6b_multi_expert_rows > 0`，
+即同一个 `recv_token_idx` 在本 rank 被多个 local expert 命中是常态，不是边角情况。这直接导致：
+
+- 每个 task 都走完整 signal slow path：`token_compute_done` atomicAdd（donecount）、
+  `compute_group_is_last` global broadcast、第二次扫描、fp32->bf16 finalize、两处额外 fence。
+- 显存里常驻一块 `compute_output_f[max_total_recv_tokens, hidden]` 的 float 累加器。
+- perf 里 p6_signal 长期是大头（donecount / fp32finalize / fence / publish 累加）。
+
+一阶段（已完成）只是把 `expected==1` 的纯单 expert task 走 fast path；但既然 multi 是常态，
+fast path 命中率低，signal 开销无法根除。必须做二阶段：**compute 阶段不再做 same-rank reduce，
+每个 (recv_token, local-expert-hit) 写自己的独立 bf16 slot，reduce 全部交给 combine 在寄存器里做。**
+这正是 DeepGEMM `sm100_bf16_mega_moe.cuh` 的做法。
+
+### II.2 mega_moe 的参考实现（对齐目标）
+
+`DeepGEMM/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh`：
+
+- L2 epilogue（down 输出）直接把每个 (token, topk) 的结果 NVLink 写到远端 combine buffer，
+  buffer 形状 `combine_token_buffer[kNumTopk][kNumMaxTokensPerRank]`（`:122-125`），
+  按 `dst_topk_idx` 选独立 slot（`:1074-1079`）。**每个 expert 贡献占独立 slot，写入零冲突。**
+- compute 阶段没有 float accumulator、没有 donecount、没有 finalize、没有 per-token ready。
+- combine 阶段（`:1142-1233`）每个 warp 负责一批最终 token：枚举该 token 的所有有效 topk slot
+  （`total_mask`），逐 slot TMA 双缓冲 load，在 **fp32 寄存器**里 `ptx::accumulate` 累加
+  （`:1184-1202`），最后 cast bf16、TMA store 到最终 `y[token]`。
+- 就绪靠 ring-buffer full/empty counter + 3 个 tagged NVLink barrier，不是逐 token 信号。
+
+### II.3 megakernel 现状约束（改动落点）
+
+关键事实（重构前必须记住）：
+
+```text
+recv_token_idx          : per-token（一个全局 token 一行），dispatch 累加得到（megakernel.cu:1219）
+expert slot             : per-(token, local-expert)，= expert_id*max_tpe + slot
+                          dispatch pass1 分配（megakernel.cu:1290-1302）
+recv_token_source_info  : [expert_slot, 2] = {recv_token_idx, topk_slot}（正向映射，:1293-1299）
+recv_tokens/compute_output : 按 total_expert_slots(=num_local_experts*max_tpe) 分配（:3855,:3905/复用 recv_tokens_bytes）
+                          但当前按 recv_token_idx 索引写入（塌缩，:1920）→ buffer 够大，是用法塌缩
+combine_input           : [max_total_recv_tokens, hidden]，per-token（:3943）
+combine_x = compute_output（:4313），combine 按 token_idx 读一行（:2534 shifted_x = x + token_idx*hidden_int4）
+combine_token_ready     : [max_total_recv_tokens]，per-token spin（:2527）
+combine_token()（internode_common.cuh:56-207）：跨 RANK reduce，每 rank 一个 head_idx/一个 slot，
+                          NOT 跨 local-expert；同 rank 多贡献目前无法枚举。
+```
+
+结论：mega_moe 的“每贡献独立 slot”本仓**已经天然存在**（expert-sorted slot 空间就是），
+问题只在于 compute 现在把它塌缩成 per-token，combine 又只按 per-token 读一行。
+
+### II.4 实现方案（三处改动，尽量对齐 mega_moe）
+
+#### 改动 A：compute 输出改成 per-slot bf16（干掉 reduce/finalize/donecount）
+
+compute worker 的每个 task 已经知道自己的绝对 slot 基址：
+`base_offset = expert_id * max_tpe + start_slot + row`（megakernel.cu:1753）。
+
+把 output 段（当前 `megakernel.cu:1913-1943`）改为**无条件 per-slot int4 store**，目标行用 slot：
+
+```cpp
+// 每个 (token, expert-hit) 写自己的 slot 行，天然唯一，无 atomic
+const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
+int4* out_i4 = reinterpret_cast<int4*>(state->compute_output);
+for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
+    int row = idx / hidden_int4;
+    int v = idx - row * hidden_int4;
+    int slot = expert_id * max_tpe + start_slot + row;   // per-slot, not recv_token_idx
+    out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
+}
+```
+
+route weight 仍在 gate/up epilogue 乘入（不变）。
+
+删除：
+- `compute_output_f`（state 字段 + alloc/memset/free + 所有 atomicAdd/finalize）。
+- `token_compute_done`（donecount atomicAdd）。
+- `s_is_last` / `compute_group_is_last` 的 last-flag broadcast 逻辑。
+- fp32->bf16 finalize pass 及其 fence。
+- fast/slow path 分叉（`s_has_multi_finalize`），signal 段简化为只发 per-slot ready。
+
+signal 段变成：output 写完 -> `__threadfence()` -> group sync -> 每个 slot 直接
+`st_release` 自己的 per-slot ready，然后 group sync。无 donecount、无 finalize。
+
+#### 改动 B：ready 从 per-token 改成 per-slot（对齐“每贡献独立就绪”）
+
+- 新增 `slot_ready`（或复用 dispatch 的 `expert_slot_ready` 语义，注意生命周期不同，建议新开
+  `compute_slot_ready[num_local_experts*max_tpe]`，避免和 dispatch 的复用冲突）。
+- compute 完成一个 task 后，对它覆盖的每个 slot 置 `compute_slot_ready[slot]=1`（release）。
+- 删除 `combine_token_ready[max_total_recv_tokens]` 的 per-token 语义（或保留但不再由 compute 写）。
+
+#### 改动 C：combine 读取改成 per-token 聚合多个 slot + fp32 寄存器 reduce
+
+这是最大、风险最高的一块，落在 combine NVL sender / RDMA 两条路径。
+
+需要一个 **反向映射** `recv_token_idx -> {slot_0, slot_1, ...}`（本 rank 命中该 token 的所有 expert slot）：
+
+- 方案 C1（推荐）：dispatch pass1 里已经知道一个 token 的 `num_hits` 和每个 `hit_slot`
+  （megakernel.cu:1300-1302）。额外写一张 `token_slots[recv_token_idx]` = 变长 slot 列表
+  （用 `token_nhits[recv_token_idx]` + `token_slot_list[recv_token_idx * num_topk + k]`，
+  上限 num_topk）。dispatch 阶段成本极低。
+- 方案 C2：combine 阶段现扫 `recv_token_source_info`，代价高，不推荐。
+
+combine NVL sender 现在读 `shifted_x = compute_output + token_idx * hidden_int4`（单行，:2534）。
+改为：对该 token，读 `token_nhits` 个 slot 行，在 fp32 寄存器累加后再喂给现有 TMA 发送。
+对齐 mega_moe combine（`:1184-1202`）的 `ptx::accumulate` 双缓冲 load-reduce 结构：
+
+```cpp
+int nh = token_nhits[token_idx];
+// nh==0: 该 token 本 rank 无 local expert，发 0（现有 expected==0 跳过路径可复用）
+float acc[hidden_int4 * elems_per_int4 / 32];   // per-lane fp32 累加寄存器
+zero(acc);
+for (int k = 0; k < nh; ++k) {
+    int slot = token_slot_list[token_idx * num_topk + k];
+    wait(compute_slot_ready[slot]);              // per-slot ready
+    load compute_output[slot] -> reg/smem;
+    accumulate(acc, loaded);                     // fp32
+}
+cast acc -> bf16 -> 现有 tma_buffer -> 发送
+```
+
+RDMA 路径同理（`get_addr_fn` / recv_tw_fn 相关段，:3064 附近）。
+
+注意：ready-wait 从「等 1 个 per-token flag」变成「等 nh 个 per-slot flag」，
+等待逻辑要重写，但语义更细、不再需要 finalize。
+
+### II.5 保持不变的部分
+
+- gate/up interleaved SwiGLU epilogue、down GEMM、TMA 描述符：不动。
+- dispatch 的 slot 分配、`expert_slot_ready`、scheduler、compute task queue：基本不动
+  （只在 dispatch pass1 增加写反向映射 `token_slots`）。
+- combine 的跨 rank NVL/RDMA forwarder 协议、`combine_token()` 的跨 rank reduce：不动
+  （per-slot 聚合发生在“进入 combine 发送之前”，把本 rank 多 expert 先合成一份 contribution，
+  仍然每 rank 对一个 token 只发一份，`combine_token()` 的 per-rank 单槽假设不被破坏）。
+
+  这一点很关键：**不去动 `combine_token()` 的 per-rank 枚举**，而是在 combine sender 读
+  compute_output 时，先把本 rank 的多个 slot 合成一份再发。这样跨 rank reduce 逻辑零改动，
+  只有“本 rank 读取 + 合并”这一步变了。风险集中在 sender 读取段，可控性比改 `combine_token()` 高。
+
+### II.6 显存与性能预期
+
+- 删除 `compute_output_f`：省 `max_total_recv_tokens * hidden * sizeof(float)`。
+- 新增 `token_nhits[max_total_recv_tokens]` + `token_slot_list[max_total_recv_tokens * num_topk]`
+  （int），远小于删掉的 float buffer。
+- signal 阶段：donecount / broadcast / finalize / 两处 fence 全删；只剩 per-slot ready release。
+- combine 阶段：读取量增大（一个 token 读 nh 个 slot 而非 1 行），reduce 在寄存器。
+  需要实测 combine 是否成为新瓶颈；预期总体优于当前 signal 常态 slow path。
+
+### II.7 风险与验证顺序（务必按序）
+
+风险点：
+1. combine sender 读取段重写，涉及 TMA load 多 slot + fp32 reduce + 现有发送 buffer 对接。
+2. per-slot ready 生命周期与 combine 等待，容易 hang。
+3. `megakernel.cu:2911` 附近注释：`hidden < 1024` 用 TMA combine 可能 hang，验证必须 `hidden >= 1024`。
+4. tail batch 的 padding slot（row >= batch_size）不能被 combine 当作有效贡献。
+
+验证顺序：
+1. 先只做改动 A（per-slot 写）+ 保留旧 combine，用一个临时 finalize kernel 把 slot 合回
+   per-token compute_output，验证数值对齐（隔离 compute 改动正确性）。
+2. 再做改动 B（per-slot ready）+ C（combine 内 reduce），先在单机、小规模、`hidden>=1024`、
+   `num_local_experts` 较小（保证 multi 命中多）配置下跑 `tests/test_megakernel_v7.py` 精度对齐。
+3. 精度通过后再放大规模、开 MK_PERF_TRACE 对比 p6_signal 收益。
+4. 全程遵循「一 hang 先定位不回退」；combine 改动出问题优先用 cute.printf/MK_TOKEN_TRACE 定位
+   到具体 slot/token，不要盲改。
+
+### II.8 与 DeepGEMM 的差异（为什么不能全抄）
+
+- DeepGEMM 是单 kernel + ring buffer 流水 + 编译期固定 warp 角色 + 自己的 combine buffer 布局；
+  本仓 combine 复用 DeepEP 的 NVL/RDMA forwarder + head 协议。
+- 因此只对齐“per-贡献独立 slot + combine 内 fp32 寄存器 reduce”这一核心思想，
+  不照搬 DeepGEMM 的 `combine_token_buffer[kNumTopk]` 远端布局，也不改 DeepEP forwarder。
+- 落地形态：本 rank 多 expert 的合并放在“combine sender 读 compute_output 之前”，
+  跨 rank reduce 仍走原 `combine_token()`。
+
+## III. 定稿讨论结论（发送侧合并，锁定实现）
+
+本节是与用户讨论后锁定的最终方案，覆盖前面 II 章里未定的选择。**以本节为准。**
+
+### III.1 合并放在发送侧（sender-side），不是接收侧
+
+- mega_moe 是**接收侧、一级 reduce**：不区分本地/跨 rank，每个 (token, topk) 贡献各写目标 rank
+  的独立槽 `combine_token_buffer[kNumTopk][token]`，由目的 rank 的 combine warp 一次性 fp32 reduce
+  所有 topk 贡献（`sm100_bf16_mega_moe.cuh:1074-1079` 写，`:1142-1233` 读）。
+- 本仓**不能照抄接收侧**：本仓 combine 复用 DeepEP `combine_token()`（`internode_common.cuh:75-81`），
+  它做**跨 rank** reduce，且硬性假设**每 rank 对一个 token 只贡献一份 contribution**（每 rank 一个
+  head_idx / 一个 slot）。接收侧合并要求同 rank 多 slot，会破坏这个假设。
+- 因此本仓落地为**发送侧合并**：combine sender 在把 contribution 发给目标 rank **之前**，先在
+  本 rank 内把该 token 命中的多个 local-expert slot 用 fp32 合成一份。跨 rank 传输仍是每 rank 一份，
+  `combine_token()` 的 per-rank 单槽假设**完全不变**。这是与 mega_moe 的有意差异，根因是底座协议不同
+  （DeepEP forwarder + head 协议 vs mega_moe NVLink symmetric buffer）。
+
+### III.2 per-slot 写不增加写入量（澄清常见误解）
+
+- per-token 塌缩（现状）：token T 被 expert A/B 命中 → 两个 task 各写一次 `compute_output[T]`，
+  地址冲突，用 `compute_output_f` + atomicAdd + finalize 解决。
+- per-slot（改后）：task A 写 `compute_output[slot_A]`，task B 写 `compute_output[slot_B]`，
+  地址唯一，无冲突、无 atomic。
+- **两者总写入次数完全相同**（本来就是两个 task 两份数据）。per-slot 不是“多写一次”，而是
+  “写到不冲突的地址”，把 reduce 从 compute 阶段延迟到 combine 阶段。mega_moe 同理：每个贡献各写一份，
+  从不在写入阶段合并。
+
+### III.3 锁定的三个设计选择
+
+- **选择 1 = 统一 per-slot**：compute 统一按 per-slot 写，不再维护 per-token 塌缩分支。
+  `expected==1` 只是 `nh==1` 的特例，combine sender 读 1 个 slot、不累加，自然退化成旧行为。
+  不做 expected 分流，避免双路径维护和分流出错。
+- **选择 2 = 2a per-slot ready**：新增 `compute_slot_ready[num_local_experts*max_tpe]`，
+  compute 完成一个 task 后对覆盖的每个 slot 置位（release）。combine sender 等该 token 的 nh 个
+  slot ready。删除 per-token 的 `combine_token_ready` compute 侧写入语义 + `token_compute_done`。
+- **选择 3 = combine 累加先用 smem scratch 跑通**：先用较简单实现（load slot -> smem/寄存器
+  暂存 -> fp32 累加）验证精度，寄存器双缓冲优化列入“待实现优化”。
+
+### III.4 最终改动清单（按此实现）
+
+**dispatch pass1（megakernel.cu:1281-1326 附近）**：增加反向映射写出。已有 `num_hits`/`hit_slot`：
+```text
+token_nhits[recv_token_idx]                       = num_hits
+token_slot_list[recv_token_idx * num_topk + k]    = local_expert_id * max_tpe + hit_slot[k]
+```
+新增 state 字段：`int* token_nhits`（[max_total_recv_tokens]）、
+`int* token_slot_list`（[max_total_recv_tokens * num_topk]）。alloc/memset(token_nhits=0)/free。
+
+**compute worker 输出段（megakernel.cu:1913-1943）**：统一 per-slot int4 store：
+```cpp
+int slot = expert_id * max_tpe + start_slot + row;   // 绝对 slot，唯一
+out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
+```
+删除：`compute_output_f` 全部读写、`s_expected>1` 的 atomicAdd 分支。
+
+**compute worker signal 段（megakernel.cu:1949-2055）**：整段简化为：
+```text
+__threadfence();
+compute_group_sync(...);
+// 每个 slot 直接置 per-slot ready
+for (row = group_thread_id; row < batch_size; row += group_num_threads)
+    st_release_sys_global(&compute_slot_ready[expert_id*max_tpe+start_slot+row], 1);
+compute_group_sync(...);
+```
+删除：donecount atomicAdd、`s_is_last`/`compute_group_is_last` broadcast、
+fp32→bf16 finalize pass、两处 finalize fence、fast/slow 分叉（`s_has_multi_finalize`/`s_task_has_multi`）。
+
+**combine sender 读取段（NVL `:2534`，RDMA `:3064` 附近）**：
+```text
+nh = token_nhits[token_idx];
+if (nh == 0) { /* 复用 expected==0 跳过路径 */ }
+else {
+    zero smem_acc(hidden)                        // fp32
+    for (k in nh) {
+        slot = token_slot_list[token_idx*num_topk + k];
+        spin-wait compute_slot_ready[slot] == 1  // 带 timeout->trap
+        load compute_output[slot] -> fp32 accumulate into smem_acc
+    }
+    cast smem_acc -> bf16 -> 现有 tma_buffer -> 现有 TMA 发送
+}
+```
+替换原来的 `combine_token_ready[token]` per-token spin + 单行 `x + token_idx*hidden_int4` 读取。
+跨 rank `combine_token()` 不动。
+
+**删除的 state 字段**：`compute_output_f`、`token_compute_done`、`combine_token_ready`
+（若 RDMA 路径不再需要则一并删；否则保留读侧但 compute 不写——实现时确认 RDMA receiver 是否依赖它）。
+
+### III.5 tail batch / padding 处理
+
+- compute 的 padding row（row >= batch_size）不对应真实 slot，不写、不置 ready。
+- `token_nhits` 只统计真实命中，padding 不进 slot_list，天然被排除。
+
+### III.6 验证顺序（沿用 II.7，按序执行）
+
+1. 先只改 compute per-slot 写 + 临时 finalize kernel 把 slot 合回 per-token `compute_output`，
+   保留旧 combine，跑 `tests/test_megakernel_v7.py` 验证数值对齐（隔离 compute 正确性）。
+2. 再改 per-slot ready + combine sender 合并，`hidden>=1024`、`num_local_experts` 小
+   （保证 multi 命中多）配置下跑精度对齐。
+3. 过了再开 MK_PERF_TRACE 看 p6_signal 收益。
+4. 一 hang 先用 MK_TOKEN_TRACE/cute.printf 定位具体 slot/token，不盲改不回退。
+
+### III.7 待实现优化（本次先不做）
+
+- **combine sender 的 fp32 累加改寄存器双缓冲**：当前先用 smem scratch 跑通。后续对齐 mega_moe
+  `combine` 的寄存器累加 + 双 stage TMA 预取（`sm100_bf16_mega_moe.cuh:1184-1202` 的
+  `ptx::accumulate` + `move_mask_and_load` 结构），省 smem、overlap load 与 reduce。
