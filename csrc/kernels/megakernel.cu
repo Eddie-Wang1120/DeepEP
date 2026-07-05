@@ -284,7 +284,18 @@ struct MegaKernelState {
     int64_t* perf_disp_pub_atomic_ns;      // atomicAdd(expected) + atomicAdd(expert_token_offsets)
     int64_t* perf_disp_pub_fence_ns;       // __threadfence()
     int64_t* perf_disp_pub_store_ns;       // st_release writes of source_info
-    int64_t* perf_comb_wait_ready_ns;      // combine sender wait on per-slot compute_slot_ready
+    int64_t* perf_comb_tma_wait_ns;        // sum: combine sender tma_store_wait before reusing smem buffer
+    int64_t* perf_comb_wait_ready_ns;      // sum: combine sender wait on per-slot compute_slot_ready
+    int64_t* perf_comb_gather_reduce_ns;   // sum: gather per-slot outputs + fp32 reduce + bf16 pack
+    int64_t* perf_comb_pack_meta_ns;       // sum: write SourceMeta/topk_weights/padding into TMA packet
+    int64_t* perf_comb_tma_store_ns;       // sum: tma_store_fence + tma_store_1d issue
+    int64_t* perf_comb_tma_wait_max_ns;        // max per sender warp/token phase, comparable to wall time
+    int64_t* perf_comb_wait_ready_max_ns;
+    int64_t* perf_comb_gather_reduce_max_ns;
+    int64_t* perf_comb_pack_meta_max_ns;
+    int64_t* perf_comb_tma_store_max_ns;
+    int64_t* perf_comb_nhit_sum;           // sum of token_nhits processed by combine sender
+    int64_t* perf_comb_token_count;        // number of tokens processed by combine sender
     // Scheduler bridge timing: our expert_slot_ready -> expert_recv_count -> compute task queue layer.
     int64_t* perf_sched_ts;                // [2] scheduler start/end
     int64_t* perf_sched_scan_ns;           // ready bitmap scan + expert_recv_count publish
@@ -2095,9 +2106,9 @@ __device__ void combine_worker_v2(
     const int hidden = state->combine_hidden;
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(hidden % (sizeof(int4) / sizeof(dtype_t)) == 0);
-    const auto hidden_int4 = hidden / (sizeof(int4) / sizeof(dtype_t));
-    const auto hidden_bytes = hidden_int4 * sizeof(int4);
-    const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, 0, num_topk);
+    const int hidden_int4 = hidden / (sizeof(int4) / sizeof(dtype_t));
+    const int hidden_bytes = hidden_int4 * sizeof(int4);
+    const int num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, 0, num_topk);
 
     const auto nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
 
@@ -2333,14 +2344,24 @@ __device__ void combine_worker_v2(
                                     .advance_also(local_buffer_ptr);
 
         // TMA stuffs
+        constexpr int kGatherChunkInt4 = 128;
+        constexpr int kGatherChunkBytes = kGatherChunkInt4 * sizeof(int4);
+        constexpr int kGatherNumStages = 2;
         extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
         auto tma_buffer = smem_tma_buffer + dst_nvl_rank * kNumCombineTMABytesPerSenderWarp;
-        auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
-        uint32_t tma_phase = 0;
+        auto gather_mbarrier = [=](int stage) {
+            return reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token + stage * sizeof(uint64_t));
+        };
+        auto gather_load_buffer = [=](int stage) {
+            return tma_buffer + num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) + stage * kGatherChunkBytes;
+        };
+        uint32_t gather_tma_phase[kGatherNumStages] = {0, 0};
+        if (lane_id < kGatherNumStages)
+            mbarrier_init(gather_mbarrier(lane_id), 1);
         if (elect_one_sync()) {
-            mbarrier_init(tma_mbarrier, 1);
             fence_barrier_init();
-            EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumCombineTMABytesPerSenderWarp);
+            EP_DEVICE_ASSERT(num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) +
+                             kGatherNumStages * kGatherChunkBytes <= kNumCombineTMABytesPerSenderWarp);
         }
         __syncwarp();
 
@@ -2456,15 +2477,27 @@ __device__ void combine_worker_v2(
                     //            (long long)token_idx, dst_slot_idx, shifted_x_buffers, src_meta + token_idx,
                     //            topk_weights + token_idx * num_topk, tma_buffer, hidden_int4, num_topk);
                     // }
+#ifdef MK_PERF_TRACE
+                    int64_t comb_tma_wait_ns = 0;
+                    int64_t comb_wait_ready_ns = 0;
+                    int64_t comb_gather_reduce_ns = 0;
+                    int64_t comb_pack_meta_ns = 0;
+                    int64_t comb_tma_store_ns = 0;
+                    int64_t phase_start_ns = lane_id == 0 ? globaltimer_ns() : 0;
+#endif
                     tma_store_wait<0>();
+#ifdef MK_PERF_TRACE
+                    if (lane_id == 0) {
+                        int64_t now = globaltimer_ns();
+                        comb_tma_wait_ns = now - phase_start_ns;
+                        phase_start_ns = now;
+                    }
+#endif
                     // Change C: gather this token's nh local-expert slots and fp32-reduce
                     // them directly into tma_buffer (per-lane registers). compute now writes
                     // per-slot rows to compute_output_slot; the same-rank reduce happens here.
-#ifdef MK_PERF_TRACE
-                    int64_t wait_ready_acc = 0;
-#endif
+                    const int nh = state->token_nhits[token_idx];
                     {
-                        const int nh = state->token_nhits[token_idx];
                         constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
                         int4* tma_i4 = reinterpret_cast<int4*>(tma_buffer);
                         const int4* slot_base_i4 = reinterpret_cast<const int4*>(state->compute_output_slot);
@@ -2473,9 +2506,6 @@ __device__ void combine_worker_v2(
                         if (lane_id < nh) {
                             int slot = state->token_slot_list[token_idx * num_topk + lane_id];
                             auto wait_start = clock64();
-#ifdef MK_PERF_TRACE
-                            int64_t wait_start_ns = globaltimer_ns();
-#endif
                             while (ld_acquire_sys_global(&state->compute_slot_ready[slot]) != 1) {
                                 if (clock64() - wait_start > NUM_TIMEOUT_CYCLES) {
                                     if (timeout_log_once(state, kTimeoutLogComputeReady))
@@ -2485,37 +2515,94 @@ __device__ void combine_worker_v2(
                                 }
                                 __nanosleep(32);
                             }
-#ifdef MK_PERF_TRACE
-                            wait_ready_acc = globaltimer_ns() - wait_start_ns;
-#endif
                         }
                         __syncwarp();
-                        // Per-lane strided over hidden_int4 vectors; fp32 accumulate nh slots.
-                        for (int vi = lane_id; vi < hidden_int4; vi += 32) {
-                            float acc[kElemsPerInt4];
-                            #pragma unroll
-                            for (int e = 0; e < kElemsPerInt4; ++e) acc[e] = 0.0f;
-                            for (int k = 0; k < nh; ++k) {
-                                int slot = state->token_slot_list[token_idx * num_topk + k];
-                                int4 raw = ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi);
-                                const __nv_bfloat16* bv = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#ifdef MK_PERF_TRACE
+                        if (lane_id == 0) {
+                            int64_t now = globaltimer_ns();
+                            comb_wait_ready_ns = now - phase_start_ns;
+                            phase_start_ns = now;
+                        }
+#endif
+                        // Fast path: if this rank has exactly one local expert hit for the
+                        // token, no same-rank reduce is needed. Copy bf16 int4 vectors
+                        // directly and skip bf16->fp32->bf16 conversion.
+                        if (nh == 1) {
+                            const int slot = state->token_slot_list[token_idx * num_topk];
+                            for (int vi = lane_id; vi < hidden_int4; vi += 32)
+                                tma_i4[vi] = ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi);
+                        } else {
+                            // Chunked smem-load reduce: use the sender warp's spare shared
+                            // memory to TMA-load each slot chunk, then reduce from smem in
+                            // registers. This keeps the current expert-slot-major layout while
+                            // moving the nh>1 path closer to mega_moe's combine pipeline.
+                            constexpr int kVecsPerLane = kGatherChunkInt4 / 32;
+                            for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
+                                const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
+                                const int chunk_int4 = chunk_end - chunk_base;
+                                const int chunk_bytes = chunk_int4 * static_cast<int>(sizeof(int4));
+                                float acc[kVecsPerLane][kElemsPerInt4];
                                 #pragma unroll
-                                for (int e = 0; e < kElemsPerInt4; ++e)
-                                    acc[e] += __bfloat162float(bv[e]);
+                                for (int j = 0; j < kVecsPerLane; ++j) {
+                                    #pragma unroll
+                                    for (int e = 0; e < kElemsPerInt4; ++e)
+                                        acc[j][e] = 0.0f;
+                                }
+                                int stage = 0;
+                                if (lane_id == 0) {
+                                    int slot = state->token_slot_list[token_idx * num_topk];
+                                    tma_load_1d(gather_load_buffer(stage),
+                                                slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base,
+                                                gather_mbarrier(stage), chunk_bytes, false);
+                                    mbarrier_arrive_and_expect_tx(gather_mbarrier(stage), chunk_bytes);
+                                }
+                                __syncwarp();
+                                for (int k = 0; k < nh; ++k) {
+                                    const int cur_stage = stage;
+                                    const int next_stage = stage ^ 1;
+                                    if (k + 1 < nh && lane_id == 0) {
+                                        int next_slot = state->token_slot_list[token_idx * num_topk + k + 1];
+                                        tma_load_1d(gather_load_buffer(next_stage),
+                                                    slot_base_i4 + (int64_t)next_slot * hidden_int4 + chunk_base,
+                                                    gather_mbarrier(next_stage), chunk_bytes, false);
+                                        mbarrier_arrive_and_expect_tx(gather_mbarrier(next_stage), chunk_bytes);
+                                    }
+                                    mbarrier_wait(gather_mbarrier(cur_stage), gather_tma_phase[cur_stage]);
+                                    const int4* smem_i4 = reinterpret_cast<const int4*>(gather_load_buffer(cur_stage));
+                                    #pragma unroll
+                                    for (int j = 0; j < kVecsPerLane; ++j) {
+                                        const int local_vi = lane_id + j * 32;
+                                        if (local_vi < chunk_int4) {
+                                            int4 raw = smem_i4[local_vi];
+                                            const __nv_bfloat16* bv = reinterpret_cast<const __nv_bfloat16*>(&raw);
+                                            #pragma unroll
+                                            for (int e = 0; e < kElemsPerInt4; ++e)
+                                                acc[j][e] += __bfloat162float(bv[e]);
+                                        }
+                                    }
+                                    stage = next_stage;
+                                }
+                                #pragma unroll
+                                for (int j = 0; j < kVecsPerLane; ++j) {
+                                    const int vi = chunk_base + lane_id + j * 32;
+                                    if (vi < chunk_end) {
+                                        int4 packed;
+                                        __nv_bfloat16* pv = reinterpret_cast<__nv_bfloat16*>(&packed);
+                                        #pragma unroll
+                                        for (int e = 0; e < kElemsPerInt4; ++e)
+                                            pv[e] = __float2bfloat16(acc[j][e]);
+                                        tma_i4[vi] = packed;
+                                    }
+                                }
                             }
-                            int4 packed;
-                            __nv_bfloat16* pv = reinterpret_cast<__nv_bfloat16*>(&packed);
-                            #pragma unroll
-                            for (int e = 0; e < kElemsPerInt4; ++e)
-                                pv[e] = __float2bfloat16(acc[e]);
-                            tma_i4[vi] = packed;
                         }
                     }
                     __syncwarp();
 #ifdef MK_PERF_TRACE
                     if (lane_id == 0) {
-                        int acc_idx = logical_channel_id * 2;
-                        state->perf_comb_wait_ready_ns[acc_idx] += wait_ready_acc;
+                        int64_t now = globaltimer_ns();
+                        comb_gather_reduce_ns = now - phase_start_ns;
+                        phase_start_ns = now;
                     }
 #endif
 
@@ -2530,6 +2617,13 @@ __device__ void combine_worker_v2(
                     for (int byte_idx = meta_end + lane_id; byte_idx < num_bytes_per_token; byte_idx += 32)
                         tma_buffer[byte_idx] = 0;
                     __syncwarp();
+#ifdef MK_PERF_TRACE
+                    if (lane_id == 0) {
+                        int64_t now = globaltimer_ns();
+                        comb_pack_meta_ns = now - phase_start_ns;
+                        phase_start_ns = now;
+                    }
+#endif
 
 #ifdef MK_TOKEN_TRACE
                     if (lane_id == 0) {
@@ -2554,6 +2648,37 @@ __device__ void combine_worker_v2(
                     __syncwarp();
                     if (elect_one_sync())
                         tma_store_1d(tma_buffer, shifted_x_buffers, num_bytes_per_token, false);
+#ifdef MK_PERF_TRACE
+                    if (lane_id == 0) {
+                        int64_t now = globaltimer_ns();
+                        comb_tma_store_ns = now - phase_start_ns;
+                        int acc_idx = logical_channel_id * 2;
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_wait_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_tma_wait_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_gather_reduce_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_pack_meta_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_store_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_tma_store_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_wait_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_tma_wait_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_gather_reduce_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_pack_meta_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_store_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_tma_store_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_nhit_sum[acc_idx]),
+                                  static_cast<unsigned long long>(nh));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_token_count[acc_idx]),
+                                  static_cast<unsigned long long>(1));
+                    }
+#endif
                 }
                 lane_id == current_rdma_idx ? (token_start_idx = static_cast<int>(token_idx)) : 0;
             }
@@ -3271,7 +3396,6 @@ void launch_megakernel_v7(
     const int num_ranks = host_state.num_ranks;
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
 
-
 #define MEGAKERNEL_LAUNCH_CASE(num_rdma_ranks) \
     launch_megakernel_v7_case<num_rdma_ranks>(device_state, host_state, total_sms, smem_size, stream); \
     break
@@ -3303,11 +3427,33 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     std::vector<int64_t> disp_wait_nvl(num_logical_channels * 2);
     std::vector<int64_t> disp_publish(num_logical_channels * 2);
     std::vector<int64_t> disp_wait_recvcount(num_logical_channels * 2);
+    std::vector<int64_t> comb_tma_wait(num_logical_channels * 2);
     std::vector<int64_t> comb_wait_ready(num_logical_channels * 2);
+    std::vector<int64_t> comb_gather_reduce(num_logical_channels * 2);
+    std::vector<int64_t> comb_pack_meta(num_logical_channels * 2);
+    std::vector<int64_t> comb_tma_store(num_logical_channels * 2);
+    std::vector<int64_t> comb_tma_wait_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_gather_reduce_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_pack_meta_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_tma_store_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_nhit_sum(num_logical_channels * 2);
+    std::vector<int64_t> comb_token_count(num_logical_channels * 2);
     CUDA_CHECK(cudaMemcpy(disp_wait_nvl.data(), host_state.perf_disp_wait_nvl_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(disp_publish.data(), host_state.perf_disp_publish_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(disp_wait_recvcount.data(), host_state.perf_disp_wait_recvcount_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_tma_wait.data(), host_state.perf_comb_tma_wait_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_wait_ready.data(), host_state.perf_comb_wait_ready_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_gather_reduce.data(), host_state.perf_comb_gather_reduce_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_pack_meta.data(), host_state.perf_comb_pack_meta_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_tma_store.data(), host_state.perf_comb_tma_store_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_tma_wait_max.data(), host_state.perf_comb_tma_wait_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_max.data(), host_state.perf_comb_wait_ready_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_gather_reduce_max.data(), host_state.perf_comb_gather_reduce_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_pack_meta_max.data(), host_state.perf_comb_pack_meta_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_tma_store_max.data(), host_state.perf_comb_tma_store_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_nhit_sum.data(), host_state.perf_comb_nhit_sum, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_token_count.data(), host_state.perf_comb_token_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     // publish breakdown timers.
     std::vector<int64_t> disp_pub_scan(num_logical_channels * 2);
@@ -3441,6 +3587,31 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                 name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
                 key_a, wait_a_ns / 1000.0, key_b, wait_b_ns / 1000.0, key_c, wait_c_ns / 1000.0);
     };
+    auto emit_event_combine_sender = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
+                                         int64_t tma_wait_sum_ns, int64_t wait_ready_sum_ns, int64_t gather_reduce_sum_ns,
+                                         int64_t pack_meta_sum_ns, int64_t tma_store_sum_ns,
+                                         int64_t tma_wait_max_ns, int64_t wait_ready_max_ns, int64_t gather_reduce_max_ns,
+                                         int64_t pack_meta_max_ns, int64_t tma_store_max_ns,
+                                         int64_t nhit_sum, int64_t token_count) {
+        if (start == 0 || end == 0 || end <= start) return;
+        int64_t ts_ns = start - base_ts;
+        int64_t dur_ns = end - start;
+        if (dur_ns <= 0) dur_ns = 1;
+        double avg_nhits = token_count > 0 ? static_cast<double>(nhit_sum) / static_cast<double>(token_count) : 0.0;
+        emit_comma();
+        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
+                   "\"args\":{\"tma_wait_sum_us\":%.3f,\"wait_slot_ready_sum_us\":%.3f,\"gather_reduce_sum_us\":%.3f,"
+                   "\"pack_meta_sum_us\":%.3f,\"tma_store_issue_sum_us\":%.3f,"
+                   "\"tma_wait_max_us\":%.3f,\"wait_slot_ready_max_us\":%.3f,\"gather_reduce_max_us\":%.3f,"
+                   "\"pack_meta_max_us\":%.3f,\"tma_store_issue_max_us\":%.3f,"
+                   "\"tokens\":%lld,\"nhit_sum\":%lld,\"avg_nhits\":%.3f}}",
+                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
+                tma_wait_sum_ns / 1000.0, wait_ready_sum_ns / 1000.0, gather_reduce_sum_ns / 1000.0,
+                pack_meta_sum_ns / 1000.0, tma_store_sum_ns / 1000.0,
+                tma_wait_max_ns / 1000.0, wait_ready_max_ns / 1000.0, gather_reduce_max_ns / 1000.0,
+                pack_meta_max_ns / 1000.0, tma_store_max_ns / 1000.0,
+                static_cast<long long>(token_count), static_cast<long long>(nhit_sum), avg_nhits);
+    };
     auto emit_event_scheduler = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
                                     int64_t scan_ns, int64_t enqueue_ns, int64_t idle_ns) {
         if (start == 0 || end == 0 || end <= start) return;
@@ -3558,10 +3729,19 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t* csp = &combine_lch_ts[(logical_channel_id * 2) * NLP];
         emit_event("sender_wait_dispatch_done", "combine_sender_lch", csp[0], csp[1], pid, combine_sender_tid);
         emit_event("sender_head_normalize", "combine_sender_lch", csp[1], csp[2], pid, combine_sender_tid);
-        emit_event_sema("sender_nvl_send_rdma_recv", "combine_sender_lch", csp[3], csp[4], pid, combine_sender_tid,
-                        comb_wait_ready[logical_channel_id * 2 + 0], "wait_compute_ready",
-                        0, "unused_b",
-                        0, "unused_c");
+        emit_event_combine_sender("sender_nvl_send_rdma_recv", "combine_sender_lch", csp[3], csp[4], pid, combine_sender_tid,
+                                  comb_tma_wait[logical_channel_id * 2 + 0],
+                                  comb_wait_ready[logical_channel_id * 2 + 0],
+                                  comb_gather_reduce[logical_channel_id * 2 + 0],
+                                  comb_pack_meta[logical_channel_id * 2 + 0],
+                                  comb_tma_store[logical_channel_id * 2 + 0],
+                                  comb_tma_wait_max[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_max[logical_channel_id * 2 + 0],
+                                  comb_gather_reduce_max[logical_channel_id * 2 + 0],
+                                  comb_pack_meta_max[logical_channel_id * 2 + 0],
+                                  comb_tma_store_max[logical_channel_id * 2 + 0],
+                                  comb_nhit_sum[logical_channel_id * 2 + 0],
+                                  comb_token_count[logical_channel_id * 2 + 0]);
 
         int combine_forwarder_tid = dispatch_sender_tid + 3;
         int64_t* cfp = &combine_lch_ts[(logical_channel_id * 2 + 1) * NLP];
@@ -4155,7 +4335,18 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t* perf_disp_wait_nvl_ns;
     int64_t* perf_disp_publish_ns;
     int64_t* perf_disp_wait_recvcount_ns;
+    int64_t* perf_comb_tma_wait_ns;
     int64_t* perf_comb_wait_ready_ns;
+    int64_t* perf_comb_gather_reduce_ns;
+    int64_t* perf_comb_pack_meta_ns;
+    int64_t* perf_comb_tma_store_ns;
+    int64_t* perf_comb_tma_wait_max_ns;
+    int64_t* perf_comb_wait_ready_max_ns;
+    int64_t* perf_comb_gather_reduce_max_ns;
+    int64_t* perf_comb_pack_meta_max_ns;
+    int64_t* perf_comb_tma_store_max_ns;
+    int64_t* perf_comb_nhit_sum;
+    int64_t* perf_comb_token_count;
     const size_t acc_bytes = (size_t)num_logical_channels * 2 * sizeof(int64_t);
     CUDA_CHECK(cudaMalloc(&perf_disp_wait_nvl_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_disp_wait_nvl_ns, 0, acc_bytes));
@@ -4163,12 +4354,45 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(perf_disp_publish_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_disp_wait_recvcount_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_disp_wait_recvcount_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_tma_wait_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_tma_wait_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_comb_wait_ready_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_tma_store_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_tma_store_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_tma_wait_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_tma_wait_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_tma_store_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_tma_store_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_nhit_sum, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_nhit_sum, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_token_count, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_token_count, 0, acc_bytes));
     host_state.perf_disp_wait_nvl_ns = perf_disp_wait_nvl_ns;
     host_state.perf_disp_publish_ns = perf_disp_publish_ns;
     host_state.perf_disp_wait_recvcount_ns = perf_disp_wait_recvcount_ns;
+    host_state.perf_comb_tma_wait_ns = perf_comb_tma_wait_ns;
     host_state.perf_comb_wait_ready_ns = perf_comb_wait_ready_ns;
+    host_state.perf_comb_gather_reduce_ns = perf_comb_gather_reduce_ns;
+    host_state.perf_comb_pack_meta_ns = perf_comb_pack_meta_ns;
+    host_state.perf_comb_tma_store_ns = perf_comb_tma_store_ns;
+    host_state.perf_comb_tma_wait_max_ns = perf_comb_tma_wait_max_ns;
+    host_state.perf_comb_wait_ready_max_ns = perf_comb_wait_ready_max_ns;
+    host_state.perf_comb_gather_reduce_max_ns = perf_comb_gather_reduce_max_ns;
+    host_state.perf_comb_pack_meta_max_ns = perf_comb_pack_meta_max_ns;
+    host_state.perf_comb_tma_store_max_ns = perf_comb_tma_store_max_ns;
+    host_state.perf_comb_nhit_sum = perf_comb_nhit_sum;
+    host_state.perf_comb_token_count = perf_comb_token_count;
 
     // publish breakdown timers.
     int64_t* perf_disp_pub_scan_ns;
@@ -4359,7 +4583,18 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_atomic_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_fence_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_store_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_wait_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_store_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_wait_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_store_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_nhit_sum));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_token_count));
     CUDA_CHECK(cudaFree(host_state.perf_sched_ts));
     CUDA_CHECK(cudaFree(host_state.perf_sched_scan_ns));
     CUDA_CHECK(cudaFree(host_state.perf_sched_enqueue_ns));
