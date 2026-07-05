@@ -1665,3 +1665,21 @@ else {
 - **combine sender 的 fp32 累加改寄存器双缓冲**：当前先用 smem scratch 跑通。后续对齐 mega_moe
   `combine` 的寄存器累加 + 双 stage TMA 预取（`sm100_bf16_mega_moe.cuh:1184-1202` 的
   `ptx::accumulate` + `move_mask_and_load` 结构），省 smem、overlap load 与 reduce。
+
+### III.8 gather 路径后续优化顺序（对齐 mega_moe 性能形态）
+
+1. **nh==1 主路径最轻化**：单-hit token 不做 reduce，也尽量减少 per-lane scalar work。先采用保守版
+   chunked copy：沿用 `kGatherChunkInt4=128`，每个 lane 固定复制 `kVecsPerLane` 个 `int4`，让 single
+   路径与 multi 路径的 chunk shape 对齐。上一版直接整段 TMA load 到 `tma_buffer` 曾 hang，后续若重试，
+   必须给 single-hit 独立 mbarrier/stage，不能复用 multi-hit 的 `gather_mbarrier(0)`。
+2. **nh>1 TMA double-buffer pipeline**：把 “issue load next” 封装成局部 helper/lambda，先 issue stage0，
+   在 reduce 当前 stage 前尽早 issue 下一 stage；`mbarrier_wait` 后立即 toggle phase，减少循环内地址计算、
+   分支和等待暴露，靠近 mega_moe 的 `move_mask_and_load()` 结构。
+3. **vectorized bf16 accumulate**：把 scalar `__bfloat162float` 循环改成 `__nv_bfloat162/float2` accumulator，
+   最后用 `__float22bfloat162_rn` pack，减少 conversion/add 指令数。
+4. **pack_meta 低垂优化**：拆分并优化 `SourceMeta/topk_weights/padding` 写入。padding 清零只覆盖
+   `[meta_end, num_bytes_per_token)`，后续可评估是否只在 debug/assert 模式清零，但不能破坏 packet layout。
+5. **潜在大优化：compute 直接生成 combine packet/scratch**：`nh==1` 当前仍需要 combine sender 从
+   `compute_output_slot` 再搬到 packet `tma_buffer`。理论上可让 compute 直接写某种 per-token/topk packet
+   或 scratch，减少 single-hit 搬运，但 compute 阶段不知道 combine destination/tail，且会让 compute output
+   写路径变 scatter、耦合 DeepEP forwarder 协议。因此仅记录为后续大重构候选，短期不做。
