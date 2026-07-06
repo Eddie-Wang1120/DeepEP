@@ -53,6 +53,9 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 constexpr int MK_TIMEOUT_LOG_BUDGET = 8;
+constexpr int MK_PRIORITY_SCAN_WINDOW_TOKENS = 128;
+constexpr int MK_PRIORITY_MAX_ENQUEUE_PER_LOOP = 2;
+constexpr int MK_DISPATCH_ROLE_COUNT = 5;
 
 enum TimeoutLogSite {
     kTimeoutLogComputeRoundFlush = 0,
@@ -69,7 +72,7 @@ enum TimeoutLogSite {
     kTimeoutLogCount = 11,
 };
 
-// Dispatch/combine constants. Original DeepEP computes num_rdma_ranks as
+// Dispatch/combine constants. Original DeepEP computes kNumRDMARanks as
 // num_ranks / NUM_MAX_NVL_PEERS, then uses SWITCH_RDMA_RANKS to select the
 // compile-time kNumRDMARanks specialization.
 constexpr int kNumCombineForwarderWarps = 24;
@@ -99,6 +102,7 @@ struct ComputeTask {
     int expert_id;
     int start_slot;
     int num_tokens;
+    int is_flush;
 };
 
 // ============================================================================
@@ -127,7 +131,7 @@ struct MegaKernelState {
     int* send_nvl_head;              // [num_logical_channels, num_rdma_recv_tokens_ub, NUM_MAX_NVL_PEERS] for combine NVL tracking
     int* recv_rdma_channel_prefix_matrix;   // Written by forwarder
     int* recv_gbl_channel_prefix_matrix;    // Written by NVL receiver
-    int* recv_rdma_channel_token_count;     // [num_rdma_ranks * num_logical_channels] non-cumulative logical-channel count
+    int* recv_rdma_channel_token_count;     // [kNumRDMARanks * num_logical_channels] non-cumulative logical-channel count
     int* recv_gbl_channel_token_count;      // [num_ranks * num_logical_channels] non-cumulative logical-channel count
 
     // --- Dispatch dimensions ---
@@ -167,8 +171,13 @@ struct MegaKernelState {
     int* token_compute_expected;        // [max_total_recv_tokens] how many local experts must compute this token
     __nv_bfloat16* compute_output_slot; // [num_local_experts * max_tokens_per_expert, hidden] per-slot output
     int* compute_slot_ready;            // [num_local_experts * max_tokens_per_expert] per-slot ready flag
+    int* compute_slot_from_flush;       // [num_local_experts * max_tokens_per_expert] whether ready came from final flush task
+    int64_t* compute_slot_ready_ts;     // [num_local_experts * max_tokens_per_expert] ready publish timestamp (perf/debug)
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
     int* token_slot_list;               // [max_total_recv_tokens * num_topk] absolute slot ids per hit
+    int* priority_token_cursor;         // scheduler combine-order cursor for token priority scan
+    int* expert_batch_enqueued;         // [num_local_experts * max_batches_per_expert] enqueue de-dup bitmap
+    int max_batches_per_expert;
     int* compute_group_barrier;         // [num_compute_groups] reusable global barrier counters
     int* compute_group_phase;           // [num_compute_groups] reusable global barrier phase flags
     ComputeTask* compute_tasks;         // [max_compute_tasks] dynamic compute task queue
@@ -203,7 +212,7 @@ struct MegaKernelState {
     float* combine_input_topk_weights; // [max_total_recv_tokens, num_topk] DeepEP compact recv-token namespace
     internode::SourceMeta* combine_input_src_meta; // [max_total_recv_tokens] DeepEP compact recv-token namespace
     int* combine_notify_done;         // Atomic flag: combine head metadata has been normalized
-    int* combine_rdma_head_work;      // [num_combined_tokens, num_rdma_ranks] normalized combine RDMA heads
+    int* combine_rdma_head_work;      // [num_combined_tokens, kNumRDMARanks] normalized combine RDMA heads
     int* combine_nvl_head_work;       // [num_tokens upper bound, NUM_MAX_NVL_PEERS] normalized combine NVL heads
     __nv_bfloat16* gemm_workspace;    // Scratch for gate/up intermediate results
 
@@ -226,7 +235,7 @@ struct MegaKernelState {
     const int* combine_rdma_rank_prefix_sum;
     const int* combine_gbl_channel_prefix_matrix;
     const int* combine_gbl_channel_token_count;      // [num_ranks * num_logical_channels] non-cumulative logical-channel count
-    const int* combine_rdma_channel_token_count;     // [num_rdma_ranks * num_logical_channels] non-cumulative logical-channel count
+    const int* combine_rdma_channel_token_count;     // [kNumRDMARanks * num_logical_channels] non-cumulative logical-channel count
     int combine_num_tokens;                   // num tokens for combine (= tokens received by this rank)
     int combine_num_combined_tokens;          // num combined tokens (= original dispatch num_tokens)
     int combine_rdma_head_stride;             // num_combined_tokens * kNumRDMARanks per logical channel
@@ -284,10 +293,47 @@ struct MegaKernelState {
     int64_t* perf_disp_pub_atomic_ns;      // atomicAdd(expected) + atomicAdd(expert_token_offsets)
     int64_t* perf_disp_pub_fence_ns;       // __threadfence()
     int64_t* perf_disp_pub_store_ns;       // st_release writes of source_info
+    int64_t* perf_disp_cta_barrier_ns;     // first CTA barrier after dispatch role work
+    int64_t* perf_disp_channel_barrier_ns; // logical-channel dispatch barrier wait
+    int64_t* perf_disp_round_barrier_ns;   // dispatch round barrier wait
+    int64_t* perf_disp_tokens;             // tokens processed by measured NVL receiver warp
+    int64_t* perf_disp_local_hit_tokens;   // tokens with local expert hits
+    int64_t* perf_disp_local_hits;         // total local expert hits
+    int64_t* perf_disp_cta_release_ts;     // [lch * 2] timestamp after first CTA barrier releases
+    int64_t* perf_disp_role_arrive_ts;     // [lch * 2 * role_count * NUM_MAX_NVL_PEERS] CTA barrier arrival timestamps
+    int64_t* perf_disp_role_work_ns;       // [lch * 2 * role_count * NUM_MAX_NVL_PEERS] role work time before first CTA barrier
+    int64_t* perf_disp_allrecv_wait_nvl_ns; // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver wait data
+    int64_t* perf_disp_allrecv_prefix_wait_ns;
+    int64_t* perf_disp_allrecv_prefix_wait_start_ts;
+    int64_t* perf_disp_allrecv_prefix_observe_ts;
+    int64_t* perf_disp_allrecv_prefix_done_ts;
+    int64_t* perf_disp_allrecv_prefix_slowest_rdma;
+    int64_t* perf_disp_allrecv_prefix_src_nvl;
+    int64_t* perf_disp_allrecv_prefix_raw_start;
+    int64_t* perf_disp_allrecv_prefix_raw_end;
+    int64_t* perf_disp_allrecv_token_loop_ns;
+    int64_t* perf_disp_allrecv_retire_ns;
+    int64_t* perf_disp_prefix_store_begin_ts; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer before prefix stores
+    int64_t* perf_disp_prefix_publish_ts;   // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer after prefix stores
+    int64_t* perf_disp_prefix_fence_done_ts;
+    int64_t* perf_disp_prefix_store_to_fence_ns;
+    int64_t* perf_disp_prefix_meta_wait_ns; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer wait for RDMA meta
+    int64_t* perf_disp_prefix_tokens;       // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer token count
+    int64_t* perf_disp_prefix_producer_rank;
+    int64_t* perf_disp_prefix_producer_nvl;
+    int64_t* perf_disp_prefix_producer_dst_nvl;
+    int64_t* perf_disp_prefix_producer_src_rdma;
+    int64_t* perf_disp_allrecv_publish_ns;  // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver publish time
+    int64_t* perf_disp_allrecv_tokens;      // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver tokens
+    int64_t* perf_disp_allrecv_local_hits;  // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver local hits
     int64_t* perf_comb_tma_wait_ns;        // sum: combine sender tma_store_wait before reusing smem buffer
     int64_t* perf_comb_wait_ready_ns;      // sum: combine sender wait on per-slot compute_slot_ready
     int64_t* perf_comb_wait_ready_single_ns; // sum: ready wait for nh==1 tokens
     int64_t* perf_comb_wait_ready_multi_ns;  // sum: ready wait for nh>1 tokens
+    int64_t* perf_comb_wait_ready_flush_ns;  // sum: per-slot ready wait for slots computed by final flush tasks
+    int64_t* perf_comb_wait_ready_full_ns;   // sum: per-slot ready wait for slots computed by full-batch tasks
+    int64_t* perf_comb_wait_ready_flush_count; // number of waited slots from final flush tasks
+    int64_t* perf_comb_wait_ready_full_count;  // number of waited slots from full-batch tasks
     int64_t* perf_comb_gather_reduce_ns;   // sum: gather per-slot outputs + fp32 reduce + bf16 pack
     int64_t* perf_comb_gather_single_ns;   // sum: nh==1 gather/copy path
     int64_t* perf_comb_gather_multi_ns;    // sum: nh>1 gather/reduce path
@@ -299,6 +345,13 @@ struct MegaKernelState {
     int64_t* perf_comb_wait_ready_max_ns;
     int64_t* perf_comb_wait_ready_single_max_ns;
     int64_t* perf_comb_wait_ready_multi_max_ns;
+    int64_t* perf_comb_wait_ready_flush_max_ns;
+    int64_t* perf_comb_wait_ready_full_max_ns;
+    int64_t* perf_comb_wait_top_ns;
+    int64_t* perf_comb_wait_top_token;
+    int64_t* perf_comb_wait_top_slot;
+    int64_t* perf_comb_wait_top_expert;
+    int64_t* perf_comb_wait_top_from_flush;
     int64_t* perf_comb_gather_reduce_max_ns;
     int64_t* perf_comb_gather_single_max_ns;
     int64_t* perf_comb_gather_multi_max_ns;
@@ -315,6 +368,23 @@ struct MegaKernelState {
     int64_t* perf_sched_scan_ns;           // ready bitmap scan + expert_recv_count publish
     int64_t* perf_sched_enqueue_ns;        // compute task queue publish
     int64_t* perf_sched_idle_ns;           // poll sleep while waiting for more ready slots
+    int64_t* perf_sched_priority_scan_tokens;
+    int64_t* perf_sched_priority_ready_tokens;
+    int64_t* perf_sched_priority_full_batch_hits;
+    int64_t* perf_sched_priority_batch_already_enqueued;
+    int64_t* perf_sched_priority_not_full;
+    int64_t* perf_sched_normal_full_batch_enqueues;
+    int64_t* perf_sched_flush_tail_enqueues;
+    int64_t* perf_sched_queue_empty_count;
+    int64_t* perf_sched_queue_empty_after_dispatch_count;
+    int64_t* perf_sched_max_ready_tail_gap;
+    int64_t* perf_sched_stall_expert;
+    int64_t* perf_sched_stall_recv_count;
+    int64_t* perf_sched_stall_alloc_count;
+    int64_t* perf_sched_stall_enqueue_cursor;
+    int64_t* perf_sched_stall_first_unready_slot;
+    int64_t* perf_sched_stall_first_unready_ready;
+    int64_t* perf_sched_stall_dispatch_done;
     // Per-compute-task timing buffer (own Perfetto rows per compute group).
     // Fields 0..7  : start, end, sm_id, group_id, expert_id, batch_size, hidden, intermediate
     // Fields 8..13 : coarse phase boundary timestamps (ns) captured by group leader:
@@ -333,8 +403,12 @@ struct MegaKernelState {
     //   18 = ts after fp32->bf16 finalize phase + sync
     //   19 = ts after the post-finalize threadfence_system + sync
     //   20 = ts after compute_slot_ready publish + sync (== signal done)
-    //   21 = reserved
-    static constexpr int MK_PERF_NUM_COMPUTE_FIELDS = 22;
+    //   21 = compute task queue index
+    //   22 = expert-local start_slot
+    //   23 = expert-local end_slot (exclusive)
+    //   24 = absolute slot base (= expert_id * max_tokens_per_expert + start_slot)
+    //   25 = is_flush task flag
+    static constexpr int MK_PERF_NUM_COMPUTE_FIELDS = 26;
     int64_t* perf_compute_task;        // [max_compute_tasks * MK_PERF_NUM_COMPUTE_FIELDS]
     int* perf_compute_task_count;      // atomic write cursor into perf_compute_task
     // Root-cause diagnostics, parallel arrays indexed by the same compute-task slot.
@@ -567,6 +641,22 @@ __device__ void dispatch_worker_v2(
     }();
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second;
+    int dispatch_role_id = 0;
+    if (warp_role == WarpRole::kRDMASender)
+        dispatch_role_id = 0;
+    else if (warp_role == WarpRole::kRDMASenderCoordinator)
+        dispatch_role_id = 1;
+    else if (warp_role == WarpRole::kRDMAAndNVLForwarder)
+        dispatch_role_id = 2;
+    else if (warp_role == WarpRole::kForwarderCoordinator)
+        dispatch_role_id = 3;
+    else
+        dispatch_role_id = 4;
+    int dispatch_role_slot = target_rank >= 0 ? target_rank : 0;
+    if (warp_role == WarpRole::kRDMASender)
+        dispatch_role_slot = warp_id;
+    if (dispatch_role_slot >= NUM_MAX_NVL_PEERS)
+        dispatch_role_slot = NUM_MAX_NVL_PEERS - 1;
     // Data dimensions
     const int hidden_int4 = state->hidden_int4;
     const int num_scales = state->num_scales;
@@ -627,6 +717,9 @@ __device__ void dispatch_worker_v2(
     auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
     uint32_t tma_phase = 0;
+#ifdef MK_PERF_TRACE
+    int64_t recv_retire_start_ns = 0;
+#endif
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
         // printf("enter v2 role\n");
         mbarrier_init(tma_mbarrier, 1);
@@ -648,6 +741,11 @@ __device__ void dispatch_worker_v2(
     int receiver_cached_channel_head_idx = 0, receiver_cached_channel_tail_idx = 0;
 
     for (int logical_channel_id = channel_id; logical_channel_id < num_logical_channels; logical_channel_id += num_channels) {
+#ifdef MK_PERF_TRACE
+        int dispatch_lch_role_for_perf = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
+        int dispatch_acc_idx_for_perf = logical_channel_id * 2 + dispatch_lch_role_for_perf;
+        int64_t dispatch_role_work_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
+#endif
         auto rdma_channel_data = SymBuffer<uint8_t>(
             rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token,
             kNumRDMARanks, logical_channel_id, num_logical_channels);
@@ -965,6 +1063,9 @@ __device__ void dispatch_worker_v2(
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
+#ifdef MK_PERF_TRACE
+        int64_t fwd_prefix_meta_wait_start_ns = (lane_id < kNumRDMARanks) ? globaltimer_ns() : 0;
+#endif
         if (lane_id < kNumRDMARanks) {
             while (true) {
                 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
@@ -974,19 +1075,41 @@ __device__ void dispatch_worker_v2(
                 if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
                     int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
+#ifdef MK_PERF_TRACE
+                    int prefix_prod_idx = (dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + dst_nvl_rank) * kNumRDMARanks + lane_id;
+                    int64_t prefix_store_begin_ts = globaltimer_ns();
+#endif
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
                     st_relaxed_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
                     src_rdma_channel_prefix = -meta_2 - 1;
                     auto src_rdma_channel_prefix_1 = -meta_3 - 1;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
+#ifdef MK_PERF_TRACE
+                    int64_t prefix_publish_ts = globaltimer_ns();
+                    state->perf_disp_prefix_store_begin_ts[prefix_prod_idx] = prefix_store_begin_ts;
+                    state->perf_disp_prefix_publish_ts[prefix_prod_idx] = prefix_publish_ts;
+                    state->perf_disp_prefix_meta_wait_ns[prefix_prod_idx] += prefix_store_begin_ts - fwd_prefix_meta_wait_start_ns;
+                    state->perf_disp_prefix_tokens[prefix_prod_idx] = num_tokens_to_recv_from_rdma;
+                    state->perf_disp_prefix_producer_rank[prefix_prod_idx] = state->rank;
+                    state->perf_disp_prefix_producer_nvl[prefix_prod_idx] = nvl_rank;
+                    state->perf_disp_prefix_producer_dst_nvl[prefix_prod_idx] = dst_nvl_rank;
+                    state->perf_disp_prefix_producer_src_rdma[prefix_prod_idx] = lane_id;
+#endif
                     // if (blockIdx.x == 16 && lane_id == 0) {
                     // printf("lane_id: %d, src_rdma_channel_prefix: %d, src_rdma_channel_prefix_1: %d, num_tokens_to_recv_from_rdma: %d num_channels: %d channel_id: %d\n", lane_id, src_rdma_channel_prefix, src_rdma_channel_prefix_1, num_tokens_to_recv_from_rdma, num_channels, channel_id);
                     // }
                     recv_rdma_channel_prefix_matrix[lane_id * num_logical_channels + logical_channel_id] = src_rdma_channel_prefix_1;
                     // Save per-logical-channel token count (non-cumulative) for diagnostics and bounds checks.
                     state->recv_rdma_channel_token_count[lane_id * num_logical_channels + logical_channel_id] = num_tokens_to_recv_from_rdma;
-                    __threadfence_system();  // Ensure prefix_matrix and token_count visible before NVL Receiver signals done
+                    // __threadfence_system();
+#ifdef MK_PERF_TRACE
+                    {
+                        int64_t prefix_fence_done_ts = globaltimer_ns();
+                        state->perf_disp_prefix_fence_done_ts[prefix_prod_idx] = prefix_fence_done_ts;
+                        state->perf_disp_prefix_store_to_fence_ns[prefix_prod_idx] += prefix_fence_done_ts - prefix_publish_ts;
+                    }
+#endif
                     // Match original DeepEP's combine-head namespace inside this logical channel:
                     // rank prefix + cumulative channel prefix, with the outer allocation already sliced by logical_channel_id.
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
@@ -1155,6 +1278,11 @@ __device__ void dispatch_worker_v2(
     } else {
         // printf("enter v7 role\n");
         int src_nvl_rank = target_rank, total_offset = 0;
+#ifdef MK_PERF_TRACE
+        int recv_perf_idx_for_role = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + src_nvl_rank;
+        int64_t recv_prefix_wait_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
+        int64_t recv_token_loop_start_ns = 0;
+#endif
         const int local_expert_begin = state->rank * (num_experts / num_ranks);
 
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
@@ -1163,11 +1291,26 @@ __device__ void dispatch_worker_v2(
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
+#ifdef MK_PERF_TRACE
+        int64_t recv_prefix_lane_start_ns = (lane_id < kNumRDMARanks) ? globaltimer_ns() : 0;
+        int64_t recv_prefix_lane_observe_ts = 0;
+        int64_t recv_prefix_lane_wait_ns = 0;
+        int recv_prefix_lane_src_rdma = -1;
+        int recv_prefix_lane_raw_start = 0;
+        int recv_prefix_lane_raw_end = 0;
+#endif
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
             start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
             end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
             if (start_offset < 0 and end_offset < 0) {
+#ifdef MK_PERF_TRACE
+                recv_prefix_lane_observe_ts = globaltimer_ns();
+                recv_prefix_lane_wait_ns = recv_prefix_lane_observe_ts - recv_prefix_lane_start_ns;
+                recv_prefix_lane_src_rdma = lane_id;
+                recv_prefix_lane_raw_start = start_offset;
+                recv_prefix_lane_raw_end = end_offset;
+#endif
                 start_offset = -start_offset - 1, end_offset = -end_offset - 1;
                 total_offset += start_offset;
                 break;
@@ -1188,6 +1331,43 @@ __device__ void dispatch_worker_v2(
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+#ifdef MK_PERF_TRACE
+        int64_t prefix_slowest_wait_ns = recv_prefix_lane_wait_ns;
+        int64_t prefix_slowest_start_ts = recv_prefix_lane_start_ns;
+        int64_t prefix_slowest_observe_ts = recv_prefix_lane_observe_ts;
+        int prefix_slowest_src_rdma = recv_prefix_lane_src_rdma;
+        int prefix_slowest_raw_start = recv_prefix_lane_raw_start;
+        int prefix_slowest_raw_end = recv_prefix_lane_raw_end;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            int64_t other_wait = __shfl_down_sync(0xffffffff, prefix_slowest_wait_ns, offset);
+            int64_t other_start_ts = __shfl_down_sync(0xffffffff, prefix_slowest_start_ts, offset);
+            int64_t other_observe_ts = __shfl_down_sync(0xffffffff, prefix_slowest_observe_ts, offset);
+            int other_src = __shfl_down_sync(0xffffffff, prefix_slowest_src_rdma, offset);
+            int other_raw_start = __shfl_down_sync(0xffffffff, prefix_slowest_raw_start, offset);
+            int other_raw_end = __shfl_down_sync(0xffffffff, prefix_slowest_raw_end, offset);
+            if (other_wait > prefix_slowest_wait_ns) {
+                prefix_slowest_wait_ns = other_wait;
+                prefix_slowest_start_ts = other_start_ts;
+                prefix_slowest_observe_ts = other_observe_ts;
+                prefix_slowest_src_rdma = other_src;
+                prefix_slowest_raw_start = other_raw_start;
+                prefix_slowest_raw_end = other_raw_end;
+            }
+        }
+        if (lane_id == 0) {
+            int64_t now = globaltimer_ns();
+            state->perf_disp_allrecv_prefix_wait_ns[recv_perf_idx_for_role] += now - recv_prefix_wait_start_ns;
+            state->perf_disp_allrecv_prefix_wait_start_ts[recv_perf_idx_for_role] = prefix_slowest_start_ts;
+            state->perf_disp_allrecv_prefix_observe_ts[recv_perf_idx_for_role] = prefix_slowest_observe_ts;
+            state->perf_disp_allrecv_prefix_done_ts[recv_perf_idx_for_role] = now;
+            state->perf_disp_allrecv_prefix_slowest_rdma[recv_perf_idx_for_role] = prefix_slowest_src_rdma;
+            state->perf_disp_allrecv_prefix_src_nvl[recv_perf_idx_for_role] = src_nvl_rank;
+            state->perf_disp_allrecv_prefix_raw_start[recv_perf_idx_for_role] = prefix_slowest_raw_start;
+            state->perf_disp_allrecv_prefix_raw_end[recv_perf_idx_for_role] = prefix_slowest_raw_end;
+            recv_token_loop_start_ns = now;
+        }
+#endif
 
         // Save for combine usage
         if (lane_id < kNumRDMARanks) {
@@ -1224,13 +1404,12 @@ __device__ void dispatch_worker_v2(
                 }
             }
 #ifdef MK_PERF_TRACE
-            // Only one NVL receiver warp (target_rank==0) records timing, so the
-            // accumulated value reflects a single execution stream's real occupancy
-            // and is directly comparable to dispatch_sender_work wall time.
-            if (lane_id == 0 && target_rank == 0) {
-                int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-                int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
-                state->perf_disp_wait_nvl_ns[acc_idx] += globaltimer_ns() - wait_nvl_start;
+            if (lane_id == 0) {
+                int64_t wait_nvl_ns = globaltimer_ns() - wait_nvl_start;
+                int recv_idx = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                state->perf_disp_allrecv_wait_nvl_ns[recv_idx] += wait_nvl_ns;
+                if (target_rank == 0)
+                    state->perf_disp_wait_nvl_ns[dispatch_acc_idx_for_perf] += wait_nvl_ns;
             }
 #endif
 
@@ -1274,9 +1453,9 @@ __device__ void dispatch_worker_v2(
                 const int local_expert_end = local_expert_begin + state->num_local_experts;
                 if (lane_id == 0) {
 #ifdef MK_PERF_TRACE
-                    int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-                    int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
-                    bool record_perf = (target_rank == 0);  // only one receiver warp records
+                    int acc_idx = dispatch_acc_idx_for_perf;
+                    int recv_perf_idx = acc_idx * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                    bool record_perf = (target_rank == 0);  // keep legacy single-receiver aggregate
                     int64_t publish_start = globaltimer_ns();
                     int64_t wait_recvcount_acc = 0;
 #endif
@@ -1346,10 +1525,9 @@ __device__ void dispatch_worker_v2(
                     int64_t pub_fence_start = globaltimer_ns();
 #endif
 
-                    // Single device-scope fence per token: orders the plain source_info
-                    // stores before the slot_ready release stores. The whole signal chain
-                    // (slot_ready -> scheduler -> expert_recv_count -> compute) stays in
-                    // device scope because no remote GPU reads these buffers.
+                    // Single device-scope fence per token: orders the plain source_info and
+                    // token_slot_list stores before the slot_ready releases. The whole signal
+                    // chain stays in device scope because no remote GPU reads these buffers.
                     if (num_hits > 0)
                         __threadfence();
 #ifdef MK_PERF_TRACE
@@ -1367,6 +1545,9 @@ __device__ void dispatch_worker_v2(
 #ifdef MK_PERF_TRACE
                     int64_t pub_store_ns = globaltimer_ns() - pub_store_start;
                     int64_t publish_total = globaltimer_ns() - publish_start;
+                    state->perf_disp_allrecv_publish_ns[recv_perf_idx] += publish_total - wait_recvcount_acc;
+                    state->perf_disp_allrecv_tokens[recv_perf_idx] += 1;
+                    state->perf_disp_allrecv_local_hits[recv_perf_idx] += num_hits;
                     if (record_perf) {
                         state->perf_disp_wait_recvcount_ns[acc_idx] += wait_recvcount_acc;
                         state->perf_disp_publish_ns[acc_idx] += publish_total - wait_recvcount_acc;
@@ -1374,6 +1555,10 @@ __device__ void dispatch_worker_v2(
                         state->perf_disp_pub_atomic_ns[acc_idx] += pub_atomic_ns;
                         state->perf_disp_pub_fence_ns[acc_idx] += pub_fence_ns;
                         state->perf_disp_pub_store_ns[acc_idx] += pub_store_ns;
+                        state->perf_disp_tokens[acc_idx] += 1;
+                        if (num_hits > 0)
+                            state->perf_disp_local_hit_tokens[acc_idx] += 1;
+                        state->perf_disp_local_hits[acc_idx] += num_hits;
                     }
 #endif
                 }
@@ -1390,6 +1575,14 @@ __device__ void dispatch_worker_v2(
                 st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
         }
 
+#ifdef MK_PERF_TRACE
+        if (lane_id == 0) {
+            int64_t now = globaltimer_ns();
+            state->perf_disp_allrecv_token_loop_ns[recv_perf_idx_for_role] += now - recv_token_loop_start_ns;
+            recv_retire_start_ns = now;
+        }
+#endif
+
         // Signal dispatch done after all NVL receiver warps on this rank have finished.
         // This is the correct location: NVL Receiver writes gbl_channel_prefix_matrix and
         // gbl_channel_token_count (L929-934), so it must be the one to signal channel_dispatch_done.
@@ -1403,8 +1596,27 @@ __device__ void dispatch_worker_v2(
         }
     }
 
+#ifdef MK_PERF_TRACE
+    int64_t dispatch_cta_barrier_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
+    if (lane_id == 0 && dispatch_role_id == 4) {
+        int recv_idx = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + dispatch_role_slot;
+        state->perf_disp_allrecv_retire_ns[recv_idx] += dispatch_cta_barrier_start_ns - recv_retire_start_ns;
+    }
+    if (lane_id == 0) {
+        int role_idx = (((dispatch_acc_idx_for_perf * MK_DISPATCH_ROLE_COUNT + dispatch_role_id) * NUM_MAX_NVL_PEERS) + dispatch_role_slot);
+        state->perf_disp_role_arrive_ts[role_idx] = dispatch_cta_barrier_start_ns;
+        state->perf_disp_role_work_ns[role_idx] = dispatch_cta_barrier_start_ns - dispatch_role_work_start_ns;
+    }
+#endif
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
 #ifdef MK_PERF_TRACE
+    if (thread_id == 0) {
+        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
+        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
+        int64_t cta_release_ns = globaltimer_ns();
+        state->perf_disp_cta_barrier_ns[acc_idx] += cta_release_ns - dispatch_cta_barrier_start_ns;
+        state->perf_disp_cta_release_ts[acc_idx] = cta_release_ns;
+    }
     if (thread_id == 0) {
         int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
         int trace_idx = (logical_channel_id * 2 + dispatch_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
@@ -1415,6 +1627,9 @@ __device__ void dispatch_worker_v2(
         atomicAdd(&state->dispatch_channel_barrier[logical_channel_id], 1);
     if (thread_id == 0) {
         auto start_time = clock64();
+#ifdef MK_PERF_TRACE
+        int64_t barrier_start_ns = globaltimer_ns();
+#endif
         while (ld_acquire_sys_global(&state->dispatch_channel_barrier[logical_channel_id]) < 2) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                 printf("MK dispatch logical-channel barrier timeout, physical_ch=%d logical_ch=%d count=%d\n",
@@ -1423,6 +1638,11 @@ __device__ void dispatch_worker_v2(
             }
             __nanosleep(32);
         }
+#ifdef MK_PERF_TRACE
+        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
+        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
+        state->perf_disp_channel_barrier_ns[acc_idx] += globaltimer_ns() - barrier_start_ns;
+#endif
     }
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
 #ifdef MK_PERF_TRACE
@@ -1441,6 +1661,9 @@ __device__ void dispatch_worker_v2(
     if (thread_id == 0) {
         const int round_idx = logical_channel_id / num_channels;
         auto start_time = clock64();
+#ifdef MK_PERF_TRACE
+        int64_t barrier_start_ns = globaltimer_ns();
+#endif
         while (ld_acquire_sys_global(&state->dispatch_round_barrier[round_idx]) < num_channels) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                 printf("MK dispatch round barrier timeout, physical_ch=%d logical_ch=%d round=%d count=%d need=%d\n",
@@ -1450,6 +1673,11 @@ __device__ void dispatch_worker_v2(
             }
             __nanosleep(32);
         }
+#ifdef MK_PERF_TRACE
+        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
+        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
+        state->perf_disp_round_barrier_ns[acc_idx] += globaltimer_ns() - barrier_start_ns;
+#endif
     }
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
 #ifdef MK_PERF_TRACE
@@ -1492,13 +1720,13 @@ __device__ __forceinline__ bool timeout_log_once(MegaKernelState* state, int sit
     return ticket < MK_TIMEOUT_LOG_BUDGET;
 }
 
-__device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens) {
+__device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens, int is_flush) {
     int tail = atomicAdd(state->compute_task_reserve_tail, 1);
     if (tail >= state->max_compute_tasks) {
         printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
         trap();
     }
-    state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens};
+    state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens, is_flush};
     __threadfence_system();
     while (ld_acquire_sys_global(state->compute_task_tail) != tail)
         __nanosleep(32);
@@ -1506,6 +1734,20 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
     state->perf_task_publish_ts[tail] = globaltimer_ns();
 #endif
     st_release_sys_global(state->compute_task_tail, tail + 1);
+}
+
+__device__ __forceinline__ bool scheduler_try_enqueue_batch(
+    MegaKernelState* state, int expert_id, int batch_id, int start_slot, int num_tokens, int is_flush) {
+    if (batch_id < 0 || batch_id >= state->max_batches_per_expert) {
+        printf("MK scheduler batch id overflow, rank=%d expert=%d batch=%d max=%d\n",
+               state->rank, expert_id, batch_id, state->max_batches_per_expert);
+        trap();
+    }
+    int idx = expert_id * state->max_batches_per_expert + batch_id;
+    if (atomicCAS(&state->expert_batch_enqueued[idx], 0, 1) != 0)
+        return false;
+    scheduler_publish_task(state, expert_id, start_slot, num_tokens, is_flush);
+    return true;
 }
 
 __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_id, int num_schedulers) {
@@ -1521,10 +1763,38 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     int64_t sched_scan_acc = 0;
     int64_t sched_enqueue_acc = 0;
     int64_t sched_idle_acc = 0;
+    int64_t priority_scan_tokens = 0;
+    int64_t priority_ready_tokens = 0;
+    int64_t priority_full_batch_hits = 0;
+    int64_t priority_batch_already_enqueued = 0;
+    int64_t priority_not_full = 0;
+    int64_t normal_full_batch_enqueues = 0;
+    int64_t flush_tail_enqueues = 0;
+    int64_t queue_empty_count = 0;
+    int64_t queue_empty_after_dispatch_count = 0;
+    int64_t max_ready_tail_gap = 0;
+    int64_t stall_expert = -1;
+    int64_t stall_recv_count = 0;
+    int64_t stall_alloc_count = 0;
+    int64_t stall_enqueue_cursor = 0;
+    int64_t stall_first_unready_slot = -1;
+    int64_t stall_first_unready_ready = 0;
+    int64_t stall_dispatch_done = 0;
 #endif
 
     while (true) {
+        int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
+        bool dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count);
 #ifdef MK_PERF_TRACE
+        if (scheduler_id == 0) {
+            int task_head = ld_acquire_sys_global(state->compute_task_head);
+            int task_tail = ld_acquire_sys_global(state->compute_task_tail);
+            if (task_head >= task_tail) {
+                queue_empty_count += 1;
+                if (dispatch_done)
+                    queue_empty_after_dispatch_count += 1;
+            }
+        }
         int64_t sched_scan_start = globaltimer_ns();
 #endif
         // Scan per-slot ready bitmap and advance expert_recv_count for this scheduler lane's experts.
@@ -1542,29 +1812,98 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 __threadfence();
                 st_na_release(&state->expert_recv_count[expert_id], count);
             }
-
-            // Enqueue full batches.
-            int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
 #ifdef MK_PERF_TRACE
-            sched_scan_acc += globaltimer_ns() - sched_scan_start;
-            int64_t sched_enqueue_start = globaltimer_ns();
-#endif
-            while (count - cursor >= COMPUTE_BATCH_SIZE) {
-                scheduler_publish_task(state, expert_id, cursor, COMPUTE_BATCH_SIZE);
-                cursor += COMPUTE_BATCH_SIZE;
-                st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+            int alloc_count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
+            int gap = alloc_count - count;
+            if (gap > max_ready_tail_gap) {
+                max_ready_tail_gap = gap;
+                stall_expert = expert_id;
+                stall_recv_count = count;
+                stall_alloc_count = alloc_count;
+                stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                stall_first_unready_slot = count;
+                stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + count]) : -1;
+                stall_dispatch_done = dispatch_done ? 1 : 0;
             }
-#ifdef MK_PERF_TRACE
-            sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
-            sched_scan_start = globaltimer_ns();
 #endif
         }
 #ifdef MK_PERF_TRACE
         sched_scan_acc += globaltimer_ns() - sched_scan_start;
+        int64_t sched_enqueue_start = globaltimer_ns();
 #endif
 
-        int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
-        bool dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count);
+        int priority_enqueued = 0;
+        if (dispatch_done && scheduler_id == 0) {
+            int cursor_token = ld_acquire_global(state->priority_token_cursor);
+            int scan_end = cursor_token + MK_PRIORITY_SCAN_WINDOW_TOKENS;
+            if (scan_end > state->max_total_recv_tokens)
+                scan_end = state->max_total_recv_tokens;
+            int new_cursor = cursor_token;
+            for (int token = cursor_token; token < scan_end && priority_enqueued < MK_PRIORITY_MAX_ENQUEUE_PER_LOOP; ++token) {
+#ifdef MK_PERF_TRACE
+                priority_scan_tokens += 1;
+                priority_ready_tokens += 1;
+#endif
+                int nh = ld_acquire_global(&state->token_nhits[token]);
+                bool token_has_not_full = false;
+                for (int h = 0; h < nh && priority_enqueued < MK_PRIORITY_MAX_ENQUEUE_PER_LOOP; ++h) {
+                    int slot = ld_nc_global(&state->token_slot_list[token * state->num_topk + h]);
+                    if (slot < 0)
+                        continue;
+                    int expert_id = slot / max_tpe;
+                    int expert_local_slot = slot - expert_id * max_tpe;
+                    int batch_id = expert_local_slot / COMPUTE_BATCH_SIZE;
+                    int batch_start = batch_id * COMPUTE_BATCH_SIZE;
+                    int batch_end = batch_start + COMPUTE_BATCH_SIZE;
+                    int count = ld_acquire_global(&state->expert_recv_count[expert_id]);
+                    if (count < batch_end) {
+                        token_has_not_full = true;
+#ifdef MK_PERF_TRACE
+                        priority_not_full += 1;
+#endif
+                        continue;
+                    }
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, batch_start, COMPUTE_BATCH_SIZE, 0);
+                    if (enq) {
+                        priority_enqueued += 1;
+#ifdef MK_PERF_TRACE
+                        priority_full_batch_hits += 1;
+#endif
+                    } else {
+#ifdef MK_PERF_TRACE
+                        priority_batch_already_enqueued += 1;
+#endif
+                    }
+                }
+                if (token_has_not_full)
+                    break;
+                new_cursor = token + 1;
+            }
+            if (new_cursor != cursor_token)
+                st_na_release(state->priority_token_cursor, new_cursor);
+        }
+
+        // Fallback normal full-batch enqueue keeps compute queue supplied if priority scan misses.
+        if (priority_enqueued == 0) {
+            for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
+                int count = ld_acquire_global(&state->expert_recv_count[expert_id]);
+                int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                while (count - cursor >= COMPUTE_BATCH_SIZE) {
+                    int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0);
+                    cursor += COMPUTE_BATCH_SIZE;
+                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+#ifdef MK_PERF_TRACE
+                    if (enq)
+                        normal_full_batch_enqueues += 1;
+#endif
+                }
+            }
+        }
+#ifdef MK_PERF_TRACE
+        sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
+#endif
+
         if (dispatch_done && !tail_enqueued) {
 #ifdef MK_PERF_TRACE
             sched_scan_start = globaltimer_ns();
@@ -1582,20 +1921,23 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
 #ifdef MK_PERF_TRACE
                 sched_scan_acc += globaltimer_ns() - sched_scan_start;
-                int64_t sched_enqueue_start = globaltimer_ns();
+                sched_enqueue_start = globaltimer_ns();
 #endif
                 // Enqueue full batches first, then a final (< BATCH) tail batch.
-                // Every published task must have num_tokens <= COMPUTE_BATCH_SIZE,
-                // otherwise compute_worker overruns its [COMPUTE_BATCH_SIZE] shared
-                // arrays (s_recv_token_idx/...) and triggers an illegal memory access.
                 while (count - cursor >= COMPUTE_BATCH_SIZE) {
-                    scheduler_publish_task(state, expert_id, cursor, COMPUTE_BATCH_SIZE);
+                    int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                    scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0);
                     cursor += COMPUTE_BATCH_SIZE;
                     st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
                 }
                 if (count > cursor) {
-                    scheduler_publish_task(state, expert_id, cursor, count - cursor);
+                    int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1);
                     st_na_release(&state->expert_enqueue_cursor[expert_id], count);
+#ifdef MK_PERF_TRACE
+                    if (enq)
+                        flush_tail_enqueues += 1;
+#endif
                 }
 #ifdef MK_PERF_TRACE
                 sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
@@ -1637,6 +1979,35 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
               static_cast<unsigned long long>(sched_enqueue_acc));
     atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_idle_ns),
               static_cast<unsigned long long>(sched_idle_acc));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_priority_scan_tokens),
+              static_cast<unsigned long long>(priority_scan_tokens));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_priority_ready_tokens),
+              static_cast<unsigned long long>(priority_ready_tokens));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_priority_full_batch_hits),
+              static_cast<unsigned long long>(priority_full_batch_hits));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_priority_batch_already_enqueued),
+              static_cast<unsigned long long>(priority_batch_already_enqueued));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_priority_not_full),
+              static_cast<unsigned long long>(priority_not_full));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_normal_full_batch_enqueues),
+              static_cast<unsigned long long>(normal_full_batch_enqueues));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_flush_tail_enqueues),
+              static_cast<unsigned long long>(flush_tail_enqueues));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_queue_empty_count),
+              static_cast<unsigned long long>(queue_empty_count));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_queue_empty_after_dispatch_count),
+              static_cast<unsigned long long>(queue_empty_after_dispatch_count));
+    unsigned long long old_gap = atomicMax(reinterpret_cast<unsigned long long*>(state->perf_sched_max_ready_tail_gap),
+                                           static_cast<unsigned long long>(max_ready_tail_gap));
+    if (static_cast<unsigned long long>(max_ready_tail_gap) > old_gap && max_ready_tail_gap > 0) {
+        st_na_global(state->perf_sched_stall_expert, stall_expert);
+        st_na_global(state->perf_sched_stall_recv_count, stall_recv_count);
+        st_na_global(state->perf_sched_stall_alloc_count, stall_alloc_count);
+        st_na_global(state->perf_sched_stall_enqueue_cursor, stall_enqueue_cursor);
+        st_na_global(state->perf_sched_stall_first_unready_slot, stall_first_unready_slot);
+        st_na_global(state->perf_sched_stall_first_unready_ready, stall_first_unready_ready);
+        st_na_global(state->perf_sched_stall_dispatch_done, stall_dispatch_done);
+    }
 #endif
 }
 
@@ -1707,9 +2078,6 @@ __device__ void compute_worker(
             pop_start_ns = globaltimer_ns();
 #endif
             while (true) {
-#ifdef MK_PERF_TRACE
-                pop_attempts += 1;
-#endif
                 int head = ld_acquire_sys_global(state->compute_task_head);
                 int tail = ld_acquire_sys_global(state->compute_task_tail);
                 if (head >= tail) {
@@ -1720,7 +2088,6 @@ __device__ void compute_worker(
                 if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
                     task_idx = head;
 #ifdef MK_PERF_TRACE
-                    pop_done_ns = globaltimer_ns();
                     if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
                         state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
                         state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
@@ -1764,6 +2131,31 @@ __device__ void compute_worker(
         int expert_id = task.expert_id;
         int start_slot = task.start_slot;
         int batch_size = task.num_tokens;
+
+        // MK_COMPUTE_KERNEL selects the compute implementation at compile time:
+        //   0 = WMMA gate/up + WMMA down
+        //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
+        //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
+        constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+        constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
+
+        // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
+        // Do the same after task decode so descriptor fetch can overlap input gather.
+        if constexpr (kUseUmmaCompute) {
+            if (state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
+                batch_size <= COMPUTE_BATCH_SIZE) {
+                const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
+                if (local_warp_id == 0) {
+                    cute::prefetch_tma_descriptor(&prefetch_atom.a);
+                    cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
+                    cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                }
+            }
+        }
 #ifdef MK_PERF_TRACE
         const bool perf_leader = (group_sm_idx == 0 && thread_id == 0);
         int64_t compute_task_start_ns = perf_leader ? globaltimer_ns() : 0;
@@ -1846,14 +2238,6 @@ __device__ void compute_worker(
         // between gate/up and down-proj — the barrier ring is initialized once and
         // must stay in phase. Declared here so it spans both if-blocks below.
         uint32_t umma_accum_iter = 0;
-
-        // MK_COMPUTE_KERNEL selects the compute implementation at compile time:
-        //   0 = WMMA gate/up + WMMA down
-        //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
-        //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
-        constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
-        constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
-        constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
         // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
         // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
@@ -1994,8 +2378,18 @@ __device__ void compute_worker(
             }
 #endif
             const int slot_base_sig = expert_id * max_tpe + start_slot;
-            for (int row = group_thread_id; row < batch_size; row += group_num_threads)
-                st_release_sys_global(&state->compute_slot_ready[slot_base_sig + row], 1);
+            const int task_is_flush = task.is_flush;
+#ifdef MK_PERF_TRACE
+            const int64_t slot_ready_ts = globaltimer_ns();
+#endif
+            for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
+                const int slot = slot_base_sig + row;
+                st_na_global(&state->compute_slot_from_flush[slot], task_is_flush);
+#ifdef MK_PERF_TRACE
+                st_na_global(&state->compute_slot_ready_ts[slot], slot_ready_ts);
+#endif
+                st_na_release(&state->compute_slot_ready[slot], 1);
+            }
             compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
             if (perf_leader) perf_sig_publish_ns = globaltimer_ns();
@@ -2030,6 +2424,10 @@ __device__ void compute_worker(
                 rec[19] = perf_sig_fence_ns;
                 rec[20] = perf_sig_publish_ns;
                 rec[21] = task_idx;
+                rec[22] = start_slot;
+                rec[23] = start_slot + batch_size;
+                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                rec[25] = task.is_flush;
                 last_task_end_ns = perf_ph_signal_ns;
                 // Root-cause diagnostics (parallel arrays, same slot): full UMMA breakdown.
                 state->perf_up_setup[slot]        = s_perf_up.setup_ns;
@@ -2364,10 +2762,12 @@ __device__ void combine_worker_v2(
         extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
         auto tma_buffer = smem_tma_buffer + dst_nvl_rank * kNumCombineTMABytesPerSenderWarp;
         auto gather_mbarrier = [=](int stage) {
-            return reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token + stage * sizeof(uint64_t));
+            return reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token +
+                                               stage * sizeof(uint64_t));
         };
         auto gather_load_buffer = [=](int stage) {
-            return tma_buffer + num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) + stage * kGatherChunkBytes;
+            return tma_buffer + num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) +
+                   stage * kGatherChunkBytes;
         };
         uint32_t gather_tma_phase[kGatherNumStages] = {0, 0};
         if (lane_id < kGatherNumStages)
@@ -2496,6 +2896,13 @@ __device__ void combine_worker_v2(
                     int64_t comb_wait_ready_ns = 0;
                     int64_t comb_wait_ready_single_ns = 0;
                     int64_t comb_wait_ready_multi_ns = 0;
+                    int64_t comb_wait_ready_flush_ns = 0;
+                    int64_t comb_wait_ready_full_ns = 0;
+                    int64_t comb_wait_ready_flush_count = 0;
+                    int64_t comb_wait_ready_full_count = 0;
+                    int64_t comb_wait_top_ns = 0;
+                    int64_t comb_wait_top_slot = -1;
+                    int64_t comb_wait_top_from_flush = -1;
                     int64_t comb_gather_reduce_ns = 0;
                     int64_t comb_gather_single_ns = 0;
                     int64_t comb_gather_multi_ns = 0;
@@ -2524,10 +2931,18 @@ __device__ void combine_worker_v2(
                         const int4* slot_base_i4 = reinterpret_cast<const int4*>(state->compute_output_slot);
                         // Per-slot ready wait (change B): each lane waits on one slot's ready
                         // flag; nh <= num_topk <= 32 so a single warp covers all slots.
+#ifdef MK_PERF_TRACE
+                        int64_t lane_slot_wait_ns = 0;
+                        int lane_wait_slot = -1;
+                        int lane_wait_from_flush = 0;
+#endif
                         if (lane_id < nh) {
                             int slot = state->token_slot_list[token_idx * num_topk + lane_id];
                             auto wait_start = clock64();
-                            while (ld_acquire_sys_global(&state->compute_slot_ready[slot]) != 1) {
+#ifdef MK_PERF_TRACE
+                            int64_t wait_start_ns = globaltimer_ns();
+#endif
+                            while (ld_acquire_global(&state->compute_slot_ready[slot]) != 1) {
                                 if (clock64() - wait_start > NUM_TIMEOUT_CYCLES) {
                                     if (timeout_log_once(state, kTimeoutLogComputeReady))
                                         printf("MK combine per-slot-ready timeout, rank=%d token=%lld slot=%d nh=%d\n",
@@ -2536,9 +2951,41 @@ __device__ void combine_worker_v2(
                                 }
                                 __nanosleep(32);
                             }
+#ifdef MK_PERF_TRACE
+                            lane_slot_wait_ns = globaltimer_ns() - wait_start_ns;
+                            lane_wait_slot = slot;
+                            lane_wait_from_flush = ld_nc_global(&state->compute_slot_from_flush[slot]);
+#endif
                         }
                         __syncwarp();
 #ifdef MK_PERF_TRACE
+                        int64_t wait_ready_flush_sum = 0;
+                        int64_t wait_ready_full_sum = 0;
+                        int64_t wait_ready_flush_slots = 0;
+                        int64_t wait_ready_full_slots = 0;
+                        int64_t wait_top_ns = 0;
+                        int wait_top_slot = -1;
+                        int wait_top_from_flush = -1;
+                        #pragma unroll
+                        for (int l = 0; l < 32; ++l) {
+                            int64_t w = __shfl_sync(0xffffffff, lane_slot_wait_ns, l);
+                            int slot = __shfl_sync(0xffffffff, lane_wait_slot, l);
+                            int from_flush = __shfl_sync(0xffffffff, lane_wait_from_flush, l);
+                            if (l < nh) {
+                                if (from_flush) {
+                                    wait_ready_flush_sum += w;
+                                    wait_ready_flush_slots += 1;
+                                } else {
+                                    wait_ready_full_sum += w;
+                                    wait_ready_full_slots += 1;
+                                }
+                                if (w > wait_top_ns) {
+                                    wait_top_ns = w;
+                                    wait_top_slot = slot;
+                                    wait_top_from_flush = from_flush;
+                                }
+                            }
+                        }
                         if (lane_id == 0) {
                             int64_t now = globaltimer_ns();
                             comb_wait_ready_ns = now - phase_start_ns;
@@ -2546,15 +2993,29 @@ __device__ void combine_worker_v2(
                                 comb_wait_ready_single_ns = comb_wait_ready_ns;
                             else
                                 comb_wait_ready_multi_ns = comb_wait_ready_ns;
+                            comb_wait_ready_flush_ns = wait_ready_flush_sum;
+                            comb_wait_ready_full_ns = wait_ready_full_sum;
+                            comb_wait_ready_flush_count = wait_ready_flush_slots;
+                            comb_wait_ready_full_count = wait_ready_full_slots;
+                            comb_wait_top_ns = wait_top_ns;
+                            comb_wait_top_slot = wait_top_slot;
+                            comb_wait_top_from_flush = wait_top_from_flush;
                             phase_start_ns = now;
                         }
 #endif
                         constexpr int kVecsPerLane = kGatherChunkInt4 / 32;
-                        // Fast path: if this rank has exactly one local expert hit for the
-                        // token, no same-rank reduce is needed. Copy bf16 int4 vectors
-                        // directly and skip bf16->fp32->bf16 conversion.
                         if (is_single_hit) {
                             const int slot = state->token_slot_list[token_idx * num_topk];
+#ifdef COMBINE_TMA_LOAD
+                            if (lane_id == 0) {
+                                tma_load_1d(tma_buffer,
+                                            slot_base_i4 + (int64_t)slot * hidden_int4,
+                                            gather_mbarrier(0), hidden_bytes, false);
+                                mbarrier_arrive_and_expect_tx(gather_mbarrier(0), hidden_bytes);
+                            }
+                            __syncwarp();
+                            mbarrier_wait(gather_mbarrier(0), gather_tma_phase[0]);
+#else
                             for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
                                 const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
                                 #pragma unroll
@@ -2564,6 +3025,7 @@ __device__ void combine_worker_v2(
                                         tma_i4[vi] = ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi);
                                 }
                             }
+#endif
                         } else {
                             // Chunked smem-load reduce: use the sender warp's spare shared
                             // memory to TMA-load each slot chunk, then reduce from smem in
@@ -2706,6 +3168,14 @@ __device__ void combine_worker_v2(
                                   static_cast<unsigned long long>(comb_wait_ready_single_ns));
                         atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_multi_ns[acc_idx]),
                                   static_cast<unsigned long long>(comb_wait_ready_multi_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_flush_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_full_ns));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_count[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_flush_count));
+                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_count[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_full_count));
                         atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_ns[acc_idx]),
                                   static_cast<unsigned long long>(comb_gather_reduce_ns));
                         atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_single_ns[acc_idx]),
@@ -2728,6 +3198,18 @@ __device__ void combine_worker_v2(
                                   static_cast<unsigned long long>(comb_wait_ready_single_ns));
                         atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_multi_max_ns[acc_idx]),
                                   static_cast<unsigned long long>(comb_wait_ready_multi_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_flush_ns));
+                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_max_ns[acc_idx]),
+                                  static_cast<unsigned long long>(comb_wait_ready_full_ns));
+                        unsigned long long prev_top = atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_top_ns[acc_idx]),
+                                                                static_cast<unsigned long long>(comb_wait_top_ns));
+                        if (static_cast<unsigned long long>(comb_wait_top_ns) > prev_top) {
+                            state->perf_comb_wait_top_token[acc_idx] = token_idx;
+                            state->perf_comb_wait_top_slot[acc_idx] = comb_wait_top_slot;
+                            state->perf_comb_wait_top_expert[acc_idx] = comb_wait_top_slot >= 0 ? comb_wait_top_slot / state->max_tokens_per_expert : -1;
+                            state->perf_comb_wait_top_from_flush[acc_idx] = comb_wait_top_from_flush;
+                        }
                         atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_max_ns[acc_idx]),
                                   static_cast<unsigned long long>(comb_gather_reduce_ns));
                         atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_single_max_ns[acc_idx]),
@@ -3420,7 +3902,7 @@ static void launch_megakernel_v7_case(
     constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
     const int num_ranks = host_state.num_ranks;
 
-    printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d num_rdma_ranks=%d block_threads=%d smem_size=%d stream=%p\n",
+    printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d kNumRDMARanks=%d block_threads=%d smem_size=%d stream=%p\n",
            device_state, total_sms, num_ranks, kNumRDMARanks, kThreads, smem_size, stream);
     if (smem_size > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7<kNumRDMARanks>,
@@ -3469,8 +3951,8 @@ void launch_megakernel_v7(
     const int num_ranks = host_state.num_ranks;
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
 
-#define MEGAKERNEL_LAUNCH_CASE(num_rdma_ranks) \
-    launch_megakernel_v7_case<num_rdma_ranks>(device_state, host_state, total_sms, smem_size, stream); \
+#define MEGAKERNEL_LAUNCH_CASE(kNumRDMARanks) \
+    launch_megakernel_v7_case<kNumRDMARanks>(device_state, host_state, total_sms, smem_size, stream); \
     break
 
     SWITCH_RDMA_RANKS(MEGAKERNEL_LAUNCH_CASE);
@@ -3485,6 +3967,7 @@ void launch_megakernel_v7(
 
 #ifdef MK_PERF_TRACE
 static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms) {
+    constexpr bool emit_perf_args = MK_PERF_TRACE >= 2;
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
 
@@ -3504,6 +3987,10 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     std::vector<int64_t> comb_wait_ready(num_logical_channels * 2);
     std::vector<int64_t> comb_wait_ready_single(num_logical_channels * 2);
     std::vector<int64_t> comb_wait_ready_multi(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_flush(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_full(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_flush_count(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_full_count(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_reduce(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_single(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_multi(num_logical_channels * 2);
@@ -3515,6 +4002,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     std::vector<int64_t> comb_wait_ready_max(num_logical_channels * 2);
     std::vector<int64_t> comb_wait_ready_single_max(num_logical_channels * 2);
     std::vector<int64_t> comb_wait_ready_multi_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_flush_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_ready_full_max(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_top(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_top_token(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_top_slot(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_top_expert(num_logical_channels * 2);
+    std::vector<int64_t> comb_wait_top_from_flush(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_reduce_max(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_single_max(num_logical_channels * 2);
     std::vector<int64_t> comb_gather_multi_max(num_logical_channels * 2);
@@ -3533,6 +4027,10 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     CUDA_CHECK(cudaMemcpy(comb_wait_ready.data(), host_state.perf_comb_wait_ready_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_wait_ready_single.data(), host_state.perf_comb_wait_ready_single_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_wait_ready_multi.data(), host_state.perf_comb_wait_ready_multi_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush.data(), host_state.perf_comb_wait_ready_flush_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full.data(), host_state.perf_comb_wait_ready_full_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush_count.data(), host_state.perf_comb_wait_ready_flush_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full_count.data(), host_state.perf_comb_wait_ready_full_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_reduce.data(), host_state.perf_comb_gather_reduce_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_single.data(), host_state.perf_comb_gather_single_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_multi.data(), host_state.perf_comb_gather_multi_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -3544,6 +4042,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     CUDA_CHECK(cudaMemcpy(comb_wait_ready_max.data(), host_state.perf_comb_wait_ready_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_wait_ready_single_max.data(), host_state.perf_comb_wait_ready_single_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_wait_ready_multi_max.data(), host_state.perf_comb_wait_ready_multi_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush_max.data(), host_state.perf_comb_wait_ready_flush_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full_max.data(), host_state.perf_comb_wait_ready_full_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_top.data(), host_state.perf_comb_wait_top_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_top_token.data(), host_state.perf_comb_wait_top_token, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_top_slot.data(), host_state.perf_comb_wait_top_slot, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_top_expert.data(), host_state.perf_comb_wait_top_expert, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(comb_wait_top_from_flush.data(), host_state.perf_comb_wait_top_from_flush, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_reduce_max.data(), host_state.perf_comb_gather_reduce_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_single_max.data(), host_state.perf_comb_gather_single_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(comb_gather_multi_max.data(), host_state.perf_comb_gather_multi_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -3561,17 +4066,111 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     std::vector<int64_t> disp_pub_atomic(num_logical_channels * 2);
     std::vector<int64_t> disp_pub_fence(num_logical_channels * 2);
     std::vector<int64_t> disp_pub_store(num_logical_channels * 2);
+    std::vector<int64_t> disp_cta_barrier(num_logical_channels * 2);
+    std::vector<int64_t> disp_channel_barrier(num_logical_channels * 2);
+    std::vector<int64_t> disp_round_barrier(num_logical_channels * 2);
+    std::vector<int64_t> disp_tokens(num_logical_channels * 2);
+    std::vector<int64_t> disp_local_hit_tokens(num_logical_channels * 2);
+    std::vector<int64_t> disp_local_hits(num_logical_channels * 2);
+    const int disp_role_n = num_logical_channels * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS;
+    const int disp_recv_n = num_logical_channels * 2 * NUM_MAX_NVL_PEERS;
+    const int num_rdma_ranks = host_state.num_ranks / NUM_MAX_NVL_PEERS;
+    std::vector<int64_t> disp_cta_release(num_logical_channels * 2);
+    std::vector<int64_t> disp_role_arrive(disp_role_n);
+    std::vector<int64_t> disp_role_work(disp_role_n);
+    std::vector<int64_t> disp_allrecv_wait_nvl(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_wait(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_wait_start(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_observe(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_done(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_slowest_rdma(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_src_nvl(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_raw_start(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_prefix_raw_end(disp_recv_n);
+    const int disp_prefix_prod_n = disp_recv_n * num_rdma_ranks;
+    std::vector<int64_t> disp_prefix_store_begin(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_publish(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_fence_done(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_store_to_fence(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_meta_wait(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_tokens(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_producer_rank(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_producer_nvl(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_producer_dst_nvl(disp_prefix_prod_n);
+    std::vector<int64_t> disp_prefix_producer_src_rdma(disp_prefix_prod_n);
+    std::vector<int64_t> disp_allrecv_token_loop(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_retire(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_publish(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_tokens(disp_recv_n);
+    std::vector<int64_t> disp_allrecv_local_hits(disp_recv_n);
     CUDA_CHECK(cudaMemcpy(disp_pub_scan.data(), host_state.perf_disp_pub_scan_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(disp_pub_atomic.data(), host_state.perf_disp_pub_atomic_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(disp_pub_fence.data(), host_state.perf_disp_pub_fence_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(disp_pub_store.data(), host_state.perf_disp_pub_store_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_cta_barrier.data(), host_state.perf_disp_cta_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_channel_barrier.data(), host_state.perf_disp_channel_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_round_barrier.data(), host_state.perf_disp_round_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_tokens.data(), host_state.perf_disp_tokens, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_local_hit_tokens.data(), host_state.perf_disp_local_hit_tokens, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_local_hits.data(), host_state.perf_disp_local_hits, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_cta_release.data(), host_state.perf_disp_cta_release_ts, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_role_arrive.data(), host_state.perf_disp_role_arrive_ts, (size_t)disp_role_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_role_work.data(), host_state.perf_disp_role_work_ns, (size_t)disp_role_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_wait_nvl.data(), host_state.perf_disp_allrecv_wait_nvl_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_wait.data(), host_state.perf_disp_allrecv_prefix_wait_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_wait_start.data(), host_state.perf_disp_allrecv_prefix_wait_start_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_observe.data(), host_state.perf_disp_allrecv_prefix_observe_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_done.data(), host_state.perf_disp_allrecv_prefix_done_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_slowest_rdma.data(), host_state.perf_disp_allrecv_prefix_slowest_rdma, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_src_nvl.data(), host_state.perf_disp_allrecv_prefix_src_nvl, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_raw_start.data(), host_state.perf_disp_allrecv_prefix_raw_start, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_raw_end.data(), host_state.perf_disp_allrecv_prefix_raw_end, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_store_begin.data(), host_state.perf_disp_prefix_store_begin_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_publish.data(), host_state.perf_disp_prefix_publish_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_fence_done.data(), host_state.perf_disp_prefix_fence_done_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_store_to_fence.data(), host_state.perf_disp_prefix_store_to_fence_ns, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_meta_wait.data(), host_state.perf_disp_prefix_meta_wait_ns, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_tokens.data(), host_state.perf_disp_prefix_tokens, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_rank.data(), host_state.perf_disp_prefix_producer_rank, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_nvl.data(), host_state.perf_disp_prefix_producer_nvl, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_dst_nvl.data(), host_state.perf_disp_prefix_producer_dst_nvl, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_src_rdma.data(), host_state.perf_disp_prefix_producer_src_rdma, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_token_loop.data(), host_state.perf_disp_allrecv_token_loop_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_retire.data(), host_state.perf_disp_allrecv_retire_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_publish.data(), host_state.perf_disp_allrecv_publish_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_tokens.data(), host_state.perf_disp_allrecv_tokens, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(disp_allrecv_local_hits.data(), host_state.perf_disp_allrecv_local_hits, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     std::vector<int64_t> sched_ts(2);
     int64_t sched_scan_ns = 0, sched_enqueue_ns = 0, sched_idle_ns = 0;
+    int64_t sched_priority_scan_tokens = 0, sched_priority_ready_tokens = 0;
+    int64_t sched_priority_full_batch_hits = 0, sched_priority_batch_already_enqueued = 0;
+    int64_t sched_priority_not_full = 0, sched_normal_full_batch_enqueues = 0, sched_flush_tail_enqueues = 0;
+    int64_t sched_queue_empty_count = 0, sched_queue_empty_after_dispatch_count = 0;
+    int64_t sched_max_ready_tail_gap = 0, sched_stall_expert = -1, sched_stall_recv_count = 0;
+    int64_t sched_stall_alloc_count = 0, sched_stall_enqueue_cursor = 0;
+    int64_t sched_stall_first_unready_slot = -1, sched_stall_first_unready_ready = 0, sched_stall_dispatch_done = 0;
     CUDA_CHECK(cudaMemcpy(sched_ts.data(), host_state.perf_sched_ts, 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_scan_ns, host_state.perf_sched_scan_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_enqueue_ns, host_state.perf_sched_enqueue_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_idle_ns, host_state.perf_sched_idle_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_priority_scan_tokens, host_state.perf_sched_priority_scan_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_priority_ready_tokens, host_state.perf_sched_priority_ready_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_priority_full_batch_hits, host_state.perf_sched_priority_full_batch_hits, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_priority_batch_already_enqueued, host_state.perf_sched_priority_batch_already_enqueued, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_priority_not_full, host_state.perf_sched_priority_not_full, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_normal_full_batch_enqueues, host_state.perf_sched_normal_full_batch_enqueues, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_flush_tail_enqueues, host_state.perf_sched_flush_tail_enqueues, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_queue_empty_count, host_state.perf_sched_queue_empty_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_queue_empty_after_dispatch_count, host_state.perf_sched_queue_empty_after_dispatch_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_max_ready_tail_gap, host_state.perf_sched_max_ready_tail_gap, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_expert, host_state.perf_sched_stall_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_recv_count, host_state.perf_sched_stall_recv_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_alloc_count, host_state.perf_sched_stall_alloc_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_enqueue_cursor, host_state.perf_sched_stall_enqueue_cursor, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_slot, host_state.perf_sched_stall_first_unready_slot, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_ready, host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_stall_dispatch_done, host_state.perf_sched_stall_dispatch_done, sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     // Per-compute-task records.
     constexpr int NCF = MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
@@ -3682,6 +4281,10 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t ts_ns = start - base_ts;
         int64_t dur_ns = end - start;
         if (dur_ns <= 0) dur_ns = 1;
+        if (!emit_perf_args) {
+            emit_event(name, cat, start, end, pid, tid);
+            return;
+        }
         emit_comma();
         fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
                    "\"args\":{\"%s_us\":%.3f,\"%s_us\":%.3f,\"%s_us\":%.3f}}",
@@ -3691,12 +4294,17 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     auto emit_event_combine_sender = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
                                          int64_t tma_wait_sum_ns, int64_t wait_ready_sum_ns,
                                          int64_t wait_ready_single_sum_ns, int64_t wait_ready_multi_sum_ns,
+                                         int64_t wait_ready_flush_sum_ns, int64_t wait_ready_full_sum_ns,
+                                         int64_t wait_ready_flush_count, int64_t wait_ready_full_count,
                                          int64_t gather_reduce_sum_ns,
                                          int64_t gather_single_sum_ns, int64_t gather_multi_sum_ns,
                                          int64_t pack_meta_sum_ns, int64_t pack_meta_work_sum_ns,
                                          int64_t pack_meta_sync_sum_ns, int64_t tma_store_sum_ns,
                                          int64_t tma_wait_max_ns, int64_t wait_ready_max_ns,
                                          int64_t wait_ready_single_max_ns, int64_t wait_ready_multi_max_ns,
+                                         int64_t wait_ready_flush_max_ns, int64_t wait_ready_full_max_ns,
+                                         int64_t wait_top_ns, int64_t wait_top_token, int64_t wait_top_slot,
+                                         int64_t wait_top_expert, int64_t wait_top_from_flush,
                                          int64_t gather_reduce_max_ns,
                                          int64_t gather_single_max_ns, int64_t gather_multi_max_ns,
                                          int64_t pack_meta_max_ns, int64_t pack_meta_work_max_ns,
@@ -3707,16 +4315,25 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t ts_ns = start - base_ts;
         int64_t dur_ns = end - start;
         if (dur_ns <= 0) dur_ns = 1;
+        if (!emit_perf_args) {
+            emit_event(name, cat, start, end, pid, tid);
+            return;
+        }
         double avg_nhits = token_count > 0 ? static_cast<double>(nhit_sum) / static_cast<double>(token_count) : 0.0;
         emit_comma();
         fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
                    "\"args\":{\"tma_wait_sum_us\":%.3f,\"wait_slot_ready_sum_us\":%.3f,"
                    "\"wait_slot_ready_single_sum_us\":%.3f,\"wait_slot_ready_multi_sum_us\":%.3f,"
+                   "\"wait_slot_ready_flush_sum_us\":%.3f,\"wait_slot_ready_full_sum_us\":%.3f,"
+                   "\"wait_slot_ready_flush_count\":%lld,\"wait_slot_ready_full_count\":%lld,"
                    "\"gather_reduce_sum_us\":%.3f,\"gather_single_sum_us\":%.3f,\"gather_multi_sum_us\":%.3f,"
                    "\"pack_meta_sum_us\":%.3f,\"pack_meta_work_sum_us\":%.3f,\"pack_meta_sync_sum_us\":%.3f,"
                    "\"tma_store_issue_sum_us\":%.3f,"
                    "\"tma_wait_max_us\":%.3f,\"wait_slot_ready_max_us\":%.3f,"
                    "\"wait_slot_ready_single_max_us\":%.3f,\"wait_slot_ready_multi_max_us\":%.3f,"
+                   "\"wait_slot_ready_flush_max_us\":%.3f,\"wait_slot_ready_full_max_us\":%.3f,"
+                   "\"top_wait_us\":%.3f,\"top_wait_token\":%lld,\"top_wait_slot\":%lld,"
+                   "\"top_wait_expert\":%lld,\"top_wait_from_flush\":%lld,"
                    "\"gather_reduce_max_us\":%.3f,\"gather_single_max_us\":%.3f,\"gather_multi_max_us\":%.3f,"
                    "\"pack_meta_max_us\":%.3f,\"pack_meta_work_max_us\":%.3f,\"pack_meta_sync_max_us\":%.3f,"
                    "\"tma_store_issue_max_us\":%.3f,"
@@ -3725,11 +4342,16 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                 name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
                 tma_wait_sum_ns / 1000.0, wait_ready_sum_ns / 1000.0,
                 wait_ready_single_sum_ns / 1000.0, wait_ready_multi_sum_ns / 1000.0,
+                wait_ready_flush_sum_ns / 1000.0, wait_ready_full_sum_ns / 1000.0,
+                static_cast<long long>(wait_ready_flush_count), static_cast<long long>(wait_ready_full_count),
                 gather_reduce_sum_ns / 1000.0, gather_single_sum_ns / 1000.0, gather_multi_sum_ns / 1000.0,
                 pack_meta_sum_ns / 1000.0, pack_meta_work_sum_ns / 1000.0, pack_meta_sync_sum_ns / 1000.0,
                 tma_store_sum_ns / 1000.0,
                 tma_wait_max_ns / 1000.0, wait_ready_max_ns / 1000.0,
                 wait_ready_single_max_ns / 1000.0, wait_ready_multi_max_ns / 1000.0,
+                wait_ready_flush_max_ns / 1000.0, wait_ready_full_max_ns / 1000.0,
+                wait_top_ns / 1000.0, static_cast<long long>(wait_top_token), static_cast<long long>(wait_top_slot),
+                static_cast<long long>(wait_top_expert), static_cast<long long>(wait_top_from_flush),
                 gather_reduce_max_ns / 1000.0, gather_single_max_ns / 1000.0, gather_multi_max_ns / 1000.0,
                 pack_meta_max_ns / 1000.0, pack_meta_work_max_ns / 1000.0, pack_meta_sync_max_ns / 1000.0,
                 tma_store_max_ns / 1000.0,
@@ -3737,32 +4359,195 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                 static_cast<long long>(multi_token_count), static_cast<long long>(nhit_sum), avg_nhits);
     };
     auto emit_event_scheduler = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
-                                    int64_t scan_ns, int64_t enqueue_ns, int64_t idle_ns) {
+                                    int64_t scan_ns, int64_t enqueue_ns, int64_t idle_ns,
+                                    int64_t priority_scan_tokens, int64_t priority_ready_tokens,
+                                    int64_t priority_full_batch_hits, int64_t priority_batch_already_enqueued,
+                                    int64_t priority_not_full, int64_t normal_full_batch_enqueues,
+                                    int64_t flush_tail_enqueues, int64_t queue_empty_count,
+                                    int64_t queue_empty_after_dispatch_count, int64_t max_ready_tail_gap,
+                                    int64_t stall_expert, int64_t stall_recv_count, int64_t stall_alloc_count,
+                                    int64_t stall_enqueue_cursor, int64_t stall_first_unready_slot,
+                                    int64_t stall_first_unready_ready, int64_t stall_dispatch_done) {
         if (start == 0 || end == 0 || end <= start) return;
         int64_t ts_ns = start - base_ts;
         int64_t dur_ns = end - start;
         if (dur_ns <= 0) dur_ns = 1;
+        if (!emit_perf_args) {
+            emit_event(name, cat, start, end, pid, tid);
+            return;
+        }
         emit_comma();
         fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"scheduler_lanes\":%d,\"scan_ready_us\":%.3f,\"enqueue_task_us\":%.3f,\"idle_sleep_us\":%.3f}}",
+                   "\"args\":{\"scheduler_lanes\":%d,\"scan_ready_us\":%.3f,\"enqueue_task_us\":%.3f,\"idle_sleep_us\":%.3f,"
+                   "\"priority_scan_tokens\":%lld,\"priority_ready_tokens\":%lld,"
+                   "\"priority_full_batch_hits\":%lld,\"priority_batch_already_enqueued\":%lld,"
+                   "\"priority_not_full\":%lld,\"normal_full_batch_enqueues\":%lld,\"flush_tail_enqueues\":%lld,"
+                   "\"queue_empty_count\":%lld,\"queue_empty_after_dispatch_count\":%lld,"
+                   "\"max_ready_tail_gap\":%lld,\"stall_expert\":%lld,\"stall_recv_count\":%lld,"
+                   "\"stall_alloc_count\":%lld,\"stall_enqueue_cursor\":%lld,"
+                   "\"stall_first_unready_slot\":%lld,\"stall_first_unready_ready\":%lld,"
+                   "\"stall_dispatch_done\":%lld}}",
                 name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
-                COMPUTE_SCHEDULER_SMS, scan_ns / 1000.0, enqueue_ns / 1000.0, idle_ns / 1000.0);
+                COMPUTE_SCHEDULER_SMS, scan_ns / 1000.0, enqueue_ns / 1000.0, idle_ns / 1000.0,
+                static_cast<long long>(priority_scan_tokens), static_cast<long long>(priority_ready_tokens),
+                static_cast<long long>(priority_full_batch_hits), static_cast<long long>(priority_batch_already_enqueued),
+                static_cast<long long>(priority_not_full), static_cast<long long>(normal_full_batch_enqueues),
+                static_cast<long long>(flush_tail_enqueues), static_cast<long long>(queue_empty_count),
+                static_cast<long long>(queue_empty_after_dispatch_count), static_cast<long long>(max_ready_tail_gap),
+                static_cast<long long>(stall_expert), static_cast<long long>(stall_recv_count),
+                static_cast<long long>(stall_alloc_count), static_cast<long long>(stall_enqueue_cursor),
+                static_cast<long long>(stall_first_unready_slot), static_cast<long long>(stall_first_unready_ready),
+                static_cast<long long>(stall_dispatch_done));
     };
     // Dispatch sender/forwarder work event with full publish breakdown as args (us).
     auto emit_event_publish = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
                                   int64_t wait_nvl_ns, int64_t publish_ns, int64_t wait_recvcount_ns,
-                                  int64_t scan_ns, int64_t atomic_ns, int64_t fence_ns, int64_t store_ns) {
+                                  int64_t scan_ns, int64_t atomic_ns, int64_t fence_ns, int64_t store_ns,
+                                  int64_t cta_barrier_ns, int64_t channel_barrier_ns, int64_t round_barrier_ns,
+                                  int64_t tokens, int64_t local_hit_tokens, int64_t local_hits,
+                                  int64_t cta_last_role, int64_t cta_last_slot, int64_t cta_last_work_ns,
+                                  int64_t cta_last_arrive_to_release_ns,
+                                  int64_t last_recv_prefix_wait_ns, int64_t last_recv_prefix_src_nvl,
+                                  int64_t last_recv_prefix_src_rdma,
+                                  int64_t last_recv_prefix_publish_to_done_ns,
+                                  int64_t last_recv_prefix_store_to_fence_ns,
+                                  int64_t last_recv_prefix_fence_done_to_done_ns,
+                                  int64_t last_recv_prefix_producer_meta_wait_ns,
+                                  int64_t last_recv_prefix_producer_tokens,
+                                  int64_t last_recv_prefix_producer_rank,
+                                  int64_t last_recv_prefix_producer_nvl,
+                                  int64_t last_recv_prefix_producer_dst_nvl,
+                                  int64_t last_recv_prefix_producer_src_rdma,
+                                  int64_t last_recv_prefix_wait_start_to_store_begin_ns,
+                                  int64_t last_recv_prefix_store_begin_to_observe_ns,
+                                  int64_t last_recv_prefix_publish_to_observe_ns,
+                                  int64_t last_recv_prefix_observe_to_done_ns,
+                                  int64_t last_recv_prefix_raw_start,
+                                  int64_t last_recv_prefix_raw_end,
+                                  int64_t last_recv_wait_nvl_ns,
+                                  int64_t last_recv_token_loop_ns, int64_t last_recv_publish_ns,
+                                  int64_t last_recv_retire_ns, int64_t last_recv_tokens,
+                                  int64_t last_recv_local_hits,
+                                  int64_t slowest_recv_rank, int64_t slowest_recv_prefix_wait_ns,
+                                  int64_t slowest_recv_prefix_src_nvl,
+                                  int64_t slowest_recv_prefix_src_rdma,
+                                  int64_t slowest_recv_prefix_publish_to_done_ns,
+                                  int64_t slowest_recv_prefix_store_to_fence_ns,
+                                  int64_t slowest_recv_prefix_fence_done_to_done_ns,
+                                  int64_t slowest_recv_prefix_producer_meta_wait_ns,
+                                  int64_t slowest_recv_prefix_producer_tokens,
+                                  int64_t slowest_recv_prefix_producer_rank,
+                                  int64_t slowest_recv_prefix_producer_nvl,
+                                  int64_t slowest_recv_prefix_producer_dst_nvl,
+                                  int64_t slowest_recv_prefix_producer_src_rdma,
+                                  int64_t slowest_recv_prefix_wait_start_to_store_begin_ns,
+                                  int64_t slowest_recv_prefix_store_begin_to_observe_ns,
+                                  int64_t slowest_recv_prefix_publish_to_observe_ns,
+                                  int64_t slowest_recv_prefix_observe_to_done_ns,
+                                  int64_t slowest_recv_prefix_raw_start,
+                                  int64_t slowest_recv_prefix_raw_end,
+                                  int64_t slowest_recv_wait_nvl_ns, int64_t slowest_recv_token_loop_ns,
+                                  int64_t slowest_recv_publish_ns, int64_t slowest_recv_retire_ns,
+                                  int64_t slowest_recv_tokens, int64_t slowest_recv_local_hits) {
         if (start == 0 || end == 0 || end <= start) return;
         int64_t ts_ns = start - base_ts;
         int64_t dur_ns = end - start;
         if (dur_ns <= 0) dur_ns = 1;
+        if (!emit_perf_args) {
+            emit_event(name, cat, start, end, pid, tid);
+            return;
+        }
+        int64_t attributed_ns = wait_nvl_ns + publish_ns + cta_barrier_ns + channel_barrier_ns + round_barrier_ns;
+        int64_t unattributed_ns = dur_ns > attributed_ns ? dur_ns - attributed_ns : 0;
         emit_comma();
         fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
                    "\"args\":{\"wait_nvl_us\":%.3f,\"publish_us\":%.3f,\"wait_recvcount_us\":%.3f,"
-                   "\"pub_scan_us\":%.3f,\"pub_atomic_us\":%.3f,\"pub_fence_us\":%.3f,\"pub_store_us\":%.3f}}",
+                   "\"pub_scan_us\":%.3f,\"pub_atomic_us\":%.3f,\"pub_fence_us\":%.3f,\"pub_store_us\":%.3f,"
+                   "\"cta_barrier_us\":%.3f,\"channel_barrier_us\":%.3f,\"round_barrier_us\":%.3f,\"unattributed_us\":%.3f,"
+                   "\"tokens\":%lld,\"local_hit_tokens\":%lld,\"local_hits\":%lld,"
+                   "\"cta_last_role\":%lld,\"cta_last_slot\":%lld,\"cta_last_work_us\":%.3f,"
+                   "\"cta_last_arrive_to_release_us\":%.3f,"
+                   "\"last_recv_prefix_wait_us\":%.3f,\"last_recv_prefix_src_nvl\":%lld,"
+                   "\"last_recv_prefix_src_rdma\":%lld,"
+                   "\"last_recv_prefix_publish_to_done_us\":%.3f,\"last_recv_prefix_store_to_fence_us\":%.3f,"
+                   "\"last_recv_prefix_fence_done_to_done_us\":%.3f,\"last_recv_prefix_producer_meta_wait_us\":%.3f,"
+                   "\"last_recv_prefix_producer_tokens\":%lld,\"last_recv_prefix_producer_rank\":%lld,"
+                   "\"last_recv_prefix_producer_nvl\":%lld,\"last_recv_prefix_producer_dst_nvl\":%lld,"
+                   "\"last_recv_prefix_producer_src_rdma\":%lld,"
+                   "\"last_recv_prefix_wait_start_to_store_begin_us\":%.3f,"
+                   "\"last_recv_prefix_store_begin_to_observe_us\":%.3f,"
+                   "\"last_recv_prefix_publish_to_observe_us\":%.3f,"
+                   "\"last_recv_prefix_observe_to_done_us\":%.3f,"
+                   "\"last_recv_prefix_raw_start\":%lld,\"last_recv_prefix_raw_end\":%lld,"
+                   "\"last_recv_wait_nvl_us\":%.3f,"
+                   "\"last_recv_token_loop_us\":%.3f,\"last_recv_publish_us\":%.3f,"
+                   "\"last_recv_retire_us\":%.3f,\"last_recv_tokens\":%lld,"
+                   "\"last_recv_local_hits\":%lld,"
+                   "\"slowest_recv_rank\":%lld,\"slowest_recv_prefix_wait_us\":%.3f,"
+                   "\"slowest_recv_prefix_src_nvl\":%lld,\"slowest_recv_prefix_src_rdma\":%lld,"
+                   "\"slowest_recv_prefix_publish_to_done_us\":%.3f,"
+                   "\"slowest_recv_prefix_store_to_fence_us\":%.3f,\"slowest_recv_prefix_fence_done_to_done_us\":%.3f,"
+                   "\"slowest_recv_prefix_producer_meta_wait_us\":%.3f,\"slowest_recv_prefix_producer_tokens\":%lld,"
+                   "\"slowest_recv_prefix_producer_rank\":%lld,\"slowest_recv_prefix_producer_nvl\":%lld,"
+                   "\"slowest_recv_prefix_producer_dst_nvl\":%lld,\"slowest_recv_prefix_producer_src_rdma\":%lld,"
+                   "\"slowest_recv_prefix_wait_start_to_store_begin_us\":%.3f,"
+                   "\"slowest_recv_prefix_store_begin_to_observe_us\":%.3f,"
+                   "\"slowest_recv_prefix_publish_to_observe_us\":%.3f,"
+                   "\"slowest_recv_prefix_observe_to_done_us\":%.3f,"
+                   "\"slowest_recv_prefix_raw_start\":%lld,\"slowest_recv_prefix_raw_end\":%lld,"
+                   "\"slowest_recv_wait_nvl_us\":%.3f,\"slowest_recv_token_loop_us\":%.3f,"
+                   "\"slowest_recv_publish_us\":%.3f,\"slowest_recv_retire_us\":%.3f,"
+                   "\"slowest_recv_tokens\":%lld,\"slowest_recv_local_hits\":%lld}}",
                 name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
                 wait_nvl_ns / 1000.0, publish_ns / 1000.0, wait_recvcount_ns / 1000.0,
-                scan_ns / 1000.0, atomic_ns / 1000.0, fence_ns / 1000.0, store_ns / 1000.0);
+                scan_ns / 1000.0, atomic_ns / 1000.0, fence_ns / 1000.0, store_ns / 1000.0,
+                cta_barrier_ns / 1000.0, channel_barrier_ns / 1000.0, round_barrier_ns / 1000.0, unattributed_ns / 1000.0,
+                static_cast<long long>(tokens), static_cast<long long>(local_hit_tokens),
+                static_cast<long long>(local_hits), static_cast<long long>(cta_last_role),
+                static_cast<long long>(cta_last_slot), cta_last_work_ns / 1000.0,
+                cta_last_arrive_to_release_ns / 1000.0,
+                last_recv_prefix_wait_ns / 1000.0, static_cast<long long>(last_recv_prefix_src_nvl),
+                static_cast<long long>(last_recv_prefix_src_rdma),
+                last_recv_prefix_publish_to_done_ns / 1000.0,
+                last_recv_prefix_store_to_fence_ns / 1000.0,
+                last_recv_prefix_fence_done_to_done_ns / 1000.0,
+                last_recv_prefix_producer_meta_wait_ns / 1000.0,
+                static_cast<long long>(last_recv_prefix_producer_tokens),
+                static_cast<long long>(last_recv_prefix_producer_rank),
+                static_cast<long long>(last_recv_prefix_producer_nvl),
+                static_cast<long long>(last_recv_prefix_producer_dst_nvl),
+                static_cast<long long>(last_recv_prefix_producer_src_rdma),
+                last_recv_prefix_wait_start_to_store_begin_ns / 1000.0,
+                last_recv_prefix_store_begin_to_observe_ns / 1000.0,
+                last_recv_prefix_publish_to_observe_ns / 1000.0,
+                last_recv_prefix_observe_to_done_ns / 1000.0,
+                static_cast<long long>(last_recv_prefix_raw_start),
+                static_cast<long long>(last_recv_prefix_raw_end),
+                last_recv_wait_nvl_ns / 1000.0,
+                last_recv_token_loop_ns / 1000.0, last_recv_publish_ns / 1000.0,
+                last_recv_retire_ns / 1000.0, static_cast<long long>(last_recv_tokens),
+                static_cast<long long>(last_recv_local_hits),
+                static_cast<long long>(slowest_recv_rank), slowest_recv_prefix_wait_ns / 1000.0,
+                static_cast<long long>(slowest_recv_prefix_src_nvl),
+                static_cast<long long>(slowest_recv_prefix_src_rdma),
+                slowest_recv_prefix_publish_to_done_ns / 1000.0,
+                slowest_recv_prefix_store_to_fence_ns / 1000.0,
+                slowest_recv_prefix_fence_done_to_done_ns / 1000.0,
+                slowest_recv_prefix_producer_meta_wait_ns / 1000.0,
+                static_cast<long long>(slowest_recv_prefix_producer_tokens),
+                static_cast<long long>(slowest_recv_prefix_producer_rank),
+                static_cast<long long>(slowest_recv_prefix_producer_nvl),
+                static_cast<long long>(slowest_recv_prefix_producer_dst_nvl),
+                static_cast<long long>(slowest_recv_prefix_producer_src_rdma),
+                slowest_recv_prefix_wait_start_to_store_begin_ns / 1000.0,
+                slowest_recv_prefix_store_begin_to_observe_ns / 1000.0,
+                slowest_recv_prefix_publish_to_observe_ns / 1000.0,
+                slowest_recv_prefix_observe_to_done_ns / 1000.0,
+                static_cast<long long>(slowest_recv_prefix_raw_start),
+                static_cast<long long>(slowest_recv_prefix_raw_end),
+                slowest_recv_wait_nvl_ns / 1000.0, slowest_recv_token_loop_ns / 1000.0,
+                slowest_recv_publish_ns / 1000.0, slowest_recv_retire_ns / 1000.0,
+                static_cast<long long>(slowest_recv_tokens), static_cast<long long>(slowest_recv_local_hits));
     };
 
     // Process/thread metadata
@@ -3828,24 +4613,410 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
             host_state.rank, scheduler_tid, scheduler_tid);
 
     int pid = host_state.rank;
+    auto get_dispatch_role_diag = [&](int acc_idx, int64_t& last_role, int64_t& last_slot,
+                                      int64_t& last_work_ns, int64_t& last_arrive_to_release_ns,
+                                      int64_t& last_recv_prefix_wait_ns, int64_t& last_recv_prefix_src_nvl,
+                                      int64_t& last_recv_prefix_src_rdma,
+                                      int64_t& last_recv_prefix_publish_to_done_ns,
+                                      int64_t& last_recv_prefix_store_to_fence_ns,
+                                      int64_t& last_recv_prefix_fence_done_to_done_ns,
+                                      int64_t& last_recv_prefix_producer_meta_wait_ns,
+                                      int64_t& last_recv_prefix_producer_tokens,
+                                      int64_t& last_recv_prefix_producer_rank,
+                                      int64_t& last_recv_prefix_producer_nvl,
+                                      int64_t& last_recv_prefix_producer_dst_nvl,
+                                      int64_t& last_recv_prefix_producer_src_rdma,
+                                      int64_t& last_recv_prefix_wait_start_to_store_begin_ns,
+                                      int64_t& last_recv_prefix_store_begin_to_observe_ns,
+                                      int64_t& last_recv_prefix_publish_to_observe_ns,
+                                      int64_t& last_recv_prefix_observe_to_done_ns,
+                                      int64_t& last_recv_prefix_raw_start,
+                                      int64_t& last_recv_prefix_raw_end,
+                                      int64_t& last_recv_wait_ns,
+                                      int64_t& last_recv_token_loop_ns, int64_t& last_recv_publish_ns,
+                                      int64_t& last_recv_retire_ns, int64_t& last_recv_tokens,
+                                      int64_t& last_recv_local_hits,
+                                      int64_t& slow_recv_rank, int64_t& slow_recv_prefix_wait_ns,
+                                      int64_t& slow_recv_prefix_src_nvl,
+                                      int64_t& slow_recv_prefix_src_rdma,
+                                      int64_t& slow_recv_prefix_publish_to_done_ns,
+                                      int64_t& slow_recv_prefix_store_to_fence_ns,
+                                      int64_t& slow_recv_prefix_fence_done_to_done_ns,
+                                      int64_t& slow_recv_prefix_producer_meta_wait_ns,
+                                      int64_t& slow_recv_prefix_producer_tokens,
+                                      int64_t& slow_recv_prefix_producer_rank,
+                                      int64_t& slow_recv_prefix_producer_nvl,
+                                      int64_t& slow_recv_prefix_producer_dst_nvl,
+                                      int64_t& slow_recv_prefix_producer_src_rdma,
+                                      int64_t& slow_recv_prefix_wait_start_to_store_begin_ns,
+                                      int64_t& slow_recv_prefix_store_begin_to_observe_ns,
+                                      int64_t& slow_recv_prefix_publish_to_observe_ns,
+                                      int64_t& slow_recv_prefix_observe_to_done_ns,
+                                      int64_t& slow_recv_prefix_raw_start,
+                                      int64_t& slow_recv_prefix_raw_end,
+                                      int64_t& slow_recv_wait_ns, int64_t& slow_recv_token_loop_ns,
+                                      int64_t& slow_recv_publish_ns, int64_t& slow_recv_retire_ns,
+                                      int64_t& slow_recv_tokens, int64_t& slow_recv_local_hits) {
+        last_role = -1;
+        last_slot = -1;
+        last_work_ns = 0;
+        last_arrive_to_release_ns = 0;
+        last_recv_prefix_wait_ns = 0;
+        last_recv_prefix_src_nvl = -1;
+        last_recv_prefix_src_rdma = -1;
+        last_recv_prefix_publish_to_done_ns = 0;
+        last_recv_prefix_store_to_fence_ns = 0;
+        last_recv_prefix_fence_done_to_done_ns = 0;
+        last_recv_prefix_producer_meta_wait_ns = 0;
+        last_recv_prefix_producer_tokens = 0;
+        last_recv_prefix_producer_rank = -1;
+        last_recv_prefix_producer_nvl = -1;
+        last_recv_prefix_producer_dst_nvl = -1;
+        last_recv_prefix_producer_src_rdma = -1;
+        last_recv_prefix_wait_start_to_store_begin_ns = 0;
+        last_recv_prefix_store_begin_to_observe_ns = 0;
+        last_recv_prefix_publish_to_observe_ns = 0;
+        last_recv_prefix_observe_to_done_ns = 0;
+        last_recv_prefix_raw_start = 0;
+        last_recv_prefix_raw_end = 0;
+        last_recv_wait_ns = 0;
+        last_recv_token_loop_ns = 0;
+        last_recv_publish_ns = 0;
+        last_recv_retire_ns = 0;
+        last_recv_tokens = 0;
+        last_recv_local_hits = 0;
+        slow_recv_rank = -1;
+        slow_recv_prefix_wait_ns = 0;
+        slow_recv_prefix_src_nvl = -1;
+        slow_recv_prefix_src_rdma = -1;
+        slow_recv_prefix_publish_to_done_ns = 0;
+        slow_recv_prefix_store_to_fence_ns = 0;
+        slow_recv_prefix_fence_done_to_done_ns = 0;
+        slow_recv_prefix_producer_meta_wait_ns = 0;
+        slow_recv_prefix_producer_tokens = 0;
+        slow_recv_prefix_producer_rank = -1;
+        slow_recv_prefix_producer_nvl = -1;
+        slow_recv_prefix_producer_dst_nvl = -1;
+        slow_recv_prefix_producer_src_rdma = -1;
+        slow_recv_prefix_wait_start_to_store_begin_ns = 0;
+        slow_recv_prefix_store_begin_to_observe_ns = 0;
+        slow_recv_prefix_publish_to_observe_ns = 0;
+        slow_recv_prefix_observe_to_done_ns = 0;
+        slow_recv_prefix_raw_start = 0;
+        slow_recv_prefix_raw_end = 0;
+        slow_recv_wait_ns = 0;
+        slow_recv_token_loop_ns = 0;
+        slow_recv_publish_ns = 0;
+        slow_recv_retire_ns = 0;
+        slow_recv_tokens = 0;
+        slow_recv_local_hits = 0;
+        int64_t last_arrive = 0;
+        for (int r = 0; r < MK_DISPATCH_ROLE_COUNT; ++r) {
+            for (int s = 0; s < NUM_MAX_NVL_PEERS; ++s) {
+                int idx = ((acc_idx * MK_DISPATCH_ROLE_COUNT + r) * NUM_MAX_NVL_PEERS) + s;
+                int64_t arrive = disp_role_arrive[idx];
+                if (arrive > last_arrive) {
+                    last_arrive = arrive;
+                    last_role = r;
+                    last_slot = s;
+                    last_work_ns = disp_role_work[idx];
+                }
+            }
+        }
+        if (disp_cta_release[acc_idx] > last_arrive && last_arrive > 0)
+            last_arrive_to_release_ns = disp_cta_release[acc_idx] - last_arrive;
+        if (last_role == 4 && last_slot >= 0) {
+            int idx = acc_idx * NUM_MAX_NVL_PEERS + last_slot;
+            last_recv_prefix_wait_ns = disp_allrecv_prefix_wait[idx];
+            last_recv_prefix_src_nvl = disp_allrecv_prefix_src_nvl[idx];
+            last_recv_prefix_src_rdma = disp_allrecv_prefix_slowest_rdma[idx];
+            if (last_recv_prefix_src_rdma >= 0) {
+                int producer_acc_idx = (acc_idx / 2) * 2 + 1;
+                int prod_idx = (producer_acc_idx * NUM_MAX_NVL_PEERS + last_slot) * num_rdma_ranks + static_cast<int>(last_recv_prefix_src_rdma);
+                int64_t store_begin_ts = disp_prefix_store_begin[prod_idx];
+                int64_t publish_ts = disp_prefix_publish[prod_idx];
+                int64_t observe_ts = disp_allrecv_prefix_observe[idx];
+                if (disp_allrecv_prefix_done[idx] > publish_ts && publish_ts > 0)
+                    last_recv_prefix_publish_to_done_ns = disp_allrecv_prefix_done[idx] - publish_ts;
+                last_recv_prefix_store_to_fence_ns = disp_prefix_store_to_fence[prod_idx];
+                if (disp_allrecv_prefix_done[idx] > disp_prefix_fence_done[prod_idx] && disp_prefix_fence_done[prod_idx] > 0)
+                    last_recv_prefix_fence_done_to_done_ns = disp_allrecv_prefix_done[idx] - disp_prefix_fence_done[prod_idx];
+                if (store_begin_ts > disp_allrecv_prefix_wait_start[idx] && disp_allrecv_prefix_wait_start[idx] > 0)
+                    last_recv_prefix_wait_start_to_store_begin_ns = store_begin_ts - disp_allrecv_prefix_wait_start[idx];
+                if (observe_ts > store_begin_ts && store_begin_ts > 0)
+                    last_recv_prefix_store_begin_to_observe_ns = observe_ts - store_begin_ts;
+                if (observe_ts > publish_ts && publish_ts > 0)
+                    last_recv_prefix_publish_to_observe_ns = observe_ts - publish_ts;
+                if (disp_allrecv_prefix_done[idx] > observe_ts && observe_ts > 0)
+                    last_recv_prefix_observe_to_done_ns = disp_allrecv_prefix_done[idx] - observe_ts;
+                last_recv_prefix_raw_start = disp_allrecv_prefix_raw_start[idx];
+                last_recv_prefix_raw_end = disp_allrecv_prefix_raw_end[idx];
+                last_recv_prefix_producer_meta_wait_ns = disp_prefix_meta_wait[prod_idx];
+                last_recv_prefix_producer_tokens = disp_prefix_tokens[prod_idx];
+                last_recv_prefix_producer_rank = disp_prefix_producer_rank[prod_idx];
+                last_recv_prefix_producer_nvl = disp_prefix_producer_nvl[prod_idx];
+                last_recv_prefix_producer_dst_nvl = disp_prefix_producer_dst_nvl[prod_idx];
+                last_recv_prefix_producer_src_rdma = disp_prefix_producer_src_rdma[prod_idx];
+            }
+            last_recv_wait_ns = disp_allrecv_wait_nvl[idx];
+            last_recv_token_loop_ns = disp_allrecv_token_loop[idx];
+            last_recv_publish_ns = disp_allrecv_publish[idx];
+            last_recv_retire_ns = disp_allrecv_retire[idx];
+            last_recv_tokens = disp_allrecv_tokens[idx];
+            last_recv_local_hits = disp_allrecv_local_hits[idx];
+        }
+        int64_t slow_recv_total = 0;
+        for (int s = 0; s < NUM_MAX_NVL_PEERS; ++s) {
+            int idx = acc_idx * NUM_MAX_NVL_PEERS + s;
+            int64_t total = disp_allrecv_prefix_wait[idx] + disp_allrecv_wait_nvl[idx] +
+                disp_allrecv_token_loop[idx] + disp_allrecv_publish[idx] + disp_allrecv_retire[idx];
+            if (total > slow_recv_total) {
+                slow_recv_total = total;
+                slow_recv_rank = s;
+                slow_recv_prefix_wait_ns = disp_allrecv_prefix_wait[idx];
+                slow_recv_prefix_src_nvl = disp_allrecv_prefix_src_nvl[idx];
+                slow_recv_prefix_src_rdma = disp_allrecv_prefix_slowest_rdma[idx];
+                slow_recv_prefix_publish_to_done_ns = 0;
+                slow_recv_prefix_store_to_fence_ns = 0;
+                slow_recv_prefix_fence_done_to_done_ns = 0;
+                slow_recv_prefix_producer_meta_wait_ns = 0;
+                slow_recv_prefix_producer_tokens = 0;
+                slow_recv_prefix_producer_rank = -1;
+                slow_recv_prefix_producer_nvl = -1;
+                slow_recv_prefix_producer_dst_nvl = -1;
+                slow_recv_prefix_producer_src_rdma = -1;
+                slow_recv_prefix_wait_start_to_store_begin_ns = 0;
+                slow_recv_prefix_store_begin_to_observe_ns = 0;
+                slow_recv_prefix_publish_to_observe_ns = 0;
+                slow_recv_prefix_observe_to_done_ns = 0;
+                slow_recv_prefix_raw_start = 0;
+                slow_recv_prefix_raw_end = 0;
+                if (slow_recv_prefix_src_rdma >= 0) {
+                    int producer_acc_idx = (acc_idx / 2) * 2 + 1;
+                    int prod_idx = (producer_acc_idx * NUM_MAX_NVL_PEERS + s) * num_rdma_ranks + static_cast<int>(slow_recv_prefix_src_rdma);
+                    int64_t store_begin_ts = disp_prefix_store_begin[prod_idx];
+                    int64_t publish_ts = disp_prefix_publish[prod_idx];
+                    int64_t observe_ts = disp_allrecv_prefix_observe[idx];
+                    if (disp_allrecv_prefix_done[idx] > publish_ts && publish_ts > 0)
+                        slow_recv_prefix_publish_to_done_ns = disp_allrecv_prefix_done[idx] - publish_ts;
+                    slow_recv_prefix_store_to_fence_ns = disp_prefix_store_to_fence[prod_idx];
+                    if (disp_allrecv_prefix_done[idx] > disp_prefix_fence_done[prod_idx] && disp_prefix_fence_done[prod_idx] > 0)
+                        slow_recv_prefix_fence_done_to_done_ns = disp_allrecv_prefix_done[idx] - disp_prefix_fence_done[prod_idx];
+                    if (store_begin_ts > disp_allrecv_prefix_wait_start[idx] && disp_allrecv_prefix_wait_start[idx] > 0)
+                        slow_recv_prefix_wait_start_to_store_begin_ns = store_begin_ts - disp_allrecv_prefix_wait_start[idx];
+                    if (observe_ts > store_begin_ts && store_begin_ts > 0)
+                        slow_recv_prefix_store_begin_to_observe_ns = observe_ts - store_begin_ts;
+                    if (observe_ts > publish_ts && publish_ts > 0)
+                        slow_recv_prefix_publish_to_observe_ns = observe_ts - publish_ts;
+                    if (disp_allrecv_prefix_done[idx] > observe_ts && observe_ts > 0)
+                        slow_recv_prefix_observe_to_done_ns = disp_allrecv_prefix_done[idx] - observe_ts;
+                    slow_recv_prefix_raw_start = disp_allrecv_prefix_raw_start[idx];
+                    slow_recv_prefix_raw_end = disp_allrecv_prefix_raw_end[idx];
+                    slow_recv_prefix_producer_meta_wait_ns = disp_prefix_meta_wait[prod_idx];
+                    slow_recv_prefix_producer_tokens = disp_prefix_tokens[prod_idx];
+                    slow_recv_prefix_producer_rank = disp_prefix_producer_rank[prod_idx];
+                    slow_recv_prefix_producer_nvl = disp_prefix_producer_nvl[prod_idx];
+                    slow_recv_prefix_producer_dst_nvl = disp_prefix_producer_dst_nvl[prod_idx];
+                    slow_recv_prefix_producer_src_rdma = disp_prefix_producer_src_rdma[prod_idx];
+                }
+                slow_recv_wait_ns = disp_allrecv_wait_nvl[idx];
+                slow_recv_token_loop_ns = disp_allrecv_token_loop[idx];
+                slow_recv_publish_ns = disp_allrecv_publish[idx];
+                slow_recv_retire_ns = disp_allrecv_retire[idx];
+                slow_recv_tokens = disp_allrecv_tokens[idx];
+                slow_recv_local_hits = disp_allrecv_local_hits[idx];
+            }
+        }
+    };
+
     for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
         int dispatch_sender_tid = lch_tid_base + logical_channel_id * 4;
         int64_t* dsp = &dispatch_lch_ts[(logical_channel_id * 2) * NLP];
+        int64_t last_role = -1, last_slot = -1, last_work_ns = 0, last_arrive_to_release_ns = 0;
+        int64_t last_recv_prefix_wait_ns = 0, last_recv_prefix_src_nvl = -1, last_recv_prefix_src_rdma = -1;
+        int64_t last_recv_prefix_publish_to_done_ns = 0, last_recv_prefix_store_to_fence_ns = 0;
+        int64_t last_recv_prefix_fence_done_to_done_ns = 0, last_recv_prefix_producer_meta_wait_ns = 0;
+        int64_t last_recv_prefix_producer_tokens = 0, last_recv_prefix_producer_rank = -1;
+        int64_t last_recv_prefix_producer_nvl = -1, last_recv_prefix_producer_dst_nvl = -1;
+        int64_t last_recv_prefix_producer_src_rdma = -1;
+        int64_t last_recv_prefix_wait_start_to_store_begin_ns = 0, last_recv_prefix_store_begin_to_observe_ns = 0;
+        int64_t last_recv_prefix_publish_to_observe_ns = 0, last_recv_prefix_observe_to_done_ns = 0;
+        int64_t last_recv_prefix_raw_start = 0, last_recv_prefix_raw_end = 0;
+        int64_t last_recv_wait_ns = 0, last_recv_token_loop_ns = 0;
+        int64_t last_recv_publish_ns = 0, last_recv_retire_ns = 0, last_recv_tokens = 0, last_recv_local_hits = 0;
+        int64_t slow_recv_rank = -1, slow_recv_prefix_wait_ns = 0, slow_recv_prefix_src_nvl = -1, slow_recv_prefix_src_rdma = -1;
+        int64_t slow_recv_prefix_publish_to_done_ns = 0, slow_recv_prefix_store_to_fence_ns = 0;
+        int64_t slow_recv_prefix_fence_done_to_done_ns = 0, slow_recv_prefix_producer_meta_wait_ns = 0;
+        int64_t slow_recv_prefix_producer_tokens = 0, slow_recv_prefix_producer_rank = -1;
+        int64_t slow_recv_prefix_producer_nvl = -1, slow_recv_prefix_producer_dst_nvl = -1;
+        int64_t slow_recv_prefix_producer_src_rdma = -1;
+        int64_t slow_recv_prefix_wait_start_to_store_begin_ns = 0, slow_recv_prefix_store_begin_to_observe_ns = 0;
+        int64_t slow_recv_prefix_publish_to_observe_ns = 0, slow_recv_prefix_observe_to_done_ns = 0;
+        int64_t slow_recv_prefix_raw_start = 0, slow_recv_prefix_raw_end = 0;
+        int64_t slow_recv_wait_ns = 0;
+        int64_t slow_recv_token_loop_ns = 0, slow_recv_publish_ns = 0, slow_recv_retire_ns = 0;
+        int64_t slow_recv_tokens = 0, slow_recv_local_hits = 0;
+        get_dispatch_role_diag(logical_channel_id * 2 + 0, last_role, last_slot, last_work_ns,
+                               last_arrive_to_release_ns,
+                               last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
+                               last_recv_prefix_publish_to_done_ns,
+                               last_recv_prefix_store_to_fence_ns,
+                               last_recv_prefix_fence_done_to_done_ns,
+                               last_recv_prefix_producer_meta_wait_ns,
+                               last_recv_prefix_producer_tokens,
+                               last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
+                               last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
+                               last_recv_prefix_wait_start_to_store_begin_ns,
+                               last_recv_prefix_store_begin_to_observe_ns,
+                               last_recv_prefix_publish_to_observe_ns,
+                               last_recv_prefix_observe_to_done_ns,
+                               last_recv_prefix_raw_start, last_recv_prefix_raw_end,
+                               last_recv_wait_ns, last_recv_token_loop_ns,
+                               last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
+                               last_recv_local_hits,
+                               slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
+                               slow_recv_prefix_publish_to_done_ns,
+                               slow_recv_prefix_store_to_fence_ns,
+                               slow_recv_prefix_fence_done_to_done_ns,
+                               slow_recv_prefix_producer_meta_wait_ns,
+                               slow_recv_prefix_producer_tokens,
+                               slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
+                               slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
+                               slow_recv_prefix_wait_start_to_store_begin_ns,
+                               slow_recv_prefix_store_begin_to_observe_ns,
+                               slow_recv_prefix_publish_to_observe_ns,
+                               slow_recv_prefix_observe_to_done_ns,
+                               slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
+                               slow_recv_wait_ns, slow_recv_token_loop_ns,
+                               slow_recv_publish_ns, slow_recv_retire_ns,
+                               slow_recv_tokens, slow_recv_local_hits);
         emit_event_publish("dispatch_sender_work", "dispatch_sender_lch", dsp[0], dsp[1], pid, dispatch_sender_tid,
                            disp_wait_nvl[logical_channel_id * 2 + 0], disp_publish[logical_channel_id * 2 + 0],
                            disp_wait_recvcount[logical_channel_id * 2 + 0],
                            disp_pub_scan[logical_channel_id * 2 + 0], disp_pub_atomic[logical_channel_id * 2 + 0],
-                           disp_pub_fence[logical_channel_id * 2 + 0], disp_pub_store[logical_channel_id * 2 + 0]);
+                           disp_pub_fence[logical_channel_id * 2 + 0], disp_pub_store[logical_channel_id * 2 + 0],
+                           disp_cta_barrier[logical_channel_id * 2 + 0],
+                           disp_channel_barrier[logical_channel_id * 2 + 0],
+                           disp_round_barrier[logical_channel_id * 2 + 0],
+                           disp_tokens[logical_channel_id * 2 + 0],
+                           disp_local_hit_tokens[logical_channel_id * 2 + 0],
+                           disp_local_hits[logical_channel_id * 2 + 0],
+                           last_role, last_slot, last_work_ns, last_arrive_to_release_ns,
+                           last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
+                           last_recv_prefix_publish_to_done_ns,
+                           last_recv_prefix_store_to_fence_ns,
+                           last_recv_prefix_fence_done_to_done_ns,
+                           last_recv_prefix_producer_meta_wait_ns,
+                           last_recv_prefix_producer_tokens,
+                           last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
+                           last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
+                           last_recv_prefix_wait_start_to_store_begin_ns,
+                           last_recv_prefix_store_begin_to_observe_ns,
+                           last_recv_prefix_publish_to_observe_ns,
+                           last_recv_prefix_observe_to_done_ns,
+                           last_recv_prefix_raw_start, last_recv_prefix_raw_end,
+                           last_recv_wait_ns, last_recv_token_loop_ns,
+                           last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
+                           last_recv_local_hits,
+                           slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
+                           slow_recv_prefix_publish_to_done_ns,
+                           slow_recv_prefix_store_to_fence_ns,
+                           slow_recv_prefix_fence_done_to_done_ns,
+                           slow_recv_prefix_producer_meta_wait_ns,
+                           slow_recv_prefix_producer_tokens,
+                           slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
+                           slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
+                           slow_recv_prefix_wait_start_to_store_begin_ns,
+                           slow_recv_prefix_store_begin_to_observe_ns,
+                           slow_recv_prefix_publish_to_observe_ns,
+                           slow_recv_prefix_observe_to_done_ns,
+                           slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
+                           slow_recv_wait_ns, slow_recv_token_loop_ns,
+                           slow_recv_publish_ns, slow_recv_retire_ns,
+                           slow_recv_tokens, slow_recv_local_hits);
         emit_event("dispatch_sender_channel_barrier", "dispatch_sender_lch", dsp[1], dsp[2], pid, dispatch_sender_tid);
         emit_event("dispatch_sender_round_barrier", "dispatch_sender_lch", dsp[2], dsp[3], pid, dispatch_sender_tid);
 
         int dispatch_forwarder_tid = dispatch_sender_tid + 1;
         int64_t* dfp = &dispatch_lch_ts[(logical_channel_id * 2 + 1) * NLP];
+        get_dispatch_role_diag(logical_channel_id * 2 + 1, last_role, last_slot, last_work_ns,
+                               last_arrive_to_release_ns,
+                               last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
+                               last_recv_prefix_publish_to_done_ns,
+                               last_recv_prefix_store_to_fence_ns,
+                               last_recv_prefix_fence_done_to_done_ns,
+                               last_recv_prefix_producer_meta_wait_ns,
+                               last_recv_prefix_producer_tokens,
+                               last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
+                               last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
+                               last_recv_prefix_wait_start_to_store_begin_ns,
+                               last_recv_prefix_store_begin_to_observe_ns,
+                               last_recv_prefix_publish_to_observe_ns,
+                               last_recv_prefix_observe_to_done_ns,
+                               last_recv_prefix_raw_start, last_recv_prefix_raw_end,
+                               last_recv_wait_ns, last_recv_token_loop_ns,
+                               last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
+                               last_recv_local_hits,
+                               slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
+                               slow_recv_prefix_publish_to_done_ns,
+                               slow_recv_prefix_store_to_fence_ns,
+                               slow_recv_prefix_fence_done_to_done_ns,
+                               slow_recv_prefix_producer_meta_wait_ns,
+                               slow_recv_prefix_producer_tokens,
+                               slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
+                               slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
+                               slow_recv_prefix_wait_start_to_store_begin_ns,
+                               slow_recv_prefix_store_begin_to_observe_ns,
+                               slow_recv_prefix_publish_to_observe_ns,
+                               slow_recv_prefix_observe_to_done_ns,
+                               slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
+                               slow_recv_wait_ns, slow_recv_token_loop_ns,
+                               slow_recv_publish_ns, slow_recv_retire_ns,
+                               slow_recv_tokens, slow_recv_local_hits);
         emit_event_publish("dispatch_forwarder_work", "dispatch_forwarder_lch", dfp[0], dfp[1], pid, dispatch_forwarder_tid,
                            disp_wait_nvl[logical_channel_id * 2 + 1], disp_publish[logical_channel_id * 2 + 1],
                            disp_wait_recvcount[logical_channel_id * 2 + 1],
                            disp_pub_scan[logical_channel_id * 2 + 1], disp_pub_atomic[logical_channel_id * 2 + 1],
-                           disp_pub_fence[logical_channel_id * 2 + 1], disp_pub_store[logical_channel_id * 2 + 1]);
+                           disp_pub_fence[logical_channel_id * 2 + 1], disp_pub_store[logical_channel_id * 2 + 1],
+                           disp_cta_barrier[logical_channel_id * 2 + 1],
+                           disp_channel_barrier[logical_channel_id * 2 + 1],
+                           disp_round_barrier[logical_channel_id * 2 + 1],
+                           disp_tokens[logical_channel_id * 2 + 1],
+                           disp_local_hit_tokens[logical_channel_id * 2 + 1],
+                           disp_local_hits[logical_channel_id * 2 + 1],
+                           last_role, last_slot, last_work_ns, last_arrive_to_release_ns,
+                           last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
+                           last_recv_prefix_publish_to_done_ns,
+                           last_recv_prefix_store_to_fence_ns,
+                           last_recv_prefix_fence_done_to_done_ns,
+                           last_recv_prefix_producer_meta_wait_ns,
+                           last_recv_prefix_producer_tokens,
+                           last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
+                           last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
+                           last_recv_prefix_wait_start_to_store_begin_ns,
+                           last_recv_prefix_store_begin_to_observe_ns,
+                           last_recv_prefix_publish_to_observe_ns,
+                           last_recv_prefix_observe_to_done_ns,
+                           last_recv_prefix_raw_start, last_recv_prefix_raw_end,
+                           last_recv_wait_ns, last_recv_token_loop_ns,
+                           last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
+                           last_recv_local_hits,
+                           slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
+                           slow_recv_prefix_publish_to_done_ns,
+                           slow_recv_prefix_store_to_fence_ns,
+                           slow_recv_prefix_fence_done_to_done_ns,
+                           slow_recv_prefix_producer_meta_wait_ns,
+                           slow_recv_prefix_producer_tokens,
+                           slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
+                           slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
+                           slow_recv_prefix_wait_start_to_store_begin_ns,
+                           slow_recv_prefix_store_begin_to_observe_ns,
+                           slow_recv_prefix_publish_to_observe_ns,
+                           slow_recv_prefix_observe_to_done_ns,
+                           slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
+                           slow_recv_wait_ns, slow_recv_token_loop_ns,
+                           slow_recv_publish_ns, slow_recv_retire_ns,
+                           slow_recv_tokens, slow_recv_local_hits);
         emit_event("dispatch_forwarder_channel_barrier", "dispatch_forwarder_lch", dfp[1], dfp[2], pid, dispatch_forwarder_tid);
         emit_event("dispatch_forwarder_round_barrier", "dispatch_forwarder_lch", dfp[2], dfp[3], pid, dispatch_forwarder_tid);
 
@@ -3858,6 +5029,10 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                                   comb_wait_ready[logical_channel_id * 2 + 0],
                                   comb_wait_ready_single[logical_channel_id * 2 + 0],
                                   comb_wait_ready_multi[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_flush[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_full[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_flush_count[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_full_count[logical_channel_id * 2 + 0],
                                   comb_gather_reduce[logical_channel_id * 2 + 0],
                                   comb_gather_single[logical_channel_id * 2 + 0],
                                   comb_gather_multi[logical_channel_id * 2 + 0],
@@ -3869,6 +5044,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                                   comb_wait_ready_max[logical_channel_id * 2 + 0],
                                   comb_wait_ready_single_max[logical_channel_id * 2 + 0],
                                   comb_wait_ready_multi_max[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_flush_max[logical_channel_id * 2 + 0],
+                                  comb_wait_ready_full_max[logical_channel_id * 2 + 0],
+                                  comb_wait_top[logical_channel_id * 2 + 0],
+                                  comb_wait_top_token[logical_channel_id * 2 + 0],
+                                  comb_wait_top_slot[logical_channel_id * 2 + 0],
+                                  comb_wait_top_expert[logical_channel_id * 2 + 0],
+                                  comb_wait_top_from_flush[logical_channel_id * 2 + 0],
                                   comb_gather_reduce_max[logical_channel_id * 2 + 0],
                                   comb_gather_single_max[logical_channel_id * 2 + 0],
                                   comb_gather_multi_max[logical_channel_id * 2 + 0],
@@ -3888,7 +5070,15 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     }
 
     emit_event_scheduler("scheduler_bridge", "scheduler", sched_ts[0], sched_ts[1], pid, scheduler_tid,
-                         sched_scan_ns, sched_enqueue_ns, sched_idle_ns);
+                         sched_scan_ns, sched_enqueue_ns, sched_idle_ns,
+                         sched_priority_scan_tokens, sched_priority_ready_tokens,
+                         sched_priority_full_batch_hits, sched_priority_batch_already_enqueued,
+                         sched_priority_not_full, sched_normal_full_batch_enqueues,
+                         sched_flush_tail_enqueues, sched_queue_empty_count,
+                         sched_queue_empty_after_dispatch_count, sched_max_ready_tail_gap,
+                         sched_stall_expert, sched_stall_recv_count, sched_stall_alloc_count,
+                         sched_stall_enqueue_cursor, sched_stall_first_unready_slot,
+                         sched_stall_first_unready_ready, sched_stall_dispatch_done);
 
     // Compute task rows: one Perfetto row per compute group, one X-event per task batch.
     int compute_tid_base = num_logical_channels * 4 + 100;
@@ -3927,6 +5117,10 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t sig_donecount = rec[17], sig_finalize = rec[18];
         int64_t sig_fence = rec[19], sig_publish = rec[20];
         int queue_task_idx = static_cast<int>(rec[21]);
+        int start_slot = static_cast<int>(rec[22]);
+        int end_slot = static_cast<int>(rec[23]);
+        int64_t abs_slot_base = rec[24];
+        int is_flush_task = static_cast<int>(rec[25]);
         auto phase_us = [](int64_t a, int64_t b) -> double {
             if (a == 0 || b == 0 || b <= a) return 0.0;
             return (b - a) / 1000.0;
@@ -3971,9 +5165,14 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         double pop_to_bcast_us = phase_us(task_pop_done, task_bcast_done);
         double bcast_to_start_us = phase_us(task_bcast_done, task_start_diag);
         double prev_task_gap_us = ns_us(task_prev_gap);
+        if (!emit_perf_args) {
+            emit_event("compute_task", "compute_group", start, end, pid, tid);
+            continue;
+        }
         emit_comma();
         fprintf(f, "{\"name\":\"compute_e%d\",\"cat\":\"compute_group\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
                    "\"pid\":%d,\"tid\":%d,\"args\":{\"expert_id\":%d,\"sm_id\":%d,\"group_id\":%d,\"batch_size\":%d,"
+                   "\"start_slot\":%d,\"end_slot\":%d,\"abs_slot_base\":%lld,\"is_flush_task\":%d,"
                    "\"hidden_size\":%d,\"intermediate_size\":%d,"
                    "\"p1_meta_us\":%.3f,\"p2_input_load_us\":%.3f,\"p3_gateup_gemm_us\":%.3f,"
                    "\"p4_down_gemm_us\":%.3f,\"p5_output_us\":%.3f,\"p6_signal_us\":%.3f,"
@@ -3993,6 +5192,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                    "\"bcast_to_start_us\":%.3f,\"pop_attempts\":%d,\"cas_failures\":%d,"
                    "\"p6b_multi_expert_rows\":%d,\"p6_task_has_multi\":%d}}",
                 expert_id, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid, expert_id, sm_id, group_id, batch_size,
+                start_slot, end_slot, static_cast<long long>(abs_slot_base), is_flush_task,
                 hidden, intermediate,
                 meta_us, input_us, upgemm_us, downgemm_us, output_us, signal_us,
                 up_compute_us, up_barrier_us, down_compute_us, down_barrier_us,
@@ -4118,21 +5318,21 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_logical_channels * 2 > 3);
-    int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    int kNumRDMARanks = num_ranks / NUM_MAX_NVL_PEERS;
 
     EP_HOST_ASSERT(dispatch_num_max_rdma_chunked_send_tokens > 0 and dispatch_num_max_rdma_chunked_recv_tokens > 0);
     EP_HOST_ASSERT(dispatch_num_max_nvl_chunked_send_tokens > 0 and dispatch_num_max_nvl_chunked_recv_tokens > 0);
     EP_HOST_ASSERT(dispatch_num_max_rdma_chunked_recv_tokens % dispatch_num_max_rdma_chunked_send_tokens == 0);
     EP_HOST_ASSERT(dispatch_num_max_nvl_chunked_send_tokens < dispatch_num_max_nvl_chunked_recv_tokens);
 
-    auto num_warps_per_forwarder = std::max(kNumCombineForwarderWarps / num_rdma_ranks, 1);
-    int num_forwarder_warps = num_rdma_ranks * num_warps_per_forwarder;
-    EP_HOST_ASSERT(num_rdma_ranks <= kNumCombineForwarderWarps);
-    EP_HOST_ASSERT(num_forwarder_warps > NUM_MAX_NVL_PEERS and num_forwarder_warps % num_rdma_ranks == 0);
-    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens % num_rdma_ranks == 0);
-    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / num_rdma_ranks >
+    auto num_warps_per_forwarder = std::max(kNumCombineForwarderWarps / kNumRDMARanks, 1);
+    int num_forwarder_warps = kNumRDMARanks * num_warps_per_forwarder;
+    EP_HOST_ASSERT(kNumRDMARanks <= kNumCombineForwarderWarps);
+    EP_HOST_ASSERT(num_forwarder_warps > NUM_MAX_NVL_PEERS and num_forwarder_warps % kNumRDMARanks == 0);
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens % kNumRDMARanks == 0);
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / kNumRDMARanks >
                    std::max(combine_num_max_rdma_chunked_send_tokens, combine_num_max_nvl_chunked_send_tokens));
-    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / num_rdma_ranks - num_warps_per_forwarder >= combine_num_max_nvl_chunked_send_tokens);
+    EP_HOST_ASSERT(combine_num_max_nvl_chunked_recv_tokens / kNumRDMARanks - num_warps_per_forwarder >= combine_num_max_nvl_chunked_send_tokens);
     EP_HOST_ASSERT(combine_num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
 
     // Signaling
@@ -4213,16 +5413,29 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Per-slot output path scratch + reverse map + per-slot ready (MEGAKERNEL_COMPUTE_DESIGN III).
     __nv_bfloat16* compute_output_slot;
     int* compute_slot_ready;
+    int* compute_slot_from_flush;
+    int64_t* compute_slot_ready_ts;
     int* token_nhits;
     int* token_slot_list;
+    int* priority_token_cursor;
+    int* expert_batch_enqueued;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
     CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
     CUDA_CHECK(cudaMalloc(&compute_slot_ready, total_expert_slots * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_slot_ready, 0, total_expert_slots * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_slot_from_flush, total_expert_slots * sizeof(int)));
+    CUDA_CHECK(cudaMemset(compute_slot_from_flush, 0, total_expert_slots * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&compute_slot_ready_ts, total_expert_slots * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(compute_slot_ready_ts, 0, total_expert_slots * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&token_nhits, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&token_slot_list, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
-    CUDA_CHECK(cudaMemset(token_slot_list, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
+    CUDA_CHECK(cudaMemset(token_slot_list, 0xff, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&priority_token_cursor, sizeof(int)));
+    CUDA_CHECK(cudaMemset(priority_token_cursor, 0, sizeof(int)));
+    const int max_batches_per_expert = (max_tokens_per_expert + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
+    CUDA_CHECK(cudaMalloc(&expert_batch_enqueued, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
+    CUDA_CHECK(cudaMemset(expert_batch_enqueued, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
 
     // GEMM workspace: per-compute-group batched intermediates for M=128 compute batches.
     // Layout: [input(M*hidden)][GU scratch(M*2I)][act(M*I)][down(M*hidden)].
@@ -4279,7 +5492,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(output_accum, 0, (size_t)num_tokens * hidden_dim * sizeof(float)));
 
     // Dispatch tracking heads. Each logical channel owns an independent DeepEP-shaped head space.
-    const int combine_rdma_head_stride = num_tokens * num_rdma_ranks;
+    const int combine_rdma_head_stride = num_tokens * kNumRDMARanks;
     // In megakernel we don't have num_rdma_recv_tokens at alloc time, use num_tokens * num_topk as upper bound.
     int num_rdma_recv_tokens_ub = num_tokens * num_topk;
     const int combine_nvl_head_stride = num_rdma_recv_tokens_ub * NUM_MAX_NVL_PEERS;
@@ -4299,7 +5512,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT(num_logical_channels >= num_physical_channels);
 
     printf("num_tokens: %d, um_rdma_ranks: %d, num_physical_channels: %d, num_logical_channels: %d\n",
-           num_tokens, num_rdma_ranks, num_physical_channels, num_logical_channels);
+           num_tokens, kNumRDMARanks, num_physical_channels, num_logical_channels);
 
     // Per-logical-channel overlap signaling
     int* channel_dispatch_done;
@@ -4318,16 +5531,16 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&combine_channel_barrier, num_logical_channels * sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_channel_barrier, 0, num_logical_channels * sizeof(int)));
 
-    CUDA_CHECK(cudaMalloc(&recv_rdma_channel_prefix_matrix, num_rdma_ranks * num_logical_channels * sizeof(int)));
-    CUDA_CHECK(cudaMemset(recv_rdma_channel_prefix_matrix, 0, num_rdma_ranks * num_logical_channels * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&recv_rdma_channel_prefix_matrix, kNumRDMARanks * num_logical_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(recv_rdma_channel_prefix_matrix, 0, kNumRDMARanks * num_logical_channels * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&recv_gbl_channel_prefix_matrix, num_ranks * num_logical_channels * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_gbl_channel_prefix_matrix, 0, num_ranks * num_logical_channels * sizeof(int)));
 
     // Per-logical-channel token counts (non-cumulative) for overlap
     int* recv_rdma_channel_token_count;
     int* recv_gbl_channel_token_count;
-    CUDA_CHECK(cudaMalloc(&recv_rdma_channel_token_count, num_rdma_ranks * num_logical_channels * sizeof(int)));
-    CUDA_CHECK(cudaMemset(recv_rdma_channel_token_count, 0, num_rdma_ranks * num_logical_channels * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&recv_rdma_channel_token_count, kNumRDMARanks * num_logical_channels * sizeof(int)));
+    CUDA_CHECK(cudaMemset(recv_rdma_channel_token_count, 0, kNumRDMARanks * num_logical_channels * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&recv_gbl_channel_token_count, num_ranks * num_logical_channels * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_gbl_channel_token_count, 0, num_ranks * num_logical_channels * sizeof(int)));
 
@@ -4452,8 +5665,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_compute_expected = token_compute_expected;
     host_state.compute_output_slot = compute_output_slot;
     host_state.compute_slot_ready = compute_slot_ready;
+    host_state.compute_slot_from_flush = compute_slot_from_flush;
+    host_state.compute_slot_ready_ts = compute_slot_ready_ts;
     host_state.token_nhits = token_nhits;
     host_state.token_slot_list = token_slot_list;
+    host_state.priority_token_cursor = priority_token_cursor;
+    host_state.expert_batch_enqueued = expert_batch_enqueued;
+    host_state.max_batches_per_expert = max_batches_per_expert;
 
     // Combine infrastructure
     void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
@@ -4477,6 +5695,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t* perf_comb_wait_ready_ns;
     int64_t* perf_comb_wait_ready_single_ns;
     int64_t* perf_comb_wait_ready_multi_ns;
+    int64_t* perf_comb_wait_ready_flush_ns;
+    int64_t* perf_comb_wait_ready_full_ns;
+    int64_t* perf_comb_wait_ready_flush_count;
+    int64_t* perf_comb_wait_ready_full_count;
     int64_t* perf_comb_gather_reduce_ns;
     int64_t* perf_comb_gather_single_ns;
     int64_t* perf_comb_gather_multi_ns;
@@ -4488,6 +5710,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t* perf_comb_wait_ready_max_ns;
     int64_t* perf_comb_wait_ready_single_max_ns;
     int64_t* perf_comb_wait_ready_multi_max_ns;
+    int64_t* perf_comb_wait_ready_flush_max_ns;
+    int64_t* perf_comb_wait_ready_full_max_ns;
+    int64_t* perf_comb_wait_top_ns;
+    int64_t* perf_comb_wait_top_token;
+    int64_t* perf_comb_wait_top_slot;
+    int64_t* perf_comb_wait_top_expert;
+    int64_t* perf_comb_wait_top_from_flush;
     int64_t* perf_comb_gather_reduce_max_ns;
     int64_t* perf_comb_gather_single_max_ns;
     int64_t* perf_comb_gather_multi_max_ns;
@@ -4514,6 +5743,14 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(perf_comb_wait_ready_single_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_multi_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_comb_wait_ready_multi_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_count, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_count, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_count, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_count, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_gather_single_ns, acc_bytes));
@@ -4536,6 +5773,20 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(perf_comb_wait_ready_single_max_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_multi_max_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_comb_wait_ready_multi_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_max_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_max_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_top_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_token, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_top_token, 0xff, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_slot, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_top_slot, 0xff, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_expert, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_top_expert, 0xff, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_from_flush, acc_bytes));
+    CUDA_CHECK(cudaMemset(perf_comb_wait_top_from_flush, 0xff, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_max_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_max_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_comb_gather_single_max_ns, acc_bytes));
@@ -4565,6 +5816,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.perf_comb_wait_ready_ns = perf_comb_wait_ready_ns;
     host_state.perf_comb_wait_ready_single_ns = perf_comb_wait_ready_single_ns;
     host_state.perf_comb_wait_ready_multi_ns = perf_comb_wait_ready_multi_ns;
+    host_state.perf_comb_wait_ready_flush_ns = perf_comb_wait_ready_flush_ns;
+    host_state.perf_comb_wait_ready_full_ns = perf_comb_wait_ready_full_ns;
+    host_state.perf_comb_wait_ready_flush_count = perf_comb_wait_ready_flush_count;
+    host_state.perf_comb_wait_ready_full_count = perf_comb_wait_ready_full_count;
     host_state.perf_comb_gather_reduce_ns = perf_comb_gather_reduce_ns;
     host_state.perf_comb_gather_single_ns = perf_comb_gather_single_ns;
     host_state.perf_comb_gather_multi_ns = perf_comb_gather_multi_ns;
@@ -4576,6 +5831,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.perf_comb_wait_ready_max_ns = perf_comb_wait_ready_max_ns;
     host_state.perf_comb_wait_ready_single_max_ns = perf_comb_wait_ready_single_max_ns;
     host_state.perf_comb_wait_ready_multi_max_ns = perf_comb_wait_ready_multi_max_ns;
+    host_state.perf_comb_wait_ready_flush_max_ns = perf_comb_wait_ready_flush_max_ns;
+    host_state.perf_comb_wait_ready_full_max_ns = perf_comb_wait_ready_full_max_ns;
+    host_state.perf_comb_wait_top_ns = perf_comb_wait_top_ns;
+    host_state.perf_comb_wait_top_token = perf_comb_wait_top_token;
+    host_state.perf_comb_wait_top_slot = perf_comb_wait_top_slot;
+    host_state.perf_comb_wait_top_expert = perf_comb_wait_top_expert;
+    host_state.perf_comb_wait_top_from_flush = perf_comb_wait_top_from_flush;
     host_state.perf_comb_gather_reduce_max_ns = perf_comb_gather_reduce_max_ns;
     host_state.perf_comb_gather_single_max_ns = perf_comb_gather_single_max_ns;
     host_state.perf_comb_gather_multi_max_ns = perf_comb_gather_multi_max_ns;
@@ -4601,6 +5863,75 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(perf_disp_pub_fence_ns, 0, acc_bytes));
     CUDA_CHECK(cudaMalloc(&perf_disp_pub_store_ns, acc_bytes));
     CUDA_CHECK(cudaMemset(perf_disp_pub_store_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_cta_barrier_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_cta_barrier_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_channel_barrier_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_channel_barrier_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_round_barrier_ns, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_round_barrier_ns, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_tokens, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_tokens, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_local_hit_tokens, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_local_hit_tokens, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_local_hits, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_local_hits, 0, acc_bytes));
+    const size_t disp_role_bytes = (size_t)num_logical_channels * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS * sizeof(int64_t);
+    const size_t disp_recv_bytes = (size_t)num_logical_channels * 2 * NUM_MAX_NVL_PEERS * sizeof(int64_t);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_cta_release_ts, acc_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_cta_release_ts, 0, acc_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_role_arrive_ts, disp_role_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_role_arrive_ts, 0, disp_role_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_role_work_ns, disp_role_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_role_work_ns, 0, disp_role_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_wait_nvl_ns, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_wait_nvl_ns, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_wait_ns, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_wait_ns, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_wait_start_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_wait_start_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_observe_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_observe_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_done_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_done_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_slowest_rdma, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_slowest_rdma, 0xff, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_src_nvl, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_src_nvl, 0xff, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_raw_start, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_start, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_raw_end, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_end, 0, disp_recv_bytes));
+    const size_t disp_prefix_prod_bytes = disp_recv_bytes * (host_state.num_ranks / NUM_MAX_NVL_PEERS);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_begin_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_begin_ts, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_publish_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_publish_ts, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_fence_done_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_fence_done_ts, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_to_fence_ns, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_to_fence_ns, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_wait_ns, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_wait_ns, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_tokens, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_tokens, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_rank, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_rank, 0xff, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_nvl, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_nvl, 0xff, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_dst_nvl, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_dst_nvl, 0xff, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_src_rdma, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_src_rdma, 0xff, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_token_loop_ns, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_token_loop_ns, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_retire_ns, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_retire_ns, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_publish_ns, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_publish_ns, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_tokens, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_tokens, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_local_hits, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_local_hits, 0, disp_recv_bytes));
     host_state.perf_disp_pub_scan_ns = perf_disp_pub_scan_ns;
     host_state.perf_disp_pub_atomic_ns = perf_disp_pub_atomic_ns;
     host_state.perf_disp_pub_fence_ns = perf_disp_pub_fence_ns;
@@ -4615,6 +5946,40 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(host_state.perf_sched_enqueue_ns, 0, sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&host_state.perf_sched_idle_ns, sizeof(int64_t)));
     CUDA_CHECK(cudaMemset(host_state.perf_sched_idle_ns, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_scan_tokens, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_scan_tokens, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_ready_tokens, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_ready_tokens, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_full_batch_hits, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_full_batch_hits, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_batch_already_enqueued, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_batch_already_enqueued, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_not_full, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_not_full, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_normal_full_batch_enqueues, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_normal_full_batch_enqueues, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_flush_tail_enqueues, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_flush_tail_enqueues, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_queue_empty_count, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_queue_empty_count, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_queue_empty_after_dispatch_count, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_queue_empty_after_dispatch_count, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_max_ready_tail_gap, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_max_ready_tail_gap, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_expert, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_expert, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_recv_count, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_recv_count, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_alloc_count, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_alloc_count, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_enqueue_cursor, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_enqueue_cursor, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_first_unready_slot, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_first_unready_slot, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_first_unready_ready, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_dispatch_done, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_dispatch_done, 0, sizeof(int64_t)));
 
     // Per-compute-task timing buffer.
     int64_t* perf_compute_task;
@@ -4734,8 +6099,12 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
     CUDA_CHECK(cudaFree(host_state.compute_slot_ready));
+    CUDA_CHECK(cudaFree(host_state.compute_slot_from_flush));
+    CUDA_CHECK(cudaFree(host_state.compute_slot_ready_ts));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
     CUDA_CHECK(cudaFree(host_state.token_slot_list));
+    CUDA_CHECK(cudaFree(host_state.priority_token_cursor));
+    CUDA_CHECK(cudaFree(host_state.expert_batch_enqueued));
     CUDA_CHECK(cudaFree(host_state.compute_group_barrier));
     CUDA_CHECK(cudaFree(host_state.compute_group_phase));
     CUDA_CHECK(cudaFree(host_state.compute_tasks));
@@ -4777,10 +6146,47 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_atomic_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_fence_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_pub_store_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_cta_barrier_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_channel_barrier_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_round_barrier_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_local_hit_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_local_hits));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_cta_release_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_role_arrive_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_role_work_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_wait_nvl_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_wait_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_wait_start_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_observe_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_done_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_slowest_rdma));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_src_nvl));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_start));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_end));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_begin_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_publish_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_fence_done_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_to_fence_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_wait_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_rank));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_nvl));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_dst_nvl));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_src_rdma));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_token_loop_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_retire_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_publish_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_local_hits));
     CUDA_CHECK(cudaFree(host_state.perf_comb_tma_wait_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_single_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_multi_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_count));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_count));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_single_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_multi_ns));
@@ -4792,6 +6198,13 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_max_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_single_max_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_multi_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_max_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_token));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_slot));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_expert));
+    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_from_flush));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_max_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_single_max_ns));
     CUDA_CHECK(cudaFree(host_state.perf_comb_gather_multi_max_ns));
@@ -4807,6 +6220,23 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_sched_scan_ns));
     CUDA_CHECK(cudaFree(host_state.perf_sched_enqueue_ns));
     CUDA_CHECK(cudaFree(host_state.perf_sched_idle_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_scan_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_ready_tokens));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_full_batch_hits));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_batch_already_enqueued));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_not_full));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_normal_full_batch_enqueues));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_flush_tail_enqueues));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_queue_empty_count));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_queue_empty_after_dispatch_count));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_max_ready_tail_gap));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_expert));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_recv_count));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_alloc_count));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_enqueue_cursor));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_slot));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_ready));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_dispatch_done));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task_count));
     CUDA_CHECK(cudaFree(host_state.perf_up_setup));

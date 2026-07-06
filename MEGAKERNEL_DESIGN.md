@@ -223,6 +223,44 @@ recv_token_source_info 已稳定；
 
 这个信号不依赖 compute，因此不会被 compute 卡住。
 
+## ⚠ 排障坑：不同 rank 的 dispatch 耗时差异极大（根因往往是硬件，不是代码）
+
+**现象**：不同 rank（甚至同一 node 内的 8 个 rank）dispatch 路径耗时差异可达 5–10 倍，而原始 DeepEP 在同样规模下很均匀。
+
+**结论（2026-07 实测坐实）**：这类抖动的**首要根因是机器的 NVLink/NVSwitch「跨 GPU 写可见性」劣化，其次是 node 级 GPU 降频，都不是 megakernel 代码问题**。换一台健康机器后，`MK_COMPUTE_KERNEL=0`（WMMA）和 `=1`（UMMA）都立刻均衡。
+
+**为什么会误判**：dispatch 的 NVL receiver 要自旋等 forwarder 经 NVLink 用 `st_relaxed_sys_global` 写进 peer buffer 的 `nvl_channel_prefix_start/end`（megakernel.cu:1082-1083 写，1303-1332 读）。当 NVLink 传播延迟劣化时，forwarder 早已写完，但 receiver 要 20–30ms 才「看到」这个值，全体 sender/forwarder warp 又在 CTA barrier 上等这个 receiver，于是 dispatch 被整体拖慢且抖动。很容易误以为是「compute GEMM 抢占/饿死 receiver」——但这个猜测已被数据否定（见下）。
+
+**决定性判据 —— 看 perf trace 里的 `pub->observe`**（`last_recv_prefix_publish_to_observe_us`，即 forwarder 发布 prefix 到 receiver 观测到的间隔）：
+
+```text
+健康机：pub->observe ≈ 0.4–0.6ms（prefix_wait 同量级），dispatch span cv ≈ 0.13
+坏机  ：pub->observe ≈ 20–30ms，dispatch span cv ≈ 0.33，最坏 rank 达 36ms
+```
+
+配套佐证（区分「硬件」还是「代码/负载」）：
+
+```text
+- publish_us / last_recv_token_loop_us（receiver 真正干的活）在好机/坏机基本一致
+  → 说明算法没变慢，慢的全是「等 peer 写可见」的空转 → 指向硬件。
+- forwarder 侧 last_recv_prefix_producer_meta_wait_us 很小（<1.5ms）
+  → 生产侧/RDNA meta 不慢，排除网络/生产者。
+- compute_tot 若出现 node 级劈裂（如 node1 是 node0 的 1.5–2.5 倍），叠加 GPU 降频。
+- MK_COMPUTE_KERNEL=0 vs =1（compute 负载差近一倍）在健康机上 dispatch 都均衡
+  → 证明 compute 负载不是 dispatch 抖动的驱动因素。
+```
+
+**排查硬件（坏机若仍可访问）**：
+
+```text
+NVLink : nvidia-smi nvlink -s（是否 downtrain 到低速）、nvidia-smi nvlink -e（CRC/replay/recovery 错误）
+NVSwitch: Fabric Manager 日志、nvidia-smi -q 的 fabric 状态
+降频   : nvidia-smi -q -d CLOCK,PERFORMANCE,POWER,TEMPERATURE（看 throttle reason：HW/SW thermal slowdown、power brake）
+显存   : nvidia-smi -q -d ECC,ROW_REMAPPER
+```
+
+**给后来者的一句话**：dispatch 跨 rank 抖动先别急着改 kernel，先看 trace 的 `pub->observe`；正常应 <1ms，若达几十 ms 基本可判定为 NVLink 写可见性 / GPU 降频等硬件劣化，换机或修硬件即可，不要在 megakernel 里空耗。
+
 ## Combine Head-of-Line Blocking 风险
 
 当前实现按 dispatch round flush tail，而不是等全局 dispatch_done；每个 round 对应一组 `num_dispatch_channels` 个 logical_channel，round 内全部结束后统一 flush：
@@ -257,6 +295,226 @@ expert_lch_end[expert, lch]
 ```
 
 这样才能正确 flush 某个 logical channel 内的 expert tail。
+
+## 第三版：Combine-Order Priority Scheduler（待实现）
+
+### 目标与触发背景
+
+当前 per-slot output + combine sender gather/reduce 已经把 compute 侧 signal 时间降下来，但 perf 显示某些 logical channel 的 combine sender 仍会长时间等待 `compute_slot_ready`：
+
+```text
+wait_slot_ready_full_sum_us 很高
+wait_slot_ready_flush_sum_us = 0
+top_wait_from_flush = 0
+```
+
+这说明慢点不是 final flush tail，而是 combine 按 dispatch/token 顺序发包时，较早 token 依赖的某个 full batch 还没有被 scheduler 提前算出来，导致 head-of-line blocking。调度优化目标是：**不改变 compute task 的 GEMM 形状，不打碎 full batch，只改变 full batch 的入队顺序，让 combine 顺序前沿依赖的 batch 优先进入 compute queue。**
+
+### 第一版原则
+
+第一版只做 full-batch priority reorder：
+
+```text
+允许：把已经凑满 COMPUTE_BATCH_SIZE 的 batch 提前 enqueue
+禁止：在正常阶段 enqueue partial batch
+保留：原 expert 轮询 full-batch enqueue 作为 fallback
+保留：dispatch_done/final flush tail 作为最后兜底
+```
+
+这样单个 compute task 仍然是 `num_tokens == COMPUTE_BATCH_SIZE`，TensorCore/GEMM 利用率不变，性能回退风险最低。
+
+### 数据结构
+
+新增轻量 token-order ready 信息。dispatch 已经会写 `token_nhits` 和 `token_slot_list`，因此 dispatch worker 不需要做 slot->batch 映射，只需在 token 的 local slot metadata 写完后发布 ready：
+
+```cpp
+int* token_priority_ready;        // [max_total_recv_tokens], init 0
+int* priority_token_cursor;       // scheduler 私有/全局单值，从 combine token 顺序向前推进
+```
+
+如果 `recv_token_idx` 天然就是 combine sender 的发送顺序，则不需要额外 `priority_token_queue`。scheduler 直接按 `priority_token_cursor = 0,1,2,...` 扫描即可。若后续发现 token_idx 与某条 sender 的真实发送顺序不完全一致，再改成显式队列：
+
+```cpp
+int* priority_token_queue;        // dispatch/combine order 的 token_idx stream
+int* priority_token_tail;
+```
+
+第一版优先避免队列，减少 dispatch 写入压力。
+
+### dispatch worker 改动
+
+dispatch 侧保持轻量，只在已有 token-slot metadata 完成后 release 一个 ready flag：
+
+```cpp
+// 已有逻辑：写 token_nhits/token_slot_list
+state->token_nhits[token_idx] = nh;
+state->token_slot_list[token_idx * num_topk + k] = slot;
+
+// 新增：metadata 对 scheduler 可见
+__threadfence();
+st_release_sys_global(&state->token_priority_ready[token_idx], 1);
+```
+
+约束：
+
+- 不在 dispatch worker 中做 slot->expert/batch 反查。
+- 不在 dispatch worker 中维护复杂 priority queue。
+- 不增加 atomic-heavy 路径，避免拖慢 dispatch throughput。
+
+### scheduler priority path
+
+scheduler loop 增加一个 priority path，优先尝试从 combine-order 前沿 token 找到已满 full batch：
+
+```text
+scheduler loop:
+  1. priority path:
+       从 priority_token_cursor 开始，最多扫描固定窗口 N 个 token
+       token_priority_ready[token] == 1 后读取 token_nhits/token_slot_list
+       对 token 的每个 local slot 反推出 expert_id / expert_local_slot / batch_id
+       如果该 batch 已满且未 enqueue，则优先 publish task
+  2. normal path:
+       如果 priority path 本轮没有发出 task，走原 expert_recv_count 轮询 full batch
+  3. final flush path:
+       dispatch_done 后 flush leftover tail
+```
+
+slot 到 batch 的映射：
+
+```cpp
+int expert_id = slot / max_tokens_per_expert;
+int expert_local_slot = slot % max_tokens_per_expert;
+int batch_id = expert_local_slot / COMPUTE_BATCH_SIZE;
+int batch_start = batch_id * COMPUTE_BATCH_SIZE;
+int batch_end = batch_start + COMPUTE_BATCH_SIZE;
+
+bool full_ready = ld_acquire_sys_global(&expert_recv_count[expert_id]) >= batch_end;
+```
+
+只有 `full_ready == true` 才能在 priority path enqueue。否则记录 miss，继续扫描窗口内后续 token 或 fallback normal path。
+
+### enqueue 去重
+
+priority path 会打破原来 `enqueue_cursor[expert]` 的单调入队假设，因此必须引入 per-expert batch enqueue bitmap，所有入队路径统一 CAS：
+
+```cpp
+int* expert_batch_enqueued;       // [num_local_experts * max_batches_per_expert], init 0
+
+bool try_enqueue_batch(int expert_id, int batch_id, int start_slot, int count, int is_flush) {
+    int idx = expert_id * max_batches_per_expert + batch_id;
+    if (atomicCAS(&expert_batch_enqueued[idx], 0, 1) != 0)
+        return false;
+    scheduler_publish_task(state, expert_id, start_slot, count, is_flush);
+    return true;
+}
+```
+
+所有路径都必须走同一个 gate：
+
+```text
+priority full batch -> try_enqueue_batch(..., is_flush=0)
+normal full batch   -> try_enqueue_batch(..., is_flush=0)
+final tail flush    -> try_enqueue_batch(..., is_flush=1)
+```
+
+注意 tail batch 与 full batch 的关系：
+
+- 如果某个 `batch_id` 已经被 full batch enqueue，final flush 不能重复 enqueue。
+- 如果最后一个 `batch_id` 不满 full batch，final flush 用同一个 `batch_id` CAS 成功后 enqueue partial tail。
+- priority path 第一版不 enqueue partial，因此不会打碎 batch。
+
+### normal path 调整
+
+引入 bitmap 后，原 `enqueue_cursor[expert]` 不能再作为唯一去重依据。第一版可以保留 cursor 用于减少 normal path 扫描范围，但发布任务前必须经过 `expert_batch_enqueued` CAS。
+
+normal path 行为：
+
+```text
+for expert in round-robin:
+  ready = expert_recv_count[expert]
+  while enqueue_cursor[expert] + COMPUTE_BATCH_SIZE <= ready:
+      batch_id = enqueue_cursor[expert] / COMPUTE_BATCH_SIZE
+      try_enqueue_batch(...)
+      enqueue_cursor[expert] += COMPUTE_BATCH_SIZE
+```
+
+即使 priority path 已提前 enqueue 某个 batch，normal path 走到该 batch 时 CAS 会失败，然后 cursor 继续前进，不重复 compute。
+
+### scheduler 扫描窗口与限流
+
+为避免 scheduler 单 SM 被 priority 扫描拖慢，第一版加硬限制：
+
+```text
+priority_scan_window_tokens = 64 / 128 / 256 之一，先从 128 开始
+每轮 priority path 最多成功 enqueue 1~2 个 batch
+priority path 未命中时立即 fallback normal path
+```
+
+如果 perf 显示 scheduler 很空、compute queue 供给充足，可以扩大窗口或增加每轮 priority enqueue 数；如果 compute queue 空等增加，则缩小窗口。
+
+### 必加 perf counter
+
+为了判断是否有性能回退，调度优化需要同步加 scheduler perf：
+
+```text
+priority_scan_tokens
+priority_ready_tokens
+priority_full_batch_hits
+priority_batch_already_enqueued
+priority_not_full
+normal_full_batch_enqueues
+flush_tail_enqueues
+compute_queue_empty_cycles / compute_queue_empty_count
+```
+
+结合已有 combine perf 看：
+
+```text
+wait_slot_ready_full_sum_us
+wait_slot_ready_full_max_us
+top_wait_slot / top_wait_expert / top_wait_token
+```
+
+成功判据：
+
+- `wait_slot_ready_full_sum_us` 和 `top_wait_us` 下降。
+- `compute_queue_empty_*` 不明显上升。
+- compute task 的 `p3_wgate_us` / `p5_wdown_us` / total duration 不明显变差。
+- `priority_scan_tokens` 不应很高但 `priority_full_batch_hits` 很低；否则说明扫描浪费，需要缩窗口或换显式 priority batch list。
+
+### 性能风险与规避
+
+1. **打碎 compute batch 的风险**
+   - 第一版不做 partial batch，因此规避。后续只有 full-batch priority reorder 无法解决 head-of-line wait 时，才评估 priority partial batch。
+
+2. **scheduler 扫描过重**
+   - 用固定窗口、每轮 enqueue 限流、miss 后 fallback normal path 控制。
+   - 通过 `compute_queue_empty_*` 判断是否拖慢 task 供给。
+
+3. **dispatch throughput 回退**
+   - dispatch 只多写一个 ready flag，不做复杂计算。
+   - 如果该写入也有压力，可评估复用 `token_nhits` 的 ready 语义，但需要把初始值改为 `-1`，避免 `nh==0` 与未 ready 混淆。
+
+4. **expert locality / 权重 cache 变差**
+   - priority reorder 可能让 expert 间跳跃更多。
+   - 通过 compute task GEMM perf 判断是否 `p3/p5` 变慢；如果变慢，限制 priority 窗口或每轮 priority batch 数。
+
+5. **重复 enqueue / 漏 enqueue**
+   - 所有路径统一走 `expert_batch_enqueued` CAS。
+   - final flush 也走同一 gate，确保 tail 不重复、不遗漏。
+
+### 后续第二阶段：priority partial batch（暂不做）
+
+如果 full-batch priority reorder 后仍存在长尾，例如 combine 前沿 token 所在 batch 长时间无法凑满，则再考虑 partial batch：
+
+```text
+ready_rows < COMPUTE_BATCH_SIZE
+且 token 距离 combine frontier 很近
+且 batch 等待超过阈值
+且 ready_rows >= min_priority_batch_size
+-> enqueue partial priority batch
+```
+
+该阶段风险较高，会降低 GEMM M 维利用率、增加 task 数和同步开销，因此必须单独评估，不能混进第一版。
 
 ### Logical Channel 与物理 Channel 的映射（补充）
 
@@ -1666,20 +1924,174 @@ else {
   `combine` 的寄存器累加 + 双 stage TMA 预取（`sm100_bf16_mega_moe.cuh:1184-1202` 的
   `ptx::accumulate` + `move_mask_and_load` 结构），省 smem、overlap load 与 reduce。
 
-### III.8 gather 路径后续优化顺序（对齐 mega_moe 性能形态）
+### III.8 gather 路径剩余优化任务（交给并行 agent 推进）
 
-1. **nh==1 主路径最轻化**：单-hit token 不做 reduce，也尽量减少 per-lane scalar work。先采用保守版
-   chunked copy：沿用 `kGatherChunkInt4=128`，每个 lane 固定复制 `kVecsPerLane` 个 `int4`，让 single
-   路径与 multi 路径的 chunk shape 对齐。上一版直接整段 TMA load 到 `tma_buffer` 曾 hang，后续若重试，
-   必须给 single-hit 独立 mbarrier/stage，不能复用 multi-hit 的 `gather_mbarrier(0)`。
-2. **nh>1 TMA double-buffer pipeline**：把 “issue load next” 封装成局部 helper/lambda，先 issue stage0，
-   在 reduce 当前 stage 前尽早 issue 下一 stage；`mbarrier_wait` 后立即 toggle phase，减少循环内地址计算、
-   分支和等待暴露，靠近 mega_moe 的 `move_mask_and_load()` 结构。
-3. **vectorized bf16 accumulate**：把 scalar `__bfloat162float` 循环改成 `__nv_bfloat162/float2` accumulator，
-   最后用 `__float22bfloat162_rn` pack，减少 conversion/add 指令数。
-4. **pack_meta 低垂优化**：拆分并优化 `SourceMeta/topk_weights/padding` 写入。padding 清零只覆盖
-   `[meta_end, num_bytes_per_token)`，后续可评估是否只在 debug/assert 模式清零，但不能破坏 packet layout。
-5. **潜在大优化：compute 直接生成 combine packet/scratch**：`nh==1` 当前仍需要 combine sender 从
-   `compute_output_slot` 再搬到 packet `tma_buffer`。理论上可让 compute 直接写某种 per-token/topk packet
-   或 scratch，减少 single-hit 搬运，但 compute 阶段不知道 combine destination/tail，且会让 compute output
-   写路径变 scatter、耦合 DeepEP forwarder 协议。因此仅记录为后续大重构候选，短期不做。
+当前 `csrc/kernels/megakernel.cu` 已完成的 gather 改动：
+
+- `combine_worker_v2()` 的 NVL sender 路径里，`nh==1` 已走 chunked int4 copy fast path，不再做 fp32 reduce。
+- `nh>1` 已走 `gather_load_buffer(stage)` + `gather_mbarrier(stage)` 的两级 TMA/smem double buffer。
+- multi-hit reduce 已从 scalar bf16 conversion 改成 `__nv_bfloat162 -> float2` accumulate，最后 `__float22bfloat162_rn` pack。
+- `pack_meta` 已拆成 `SourceMeta`、`topk_weights`、padding 清零三个轻量步骤，且没有新增宏。
+
+剩余优化按优先级推进如下。
+
+#### III.8.1 single-hit 独立 TMA bulk load（谨慎重试）
+
+目标：减少 `nh==1` 路径里 combine sender 从 `compute_output_slot` 到 `tma_buffer` 的 warp copy 成本。当前 perf 中 `gather_single_sum_us` 仍然可见，single-hit token 又占多数，因此这是最直接的 gather 优化点。
+
+代码位置：
+
+```text
+csrc/kernels/megakernel.cu
+  combine_worker_v2()
+    NVL sender token loop
+      const int nh = state->token_nhits[token_idx];
+      if (is_single_hit) { ... } else { ... }
+```
+
+当前 single-hit 代码形态：
+
+```cpp
+if (is_single_hit) {
+    const int slot = state->token_slot_list[token_idx * num_topk];
+    for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
+        const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
+        #pragma unroll
+        for (int j = 0; j < kVecsPerLane; ++j) {
+            const int vi = chunk_base + lane_id + j * 32;
+            if (vi < chunk_end)
+                tma_i4[vi] = ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi);
+        }
+    }
+}
+```
+
+建议实现：
+
+- 给 single-hit 单独分配/使用独立 mbarrier stage，不要复用 multi-hit 的 `gather_mbarrier(0/1)` phase。
+- single-hit 一次 TMA load 整个 hidden payload 到 `tma_buffer`，或者按大 chunk TMA load 到 `tma_buffer + chunk_base*sizeof(int4)`。
+- TMA wait 之后直接进入 `pack_meta`，不再 warp copy。
+- 上一次直接用 `gather_mbarrier(0)` 做 single TMA 曾 hang，怀疑是与 multi-hit chunk pipeline 的 barrier phase/expect_tx 复用冲突；重试时必须隔离 barrier 或显式维护 single phase。
+
+伪代码方向：
+
+```cpp
+if (is_single_hit) {
+    int slot = state->token_slot_list[token_idx * num_topk];
+    if (lane_id == 0) {
+        tma_load_1d(tma_buffer,
+                    slot_base_i4 + (int64_t)slot * hidden_int4,
+                    single_gather_mbarrier(), hidden_bytes, false);
+        mbarrier_arrive_and_expect_tx(single_gather_mbarrier(), hidden_bytes);
+    }
+    mbarrier_wait(single_gather_mbarrier(), single_gather_phase);
+}
+```
+
+验证指标：
+
+- `gather_single_sum_us`、`gather_single_max_us` 必须下降。
+- 不能出现 hang；如果 hang，优先检查 mbarrier phase、`expect_tx` 字节数、`tma_store_wait` 与 smem buffer 复用顺序。
+- 精度必须保持不变，因为只是搬运路径改变。
+
+#### III.8.2 multi-hit reduce pipeline 进一步贴近 mega_moe
+
+目标：当前 `nh>1` 已经 double-buffer，但每个 chunk 内仍然是“按 hit 逐个 TMA load + reduce”。下一步减少循环控制/地址计算开销，并让 issue-next 更早发生。
+
+代码位置：
+
+```text
+combine_worker_v2()
+  is_single_hit == false
+    for (chunk_base ...)
+      auto issue_slot_chunk = ...
+      for (int k = 0; k < nh; ++k) { ... }
+```
+
+当前核心形态：
+
+```cpp
+auto issue_slot_chunk = [&](int stage_idx, int hit_idx) {
+    int slot = state->token_slot_list[token_idx * num_topk + hit_idx];
+    tma_load_1d(gather_load_buffer(stage_idx),
+                slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base,
+                gather_mbarrier(stage_idx), chunk_bytes, false);
+    mbarrier_arrive_and_expect_tx(gather_mbarrier(stage_idx), chunk_bytes);
+};
+```
+
+建议实现：
+
+- 在进入 chunk loop 前，先把 `token_slot_list[token_idx*num_topk + k]` 读到寄存器数组 `slots[k]`，减少循环内 global metadata load。
+- `issue_slot_chunk()` 只接收 `slot`，不再在 lambda 内读 `token_slot_list`。
+- `mbarrier_wait()` 后立刻更新 phase，再做 reduce，避免下一轮 phase 管理和 reduce 混在一起。
+- 对 `nh==2` 增加专门轻路径：两个 slot 的 bf162 load/reduce 可以少一层 loop，避免 general `for k in nh` 的控制开销。这个可以先只写在 multi 分支里，不新增宏。
+
+验证指标：
+
+- `gather_multi_sum_us`、`gather_multi_max_us` 下降。
+- `wait_slot_ready_*` 不作为本优化成败指标，因为那是 scheduler/compute readiness 问题。
+
+#### III.8.3 对齐/布局优化：让 compute_output_slot 更适合 combine gather
+
+目标：当前 `compute_output_slot` 是 expert-slot-major：
+
+```text
+slot = local_expert_id * max_tokens_per_expert + expert_local_slot
+compute_output_slot[slot, hidden]
+```
+
+这个布局对 compute 写出连续，但 combine 按 token 顺序读时会跨 expert/slot 随机 gather。短期先不大改，但需要评估两种布局优化：
+
+- 给每个 slot 行做 128B/256B 对齐，确保 TMA/warp copy 起始地址稳定对齐。
+- 增加一个轻量 token-order scratch：compute 完成后或 scheduler 辅助写出 `token -> slot row pointer` 的 compact 表，combine 读取时减少 `token_slot_list` metadata 访存和地址计算。
+
+代码相关字段：
+
+```cpp
+state->compute_output_slot
+state->token_nhits
+state->token_slot_list
+state->compute_slot_ready
+```
+
+约束：
+
+- 不要破坏 compute per-slot 唯一写语义。
+- 不要让 compute 直接依赖 DeepEP combine destination/tail，除非进入更大的 packet/scratch 重构。
+- 改布局前先用 perf 证明 gather 是主瓶颈，而不是 `wait_slot_ready`。
+
+#### III.8.4 pack_meta 继续压低同步成本
+
+目标：当前 `pack_meta_sync_sum_us` 已经较小，但 `pack_meta_work_sum_us` 在所有 channel 中稳定存在，可以继续做低风险优化。
+
+代码位置：
+
+```text
+combine_worker_v2()
+  gather/reduce 后
+  pack SourceMeta/topk_weights/padding 到 tma_buffer + hidden_bytes
+```
+
+建议实现：
+
+- 保持 unconditional padding clear，不新增宏。
+- 如果 `num_topk` 固定较小，可让 lane0 写 `SourceMeta`，lane1.. 写 topk weights，padding 由多个 lane 分摊清零，而不是 lane0 串行清零。
+- 注意 packet layout 不能变：`hidden payload | SourceMeta | topk_weights | padding`。
+
+验证指标：
+
+- `pack_meta_work_sum_us`、`pack_meta_max_us` 下降。
+- 不能破坏 combine packet 解析。
+
+#### III.8.5 大重构候选：compute 直接生成 combine scratch/packet
+
+目标：减少 `nh==1` 的二次搬运，甚至把部分 `nh>1` same-rank reduce 提前到更接近 compute output 的位置。
+
+风险：
+
+- compute 阶段不知道 combine sender 的目标 queue tail / `dst_slot_idx` / NVL/RDMA routing 细节。
+- 直接写 DeepEP packet 会把 compute 与 combine forwarder 协议强耦合。
+- 如果做 token-order scratch，也要解决同 token 多 local expert 的 reduce 时机和 ready 语义。
+
+因此短期只作为探索方向，不建议和当前 scheduler/head-of-line 优化混在一个 patch 里。

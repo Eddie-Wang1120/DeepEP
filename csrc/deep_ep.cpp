@@ -2011,7 +2011,8 @@ torch::Tensor Buffer::megakernel_forward(
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
-    const int num_logical_channels = num_physical_channels * 2;
+    // A/B: match original DeepEP's one logical channel per physical dispatch channel.
+    const int num_logical_channels = num_physical_channels;
     const int num_channels = num_logical_channels;
     const int dispatch_num_max_rdma_chunked_send_tokens = dispatch_config.num_max_rdma_chunked_send_tokens;
     const int dispatch_num_max_rdma_chunked_recv_tokens = dispatch_config.num_max_rdma_chunked_recv_tokens;

@@ -107,14 +107,22 @@ if __name__ == '__main__':
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
     # MegaKernel performance tracing (Perfetto JSON output per SM)
-    if int(os.getenv('MK_PERF_TRACE', 0)):
-        cxx_flags.append('-DMK_PERF_TRACE')
-        nvcc_flags.append('-DMK_PERF_TRACE')
+    # 0 = disabled, 1 = emit events without args, 2 = emit events with full args
+    mk_perf_trace_level = int(os.getenv('MK_PERF_TRACE', 0))
+    if mk_perf_trace_level:
+        cxx_flags.append(f'-DMK_PERF_TRACE={mk_perf_trace_level}')
+        nvcc_flags.append(f'-DMK_PERF_TRACE={mk_perf_trace_level}')
 
     # MegaKernel token path tracing (printf-based full token lifecycle)
     if int(os.getenv('MK_TOKEN_TRACE', 0)):
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
+
+    # MegaKernel combine single-hit gather path:
+    #   0 = warp global copy (default), 1 = direct TMA load into packet buffer
+    if int(os.getenv('COMBINE_TMA_LOAD', 0)):
+        cxx_flags.append('-DCOMBINE_TMA_LOAD')
+        nvcc_flags.append('-DCOMBINE_TMA_LOAD')
 
     # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
     #   0 = WMMA, 1 = 1-CTA UMMA, 2 = 2-CTA UMMA (default)
