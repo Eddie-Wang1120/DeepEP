@@ -102,6 +102,41 @@ def test_main(args: argparse.Namespace,
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
+    if args.sm_benchmark:
+        dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
+        benchmark_sms = [int(x) for x in args.sm_list.split(',') if x]
+        if local_rank == 0:
+            print(f'[sm-benchmark] mode=default-config sms={benchmark_sms}', flush=True)
+        for benchmark_sm in benchmark_sms:
+            deep_ep.Buffer.set_num_sms(benchmark_sm)
+            dispatch_args = {
+                'x': x,
+                'num_tokens_per_rank': num_tokens_per_rank,
+                'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
+                'is_token_in_rank': is_token_in_rank,
+                'num_tokens_per_expert': num_tokens_per_expert,
+                'config': None
+            }
+            t = bench(lambda: buffer.dispatch(**dispatch_args), args.benchmark_warmups, args.benchmark_tests)[0]
+            recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+            dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
+            combine_args = {'x': recv_x, 'handle': handle, 'config': None}
+            combine_t = bench(lambda: buffer.combine(**combine_args), args.benchmark_warmups, args.benchmark_tests)[0]
+            if local_rank == 0:
+                print(
+                    f'[sm-benchmark] op=dispatch SMs {benchmark_sm}: {t * 1e6:.0f} us, '
+                    f'{dispatch_bf16_rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), '
+                    f'{dispatch_bf16_nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL)',
+                    flush=True)
+                print(
+                    f'[sm-benchmark] op=combine SMs {benchmark_sm}: {combine_t * 1e6:.0f} us, '
+                    f'{dispatch_bf16_rdma_send_bytes / 1e9 / combine_t:.2f} GB/s (RDMA), '
+                    f'{dispatch_bf16_nvl_recv_bytes / 1e9 / combine_t:.2f} GB/s (NVL)',
+                    flush=True)
+            group.barrier()
+        deep_ep.Buffer.set_num_sms(num_sms)
+        return hash_value
+
     # Test dispatch
     # noinspection PyShadowingNames
     def check_data(check_x, recv_gbl_rank_prefix_sum):
@@ -321,6 +356,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     num_sms = 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
+    if args.num_qps_per_rank is not None:
+        num_qps_per_rank = args.num_qps_per_rank
 
     buffer = deep_ep.Buffer(group,
                             int(2e9),
@@ -382,6 +419,11 @@ if __name__ == '__main__':
         help='Pressure test mode. 0: don\'t do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks')
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256')
     parser.add_argument('--test-ll-compatibility', action='store_true', help='whether to test compatibility with low-latency kernels')
+    parser.add_argument('--sm-benchmark', action='store_true', help='benchmark default dispatch/combine config under selected SM counts')
+    parser.add_argument('--sm-list', type=str, default='16,24,32,48,64', help='comma-separated SM counts for --sm-benchmark')
+    parser.add_argument('--benchmark-warmups', type=int, default=20, help='warmup iterations for --sm-benchmark')
+    parser.add_argument('--benchmark-tests', type=int, default=30, help='test iterations for --sm-benchmark')
+    parser.add_argument('--num-qps-per-rank', type=int, default=None, help='override Buffer num_qps_per_rank for benchmark runs')
     args = parser.parse_args()
 
     # Set default `num_topk_groups` if not provided

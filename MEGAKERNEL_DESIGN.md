@@ -2095,3 +2095,114 @@ combine_worker_v2()
 - 如果做 token-order scratch，也要解决同 token 多 local expert 的 reduce 时机和 ready 语义。
 
 因此短期只作为探索方向，不建议和当前 scheduler/head-of-line 优化混在一个 patch 里。
+
+---
+
+## IV. Scheduler 优化总结 (v161 → v169)
+
+### IV.1 问题背景
+
+v161 baseline 中 combine 耗时 ~9200us，远超原始 DeepEP 的 ~2ms。根因链：
+
+```
+combine 慢 → 等待 compute_slot_ready → compute 空泡(gap) → scheduler 发布 task 慢
+→ scheduler 单线程 scan ready 太慢 + contiguous prefix 语义造成 head-of-line blocking
+```
+
+### IV.2 已完成的优化
+
+#### v165: Priority path 不再等 dispatch_done
+
+- 将 priority path 从 `dispatch_done` gate 后移到主循环每次迭代都执行
+- 修复 `token_has_not_full → break` 改为 `continue`，避免一个未满 token 阻塞后续扫描
+- 效果：minimal，因为 scan_ready 本身才是主要瓶颈
+
+#### v166: 低水位补充机制
+
+- Normal path 不再被 priority_enqueued > 0 完全抑制
+- 添加 queue_low_watermark 检查：当队列深度低于 `num_compute_groups * 2` 时，即使 priority 有发射也执行 normal path
+- 效果：小幅改善，但 scan_ready 仍然是主要开销
+
+#### v167: 添加详细 scheduler 计时
+
+- 在 scheduler 内部添加 `scan_ready_us`、`priority_path_us`、`normal_path_us` 等细粒度计时
+- 数据揭示：scan_ready 占 scheduler 总时间 ~195ms (跨 16 ranks)，是绝对瓶颈
+
+#### v168: Priority path 直接 batch-ready 检查
+
+- Priority path 不再依赖 expert_recv_count prefix，直接检查目标 batch 的 256 个 slot_ready
+- 绕过 contiguous prefix 语义的 head-of-line blocking
+- 效果：**回退**，单线程扫描 256 slot 导致 priority path 从 7ms 膨胀到 128ms
+
+#### v169: 多线程调度器 (当前版本)
+
+**核心改动**：将 `compute_scheduler_worker()` 从单线程改为 block-cooperative 多线程
+
+1. **去掉 `if (threadIdx.x != 0) return;`**，所有线程参与调度
+2. **Ready prefix scan 多线程化**：
+   - 每个 expert 的 slot_ready 扫描改为 cooperative 模式
+   - 每波 `num_threads` 个 slot 并行检查
+   - `__syncthreads_and()` 判断整波是否 all-ready
+   - 遇到 hole 时 thread 0 做局部精确定位
+3. **Priority batch-ready check 多线程化**：
+   - Thread 0 驱动 token/hit 迭代，找到候选 batch 后广播到 shared memory
+   - 所有线程并行检查 256 个 slot（`COMPUTE_BATCH_SIZE / num_threads` per thread）
+   - `__syncthreads_and()` 汇总结果
+4. **Normal enqueue / tail flush**：
+   - Enqueue 逻辑保持 thread 0 执行（atomicCAS 去重 + 有序 publish）
+   - Tail flush 中的 ready scan 也改为 cooperative 模式
+5. **Perf trace atomicAdd** 仅 thread 0 执行
+
+**效果**：
+- combine: 9200us → **592us** (15.5x)
+- mean prev_task_gap: ~2487us → **51.5us** (48x)
+- scan_ready total: 195ms → **142ms** (27% reduction)
+- p50 gap = 23.3us, p90 = 31.7us（健康水平）
+
+### IV.3 当前残留问题 (v169)
+
+#### 启动空泡 (1000-1400us, 21 个)
+
+- 全部出现在 group 序列第 1-2 个 task 位置
+- 根因：**网络数据到达不均匀**。以 rank 12 为例：
+  - 7 个 expert (14,3,7,9,11,13,15) 的首个 batch 在 ts≈1000-1289 ready
+  - 剩余 9 个 expert 的首个 batch 直到 ts≈2700 才 ready
+  - 3 个 compute group 在 ts=1372 消费完 7 个 task 后，等待 1377us 直到新数据到达
+- `max_ready_tail_gap = 7`：token alloc 后几乎立即 ready，不存在写入延迟
+- 调度器在数据 ready 后微秒级即发布 task（`publish_to_pop = 0`）
+
+#### 中途空泡 (200-300us, ~32 个)
+
+- 散布在中后段，个别 expert slot_ready 滞后
+- 同样是数据到达延迟，非调度器问题
+
+### IV.4 下一步优化方向
+
+当前调度器本身不再是瓶颈，残留空泡由 data arrival latency 决定。以下是候选方向：
+
+#### 方向 A: Not-full batch 提前发射
+
+- 不等 256 slot 全部 ready，达到阈值（如 192 或 128）即发射 not-full batch
+- 利用计算时间掩盖后续 slot 到达延迟
+- 挑战：compute worker 需要支持 partial batch，GEMM 效率可能下降
+- 潜在收益：消除启动空泡
+
+#### 方向 B: 降低 COMPUTE_BATCH_SIZE
+
+- 从 256 降到 128
+- 凑满一个 batch 需要的 token 数减半，等待时间缩短
+- 挑战：小 batch GEMM 效率低，task 数量翻倍增加调度开销
+- 适合场景：token per expert 偏少的情况
+
+#### 方向 C: Dispatch 发送顺序优化
+
+- 让发送端更均匀地向各 expert 分发 token，减少 expert 间到达时间差
+- 具体做法：dispatch forwarder 按 round-robin expert 而非按 token 顺序发送
+- 挑战：可能影响 dispatch throughput，需要改 dispatch 逻辑
+
+#### 方向 D: 预测性调度 (Speculative Enqueue)
+
+- Scheduler 根据 expert_token_offsets (已分配量) 预测哪些 expert 即将凑满 batch
+- 提前在 task queue 中预留位置或准备 metadata
+- 实际发射仍等 slot ready，但减少 publish 延迟
+- 复杂度较高，收益不确定

@@ -315,6 +315,7 @@ public:
         int num_dispatch_sms,
         int num_combine_sms,
         int total_sms,
+        int stage,
         const Config& dispatch_config,
         const Config& combine_config);
 

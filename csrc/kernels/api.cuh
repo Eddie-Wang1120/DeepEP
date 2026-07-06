@@ -406,6 +406,7 @@ void launch_megakernel_v7(
     MegaKernelState* device_state,
     int total_sms,
     int smem_size,
+    int stage,
     cudaStream_t stream);
 
 }  // namespace megakernel

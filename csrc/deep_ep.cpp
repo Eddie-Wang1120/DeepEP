@@ -1957,6 +1957,7 @@ torch::Tensor Buffer::megakernel_forward(
     int num_dispatch_sms,
     int num_combine_sms,
     int total_sms,
+    int stage,
     const Config& dispatch_config,
     const Config& combine_config) {
 #ifndef DISABLE_NVSHMEM
@@ -1975,6 +1976,7 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(num_experts > 0);
     EP_HOST_ASSERT(num_ranks > 0 and num_experts % num_ranks == 0);
+    EP_HOST_ASSERT(stage >= 1 and stage <= 3);
 
     const int num_tokens = x.size(0);
     const int hidden_dim = x.size(1);
@@ -2011,9 +2013,8 @@ torch::Tensor Buffer::megakernel_forward(
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
-    // A/B: match original DeepEP's one logical channel per physical dispatch channel.
-    const int num_logical_channels = num_physical_channels;
-    const int num_channels = num_logical_channels;
+    const int num_logical_channels = num_physical_channels * stage;
+    const int num_channels = num_logical_channels;  // DeepEP notify sees the expanded logical-channel count.
     const int dispatch_num_max_rdma_chunked_send_tokens = dispatch_config.num_max_rdma_chunked_send_tokens;
     const int dispatch_num_max_rdma_chunked_recv_tokens = dispatch_config.num_max_rdma_chunked_recv_tokens;
     const int dispatch_num_max_nvl_chunked_send_tokens = dispatch_config.num_max_nvl_chunked_send_tokens;
@@ -2265,7 +2266,7 @@ torch::Tensor Buffer::megakernel_forward(
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     printf("[MK-HOST][KERNEL][BEFORE] rank=%d state=%p total_sms=%d smem_size=%d stream=%p\n",
            rank, state, active_total_sms, smem_size, stream.stream());
-    megakernel::launch_megakernel_v7(state, active_total_sms, smem_size, stream);
+    megakernel::launch_megakernel_v7(state, active_total_sms, smem_size, stage, stream);
     printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
 
     AT_CUDA_CHECK(cudaGetLastError());
@@ -2345,6 +2346,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_dispatch_sms") = 24,
              py::arg("num_combine_sms") = 24,
              py::arg("total_sms") = 148,
+             py::arg("stage") = 1,
              py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
              py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
 #ifdef MK_PERF_TRACE

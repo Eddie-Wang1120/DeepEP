@@ -13,14 +13,17 @@ Usage (2 nodes x 8 GPUs):
              test_megakernel_v7.py
 """
 import argparse
+import math
 import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
+from unittest.mock import MagicMock
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from packaging import version
 
 try:
     import transformer_engine.pytorch as te
@@ -31,6 +34,168 @@ except ImportError:
     te_ops = None
     moe_permute_with_probs = None
     moe_unpermute = None
+
+def null_decorator(func=None, *args, **kwargs):
+    if func is not None:
+        return func
+    return lambda f: f
+
+
+HAVE_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+
+    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
+        HAVE_TRITON = False
+    else:
+        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+        HAVE_TRITON_AVAILABLE = True
+except ImportError:
+    HAVE_TRITON = False
+
+if not HAVE_TRITON:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
+
+
+# Copied from Megatron-LM megatron/core/fusions/fused_indices_converter.py.
+@triton.jit
+def _indices_to_multihot_kernel(
+    indices_ptr,
+    probs_in_indices_ptr,
+    multihot_indices_ptr,
+    probs_in_multihot_ptr,
+    position_map_ptr,
+    num_of_local_experts: tl.constexpr,
+    num_of_local_experts_next_power_of_2: tl.constexpr,
+    topk: tl.constexpr,
+    topk_next_power_of_2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    topk_row = tl.arange(0, topk_next_power_of_2)
+    topk_row = tl.where(topk_row < topk, topk_row, -1)
+    topk_row_mask = topk_row != -1
+    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
+    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
+    num_exp_row_mask = num_exp_row != -1
+
+    row_idx = tl.program_id(0)
+    indices_row = tl.load(indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
+    indices_row = tl.where(topk_row_mask, indices_row, -1)
+    probs_row = tl.load(probs_in_indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
+
+    position_row = tl.where(indices_row != -1, topk_row, -1)
+    mask = (indices_row != -1) & (indices_row < num_of_local_experts)
+
+    row_idx_offset = row_idx * num_of_local_experts
+    tl.store(multihot_indices_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
+    tl.store(probs_in_multihot_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
+    tl.store(position_map_ptr + row_idx_offset + num_exp_row, -1, mask=num_exp_row_mask)
+    tl.debug_barrier()
+    tl.store(multihot_indices_ptr + row_idx_offset + indices_row, 1, mask)
+    tl.store(probs_in_multihot_ptr + row_idx_offset + indices_row, probs_row, mask)
+    tl.store(position_map_ptr + row_idx_offset + indices_row, position_row, mask)
+
+
+@triton.jit
+def _multihot_to_indices_kernel(
+    probs_in_multihot_ptr,
+    position_map_ptr,
+    probs_indices_ptr,
+    num_of_local_experts: tl.constexpr,
+    num_of_local_experts_next_power_of_2: tl.constexpr,
+    topk: tl.constexpr,
+    topk_next_power_of_2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    topk_row = tl.arange(0, topk_next_power_of_2)
+    topk_row = tl.where(topk_row < topk, topk_row, -1)
+    topk_row_mask = topk_row != -1
+    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
+    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
+    num_exp_row_mask = num_exp_row != -1
+
+    row_idx = tl.program_id(0)
+    ptr_offset = row_idx * num_of_local_experts + num_exp_row
+    probs_in_multihot_row = tl.load(probs_in_multihot_ptr + ptr_offset, mask=num_exp_row_mask)
+
+    position_map_row = tl.load(position_map_ptr + ptr_offset, mask=num_exp_row_mask)
+    position_map_row = tl.where(num_exp_row_mask, position_map_row, -1)
+    mask = position_map_row != -1
+
+    tl.store(probs_indices_ptr + row_idx * topk + topk_row, 0, mask=topk_row_mask)
+    tl.debug_barrier()
+    tl.store(probs_indices_ptr + row_idx * topk + position_map_row, probs_in_multihot_row, mask)
+
+
+class IndicesToMultihot(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, indices, probs_indices, num_of_local_experts):
+        num_of_tokens = indices.shape[0]
+        assert indices.shape == probs_indices.shape, "indices and probs_indices must have the same shape"
+        topk = indices.shape[1]
+        multihot_indices = torch.empty(
+            (num_of_tokens, num_of_local_experts), dtype=torch.bool, device="cuda")
+        probs_in_multihot = torch.empty(
+            (num_of_tokens, num_of_local_experts), dtype=probs_indices.dtype, device="cuda")
+        position_map = torch.empty(
+            (num_of_tokens, num_of_local_experts), dtype=torch.int32, device="cuda")
+        topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
+        num_of_local_experts_next_power_of_2 = 2 ** int(math.ceil(math.log2(num_of_local_experts)))
+        grid = (num_of_tokens,)
+        _indices_to_multihot_kernel[grid](
+            indices,
+            probs_indices,
+            multihot_indices,
+            probs_in_multihot,
+            position_map,
+            num_of_local_experts,
+            num_of_local_experts_next_power_of_2,
+            topk,
+            topk_next_power_of_2,
+            BLOCK_SIZE=32,
+            num_warps=1,
+        )
+
+        ctx.save_for_backward(position_map)
+        ctx.num_of_tokens = num_of_tokens
+        ctx.num_of_local_experts = num_of_local_experts
+        ctx.topk = topk
+        return multihot_indices, probs_in_multihot
+
+    @staticmethod
+    def backward(ctx, grad_multihot_indices, grad_probs_in_multihot):
+        position_map = ctx.saved_tensors[0]
+        num_of_tokens = ctx.num_of_tokens
+        num_of_local_experts = ctx.num_of_local_experts
+        topk = ctx.topk
+        grad_probs_indices = torch.empty(
+            (num_of_tokens, topk), dtype=grad_probs_in_multihot.dtype, device="cuda")
+        topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
+        num_of_local_experts_next_power_of_2 = 2 ** int(math.ceil(math.log2(num_of_local_experts)))
+
+        grid = (num_of_tokens,)
+        _multihot_to_indices_kernel[grid](
+            grad_probs_in_multihot.contiguous(),
+            position_map,
+            grad_probs_indices,
+            num_of_local_experts,
+            num_of_local_experts_next_power_of_2,
+            topk,
+            topk_next_power_of_2,
+            BLOCK_SIZE=32,
+            num_warps=1,
+        )
+        return None, grad_probs_indices, None, None
+
+
+def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
+    return IndicesToMultihot.apply(indices, probs_indices, num_of_local_experts)
+
 
 sys.path.insert(0, os.path.dirname(__file__))
 import deep_ep
@@ -125,32 +290,6 @@ def _tokens_per_expert_tensor(tokens_per_expert, device):
     return torch.tensor(tokens_per_expert, device=device, dtype=torch.int32)
 
 
-def _get_te_workspace(workspace, key, shape, dtype, device):
-    tensor = workspace.get(key)
-    if tensor is None or tensor.shape != shape or tensor.dtype != dtype or tensor.device != device:
-        tensor = torch.empty(shape, dtype=dtype, device=device)
-        workspace[key] = tensor
-    return tensor
-
-
-def indices_to_routing_map(indices, probs, num_local_experts, workspace):
-    batch_size, topk = indices.shape
-    routing_map = _get_te_workspace(
-        workspace, 'routing_map', (batch_size, num_local_experts), torch.bool, indices.device)
-    probs_map = _get_te_workspace(
-        workspace, 'probs_map', (batch_size, num_local_experts), torch.float32, indices.device)
-    routing_map.zero_()
-    probs_map.zero_()
-
-    flat_indices = indices.reshape(-1)
-    valid_mask = flat_indices != -1
-    if valid_mask.any():
-        flat_token_ids = torch.arange(batch_size, device=indices.device).repeat_interleave(topk)
-        routing_map[flat_token_ids[valid_mask], flat_indices[valid_mask].long()] = True
-        probs_map[flat_token_ids[valid_mask], flat_indices[valid_mask].long()] = probs.float().reshape(-1)[valid_mask]
-    return routing_map, probs_map
-
-
 def build_te_grouped_experts(W_gate, W_up, W_down, experts_per_rank):
     if te_ops is None:
         raise RuntimeError('Transformer Engine ops are required for --baseline-impl te')
@@ -185,8 +324,10 @@ def moe_compute_on_recv_te(recv_x, recv_topk_idx, recv_topk_weights, recv_num_to
     """TE baseline aligned with sonic_te_compare_20260526: fused permute -> te_ops.Sequential -> fused unpermute."""
     if moe_permute_with_probs is None or moe_unpermute is None:
         raise RuntimeError('TE moe_permute_with_probs/moe_unpermute are required for --baseline-impl te')
-    routing_map, probs_map = indices_to_routing_map(
-        recv_topk_idx, recv_topk_weights, experts_per_rank, workspace)
+    if not HAVE_TRITON_AVAILABLE:
+        raise RuntimeError('Triton is required for local fused_indices_to_multihot with --baseline-impl te')
+    routing_map, probs_map = fused_indices_to_multihot(
+        recv_topk_idx, recv_topk_weights.float(), experts_per_rank)
     num_out_tokens = int(_tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device).sum().item())
     tokens_per_expert = _tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device)
     permuted_x, permuted_probs, row_map = moe_permute_with_probs(
@@ -207,7 +348,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
-    buffer.set_num_sms(48)
+    buffer.set_num_sms(24)
 
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
@@ -253,7 +394,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
 
 def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
-                            num_experts, buffer, local_rank, rank):
+                            num_experts, buffer, local_rank, rank, stage):
     """
     MegaKernel v7: single persistent kernel (dispatch + compute + combine fused).
     W_gateup is pairwise interleaved as [g0, u0, g1, u1, ...].
@@ -267,7 +408,7 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
     total_sms = num_sms  # use all available SMs
 
     if local_rank == 0:
-        print(f'[Rank {rank}] MegaKernel launch: total_sms={total_sms}, dispatch={num_dispatch_sms}', flush=True)
+        print(f'[Rank {rank}] MegaKernel launch: total_sms={total_sms}, dispatch={num_dispatch_sms}, stage={stage}', flush=True)
 
     result = buffer.megakernel_forward(
         x, topk_idx, topk_weights,
@@ -275,7 +416,8 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts,
         num_dispatch_sms,
         num_dispatch_sms,  # num_combine_sms = num_dispatch_sms
-        total_sms
+        total_sms,
+        stage
     )
 
     if local_rank == 0:
@@ -334,14 +476,14 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     # Generate test data
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='cuda') * 0.1
 
-    # Grouped topk routing (ensures cross-node traffic)
+    # Precompute Megatron-style DeepEP routing once, then feed the same token_indices/token_probs
+    # to both the baseline and megakernel paths. The timed paths should not redo router topk.
     scores = torch.randn(num_tokens, num_experts, dtype=torch.float32, device='cuda').abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
-    topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    topk_weights, topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = torch.randn(num_tokens, num_topk, dtype=torch.float32, device='cuda').abs()
     topk_weights = topk_weights / topk_weights.sum(dim=1, keepdim=True)
 
     # Expert weights (deterministic per rank)
@@ -361,8 +503,10 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         te_workspace = {}
 
     # Config for dispatch/combine (baseline path)
-    config_num_sms = 24
-    config = deep_ep.Config(config_num_sms, 1, 256, 16, 256)
+    # config_num_sms = 24
+    # config = deep_ep.Config(config_num_sms, 1, 256, 16, 256)
+    config = None
+    
 
     # --- Path A: Baseline (DeepEP dispatch + expert compute + DeepEP combine) ---
     baseline_output = None
@@ -401,14 +545,14 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
             print(f'[Rank {rank}] MegaKernel warmup {w + 1}/{args.warmup}', flush=True)
         run_megakernel_pipeline(
             x, topk_idx, topk_weights, W_gateup, W_down,
-            num_experts, buffer, local_rank, rank)
+            num_experts, buffer, local_rank, rank, args.stage)
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
 
     megakernel_output = run_megakernel_pipeline(
         x, topk_idx, topk_weights, W_gateup, W_down,
-        num_experts, buffer, local_rank, rank)
+        num_experts, buffer, local_rank, rank, args.stage)
 
     if args.skip_baseline:
         if local_rank == 0:
@@ -502,6 +646,8 @@ if __name__ == '__main__':
                         help='Expert compute implementation for the baseline path')
     parser.add_argument('--warmup', type=int, default=20,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
+    parser.add_argument('--stage', type=int, default=1,
+                        help='Logical channels per physical channel for megakernel')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 
