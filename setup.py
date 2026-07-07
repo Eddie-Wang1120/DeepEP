@@ -118,12 +118,6 @@ if __name__ == '__main__':
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
 
-    # MegaKernel combine single-hit gather path:
-    #   0 = warp global copy (default), 1 = direct TMA load into packet buffer
-    if int(os.getenv('COMBINE_TMA_LOAD', 0)):
-        cxx_flags.append('-DCOMBINE_TMA_LOAD')
-        nvcc_flags.append('-DCOMBINE_TMA_LOAD')
-
     # MegaKernel gather reduce path:
     #   0 = fast full-block reduce (default), 1 = align with original combine warp reduce
     if int(os.getenv('GATHER_ALIGN', 0)):

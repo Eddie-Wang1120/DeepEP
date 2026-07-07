@@ -49,6 +49,7 @@ constexpr int COMPUTE_BATCH_SIZE = 256;  // Tokens per expert batch before trigg
 constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
 constexpr int COMPUTE_SCHEDULER_SMS = 2;
 constexpr int GATHER_SCHED_TID_BEGIN = 576; // per scheduler CTA: tid >= this builds gather tasks
+constexpr int GATHER_SCHED_MAX_WARPS = 7;   // 224 gather-scheduler threads / 32 lanes
 constexpr int MK_COMPUTE_CLUSTER_DIM = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
@@ -202,6 +203,7 @@ struct MegaKernelState {
     int* gather_ready_head;             // task queue consumer cursor; gather SMs CAS-pop one task at a time
     int* gather_ready_tail;             // ordered visible task tail published by scheduler lanes
     int* gather_ready_reserve_tail;     // token-storage reservation cursor into gather_ready_queue
+    int* gather_scan_cursor;            // [COMPUTE_SCHEDULER_SMS * GATHER_SCHED_MAX_WARPS] next token for each gather scheduler warp
     int* gather_task_count;             // task metadata reservation cursor
     int* gather_task_tokens;            // [max_total_recv_tokens] task_idx -> token_base in gather_ready_queue
     int* gather_task_nhits;             // [max_total_recv_tokens] task_idx -> number of tokens in the task
@@ -1855,34 +1857,79 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     const int gather_lane = gather_tid & 31;
     const int gather_warp_idx = gather_tid >> 5;
     const int gather_num_warps = (gather_threads + 31) / 32;
-    if (gather_lane != 0)
+    if (gather_warp_idx >= GATHER_SCHED_MAX_WARPS)
         return;
 
-    int batch_tokens[kGatherBatchTokens];
-    int batch_count = 0;
+    __shared__ int s_gather_batch_tokens[GATHER_SCHED_MAX_WARPS][kGatherBatchTokens];
+    __shared__ int s_gather_batch_count[GATHER_SCHED_MAX_WARPS];
+
+    if (gather_lane == 0)
+        s_gather_batch_count[gather_warp_idx] = 0;
+    __syncwarp();
+
     const int total_tokens = state->combine_num_tokens;
+    const int cursor_idx = scheduler_id * GATHER_SCHED_MAX_WARPS + gather_warp_idx;
+    const int cursor_start = scheduler_id + gather_warp_idx * num_schedulers * 32;
+    const int warp_stride = gather_num_warps * num_schedulers * 32;
+    const int lane_stride = num_schedulers;
+    int cursor = ld_nc_global(&state->gather_scan_cursor[cursor_idx]);
+    if (cursor < cursor_start || cursor >= total_tokens)
+        cursor = cursor_start;
+
+    const int scan_groups = (total_tokens > cursor_start) ? ((total_tokens - cursor_start + warp_stride - 1) / warp_stride) : 0;
+    int scan_steps = 0;
 
     // Interleave by token index so scheduler SM0 scans token_idx % 2 == 0 and
-    // scheduler SM1 scans token_idx % 2 == 1. Gather scheduler warp leaders build
-    // concrete gather tasks; gather SMs only pop and execute those tasks.
-    for (int token = scheduler_id + gather_warp_idx * num_schedulers;
-         token < total_tokens && batch_count < kGatherBatchTokens;
-         token += gather_num_warps * num_schedulers) {
-        if (ld_nc_global(&state->gather_claimed[token]) != 0)
-            continue;
-        int nhits = ld_acquire_global(&state->token_nhits[token]);
-        if (nhits <= 1)
-            continue;
-        int expected = ld_acquire_global(&state->token_compute_expected[token]);
-        if (expected != nhits)
-            continue;
-        int done = ld_acquire_global(&state->token_done_count[token]);
-        if (done < nhits)
-            continue;
-        if (atomicCAS(&state->gather_claimed[token], 0, 1) == 0)
-            batch_tokens[batch_count++] = token;
+    // scheduler SM1 scans token_idx % 2 == 1. All lanes in a gather scheduler
+    // warp scan in parallel and compact ready multi-hit tokens into one task.
+    while (scan_steps < scan_groups && s_gather_batch_count[gather_warp_idx] < kGatherBatchTokens) {
+        const int token = cursor + gather_lane * lane_stride;
+        bool ready = false;
+        if (token < total_tokens && ld_nc_global(&state->gather_claimed[token]) == 0) {
+            int nhits = ld_acquire_global(&state->token_nhits[token]);
+            if (nhits > 1) {
+                int expected = ld_acquire_global(&state->token_compute_expected[token]);
+                int done = ld_acquire_global(&state->token_done_count[token]);
+                ready = (expected == nhits && done >= nhits);
+            }
+        }
+
+        unsigned ready_mask = __ballot_sync(0xffffffff, ready);
+        const int ready_count = __popc(ready_mask);
+        int base = 0;
+        int space = 0;
+        if (gather_lane == 0) {
+            base = s_gather_batch_count[gather_warp_idx];
+            space = max(kGatherBatchTokens - base, 0);
+        }
+        base = __shfl_sync(0xffffffff, base, 0);
+        space = __shfl_sync(0xffffffff, space, 0);
+
+        const int ready_rank = __popc(ready_mask & ((1u << gather_lane) - 1));
+        bool claimed = ready && ready_rank < space && atomicCAS(&state->gather_claimed[token], 0, 1) == 0;
+        unsigned claimed_mask = __ballot_sync(0xffffffff, claimed);
+        const int claimed_count = __popc(claimed_mask);
+        const int claimed_rank = __popc(claimed_mask & ((1u << gather_lane) - 1));
+        if (claimed)
+            s_gather_batch_tokens[gather_warp_idx][base + claimed_rank] = token;
+        if (gather_lane == 0)
+            s_gather_batch_count[gather_warp_idx] = base + claimed_count;
+
+        if (ready_count <= space) {
+            cursor += warp_stride;
+            if (cursor >= total_tokens)
+                cursor = cursor_start;
+            ++scan_steps;
+        }
     }
-    if (batch_count == 0)
+    __syncwarp();
+
+    int batch_count = s_gather_batch_count[gather_warp_idx];
+    if (batch_count > kGatherBatchTokens)
+        batch_count = kGatherBatchTokens;
+    if (gather_lane == 0)
+        state->gather_scan_cursor[cursor_idx] = cursor;
+    if (batch_count == 0 || gather_lane != 0)
         return;
 
     int token_base = atomicAdd(state->gather_ready_reserve_tail, batch_count);
@@ -1892,7 +1939,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
         trap();
     }
     for (int i = 0; i < batch_count; ++i)
-        state->gather_ready_queue[token_base + i] = batch_tokens[i];
+        state->gather_ready_queue[token_base + i] = s_gather_batch_tokens[gather_warp_idx][i];
 
     int task_idx = atomicAdd(state->gather_task_count, 1);
     if (task_idx >= state->max_total_recv_tokens) {
@@ -5864,6 +5911,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* gather_ready_head;
     int* gather_ready_tail;
     int* gather_ready_reserve_tail;
+    int* gather_scan_cursor;
     int* gather_task_count;
     int* gather_task_tokens;
     int* gather_task_nhits;
@@ -5881,6 +5929,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(gather_ready_tail, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_ready_reserve_tail, sizeof(int)));
     CUDA_CHECK(cudaMemset(gather_ready_reserve_tail, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_scan_cursor, COMPUTE_SCHEDULER_SMS * GATHER_SCHED_MAX_WARPS * sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_scan_cursor, 0, COMPUTE_SCHEDULER_SMS * GATHER_SCHED_MAX_WARPS * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_task_count, sizeof(int)));
     CUDA_CHECK(cudaMemset(gather_task_count, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_task_tokens, (size_t)max_total_recv_tokens * sizeof(int)));
@@ -6154,6 +6204,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.gather_ready_head = gather_ready_head;
     host_state.gather_ready_tail = gather_ready_tail;
     host_state.gather_ready_reserve_tail = gather_ready_reserve_tail;
+    host_state.gather_scan_cursor = gather_scan_cursor;
     host_state.gather_task_count = gather_task_count;
     host_state.gather_task_tokens = gather_task_tokens;
     host_state.gather_task_nhits = gather_task_nhits;
@@ -6692,6 +6743,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.gather_ready_head));
     CUDA_CHECK(cudaFree(host_state.gather_ready_tail));
     CUDA_CHECK(cudaFree(host_state.gather_ready_reserve_tail));
+    CUDA_CHECK(cudaFree(host_state.gather_scan_cursor));
     CUDA_CHECK(cudaFree(host_state.gather_task_count));
     CUDA_CHECK(cudaFree(host_state.gather_task_tokens));
     CUDA_CHECK(cudaFree(host_state.gather_task_nhits));
