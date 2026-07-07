@@ -2719,12 +2719,16 @@ __device__ void compute_worker(
 
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
+        int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
         const int slot_base = expert_id * max_tpe + start_slot;
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
             int slot = slot_base + row;
-            slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
+            if (s_expected[row] == 1)
+                token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = down_i4[idx];
+            else
+                slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
 #ifdef MK_PERF_TRACE
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
@@ -2760,8 +2764,7 @@ __device__ void compute_worker(
             for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
                 const int recv_token = s_recv_token_idx[row];
                 int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
-                int nhits = ld_acquire_global(&state->token_nhits[recv_token]);
-                if (nhits == 1 && done >= 1) {
+                if (s_expected[row] == 1 && done >= 1) {
                     __threadfence();
                     atomicExch(&state->combine_token_ready[recv_token], 1);
                 }
@@ -3134,26 +3137,14 @@ __device__ void combine_worker_v2(
                                     .advance_also(local_buffer_ptr);
 
         // TMA stuffs
-        constexpr int kGatherChunkInt4 = 128;
-        constexpr int kGatherChunkBytes = kGatherChunkInt4 * sizeof(int4);
-        constexpr int kGatherNumStages = 2;
         extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
         auto tma_buffer = smem_tma_buffer + dst_nvl_rank * kNumCombineTMABytesPerSenderWarp;
-        auto gather_mbarrier = [=](int stage) {
-            return reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token +
-                                               stage * sizeof(uint64_t));
-        };
-        auto gather_load_buffer = [=](int stage) {
-            return tma_buffer + num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) +
-                   stage * kGatherChunkBytes;
-        };
-        uint32_t gather_tma_phase[kGatherNumStages] = {0, 0};
-        if (lane_id < kGatherNumStages)
-            mbarrier_init(gather_mbarrier(lane_id), 1);
+        auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
+        uint32_t tma_phase = 0;
         if (elect_one_sync()) {
+            mbarrier_init(tma_mbarrier, 1);
             fence_barrier_init();
-            EP_DEVICE_ASSERT(num_bytes_per_token + kGatherNumStages * sizeof(uint64_t) +
-                             kGatherNumStages * kGatherChunkBytes <= kNumCombineTMABytesPerSenderWarp);
+            EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumCombineTMABytesPerSenderWarp);
         }
         __syncwarp();
 
@@ -3174,18 +3165,6 @@ __device__ void combine_worker_v2(
 
         auto& cached_channel_head_idx = combine_nvl_sender_cached_channel_head_idx;
         auto& cached_channel_tail_idx = combine_nvl_sender_cached_channel_tail_idx;
-
-        // DEBUG: NVL sender task range (only for ch=0, use warp-safe approach)
-        {
-            int my_range = (lane_id < kNumRDMARanks_C) ? (token_end_idx - token_start_idx) : 0;
-            // Warp-reduce to get total tasks
-            for (int offset = 16; offset > 0; offset >>= 1)
-                my_range += __shfl_down_sync(0xffffffff, my_range, offset);
-            // if (lane_id == 0 && logical_channel_id == 0)
-            //     printf("MK combine NVL sender: sm=%d, ch=%d, dst_nvl=%d, total_tasks=%d\n",
-            //            sm_id, channel_id, dst_nvl_rank, my_range);
-        }
-        __syncwarp();
 
         // Iterate over all tokens and send by chunks
         int current_rdma_idx = channel_id % kNumRDMARanks_C;
@@ -3242,9 +3221,8 @@ __device__ void combine_worker_v2(
                 int num_tokens_in_chunk = min(num_max_nvl_chunked_send_tokens, producer_token_end_idx - static_cast<int>(token_idx));
 
                 for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
-                    // The gather-reduce below consumes a single per-token readiness signal
-                    // (combine_token_ready): nhits==1 is published by compute, nhits>1 by the
-                    // gather worker after reduce. nh==0 tokens (no local expert) send zeros.
+                    // combine_token_ready: nhits==1 is published by compute, nhits>1 by gather
+                    // after reduce. nh==0 tokens (no local expert) send zeros.
                     __syncwarp();
                     // NOTE: DeepEP's combine NVL sender forwards every token in the
                     // [token_start_idx, token_end_idx) range unconditionally. The range from
@@ -3297,14 +3275,13 @@ __device__ void combine_worker_v2(
                         phase_start_ns = now;
                     }
 #endif
-                    // Change C: gather this token's nh local-expert slots and fp32-reduce
-                    // them directly into tma_buffer (per-lane registers). compute now writes
-                    // per-slot rows to compute_output_slot; the same-rank reduce happens here.
+                    // Gather-ready means combine_input already contains the same-rank output:
+                    // compute writes nhits==1 tokens directly, gather_worker reduces nhits>1 tokens.
                     const int nh = ld_acquire_global(&state->token_nhits[token_idx]);
                     const bool is_single_hit = (nh == 1);
                     // All computed tokens use the unified per-token ready signal:
                     // nhits==1 is published by compute, nhits>1 by gather after reduce.
-                    // nhits==0 has no producer and will be zero-filled below.
+                    // nhits==0 has no producer; combine_input is pre-zeroed.
                     if (nh > 0) {
                         auto gather_wait_start = clock64();
                         while (ld_acquire_global(&state->combine_token_ready[token_idx]) != 1) {
@@ -3318,46 +3295,11 @@ __device__ void combine_worker_v2(
                         }
                     }
                     {
-                        constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
                         int4* tma_i4 = reinterpret_cast<int4*>(tma_buffer);
-                        const int4* slot_base_i4 = reinterpret_cast<const int4*>(state->compute_output_slot);
-                        // Per-slot ready wait (change B): each lane waits on one slot's ready
-                        // flag; nh <= num_topk <= 32 so a single warp covers all slots.
-#ifdef MK_PERF_TRACE
-                        int64_t lane_slot_wait_ns = 0;
-                        int lane_wait_slot = -1;
-                        int lane_wait_from_flush = 0;
-#endif
+                        const int4* token_out_i4 = reinterpret_cast<const int4*>(state->combine_input);
                         // No per-slot wait here. combine_token_ready is the only readiness signal.
                         __syncwarp();
 #ifdef MK_PERF_TRACE
-                        int64_t wait_ready_flush_sum = 0;
-                        int64_t wait_ready_full_sum = 0;
-                        int64_t wait_ready_flush_slots = 0;
-                        int64_t wait_ready_full_slots = 0;
-                        int64_t wait_top_ns = 0;
-                        int wait_top_slot = -1;
-                        int wait_top_from_flush = -1;
-                        #pragma unroll
-                        for (int l = 0; l < 32; ++l) {
-                            int64_t w = __shfl_sync(0xffffffff, lane_slot_wait_ns, l);
-                            int slot = __shfl_sync(0xffffffff, lane_wait_slot, l);
-                            int from_flush = __shfl_sync(0xffffffff, lane_wait_from_flush, l);
-                            if (l < nh) {
-                                if (from_flush) {
-                                    wait_ready_flush_sum += w;
-                                    wait_ready_flush_slots += 1;
-                                } else {
-                                    wait_ready_full_sum += w;
-                                    wait_ready_full_slots += 1;
-                                }
-                                if (w > wait_top_ns) {
-                                    wait_top_ns = w;
-                                    wait_top_slot = slot;
-                                    wait_top_from_flush = from_flush;
-                                }
-                            }
-                        }
                         if (lane_id == 0) {
                             int64_t now = globaltimer_ns();
                             comb_wait_ready_ns = now - phase_start_ns;
@@ -3365,108 +3307,17 @@ __device__ void combine_worker_v2(
                                 comb_wait_ready_single_ns = comb_wait_ready_ns;
                             else
                                 comb_wait_ready_multi_ns = comb_wait_ready_ns;
-                            comb_wait_ready_flush_ns = wait_ready_flush_sum;
-                            comb_wait_ready_full_ns = wait_ready_full_sum;
-                            comb_wait_ready_flush_count = wait_ready_flush_slots;
-                            comb_wait_ready_full_count = wait_ready_full_slots;
-                            comb_wait_top_ns = wait_top_ns;
-                            comb_wait_top_slot = wait_top_slot;
-                            comb_wait_top_from_flush = wait_top_from_flush;
                             phase_start_ns = now;
                         }
 #endif
-                        constexpr int kVecsPerLane = kGatherChunkInt4 / 32;
-                        if (true) {
-                            const int slot = (nh > 0) ? state->token_slot_list[token_idx * num_topk] : 0;
-#ifdef COMBINE_TMA_LOAD
-                            if (nh > 0) {
-                                if (lane_id == 0) {
-                                    tma_load_1d(tma_buffer,
-                                                slot_base_i4 + (int64_t)slot * hidden_int4,
-                                                gather_mbarrier(0), hidden_bytes, false);
-                                    mbarrier_arrive_and_expect_tx(gather_mbarrier(0), hidden_bytes);
-                                }
-                                __syncwarp();
-                                mbarrier_wait(gather_mbarrier(0), gather_tma_phase[0]);
-                            } else {
-                                for (int vi = lane_id; vi < hidden_int4; vi += 32)
-                                    tma_i4[vi] = make_int4(0, 0, 0, 0);
-                            }
-#else
-                            for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
-                                const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
-                                #pragma unroll
-                                for (int j = 0; j < kVecsPerLane; ++j) {
-                                    const int vi = chunk_base + lane_id + j * 32;
-                                    if (vi < chunk_end)
-                                        tma_i4[vi] = (nh > 0) ? ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi) : make_int4(0, 0, 0, 0);
-                                }
-                            }
-#endif
-                        } else {
-                            // Chunked smem-load reduce: use the sender warp's spare shared
-                            // memory to TMA-load each slot chunk, then reduce from smem in
-                            // registers. This keeps the current expert-slot-major layout while
-                            // moving the nh>1 path closer to mega_moe's combine pipeline.
-                            for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
-                                const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
-                                const int chunk_int4 = chunk_end - chunk_base;
-                                const int chunk_bytes = chunk_int4 * static_cast<int>(sizeof(int4));
-                                constexpr int kBfloat162PerInt4 = kElemsPerInt4 / 2;
-                                float2 acc[kVecsPerLane][kBfloat162PerInt4];
-                                #pragma unroll
-                                for (int j = 0; j < kVecsPerLane; ++j) {
-                                    #pragma unroll
-                                    for (int p = 0; p < kBfloat162PerInt4; ++p)
-                                        acc[j][p] = make_float2(0.0f, 0.0f);
-                                }
-                                auto issue_slot_chunk = [&](int stage_idx, int hit_idx) {
-                                    int slot = state->token_slot_list[token_idx * num_topk + hit_idx];
-                                    tma_load_1d(gather_load_buffer(stage_idx),
-                                                slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base,
-                                                gather_mbarrier(stage_idx), chunk_bytes, false);
-                                    mbarrier_arrive_and_expect_tx(gather_mbarrier(stage_idx), chunk_bytes);
-                                };
-                                int stage = 0;
-                                if (lane_id == 0)
-                                    issue_slot_chunk(stage, 0);
-                                for (int k = 0; k < nh; ++k) {
-                                    const int cur_stage = stage;
-                                    const int next_stage = stage ^ 1;
-                                    mbarrier_wait(gather_mbarrier(cur_stage), gather_tma_phase[cur_stage]);
-                                    if (k + 1 < nh && lane_id == 0)
-                                        issue_slot_chunk(next_stage, k + 1);
-                                    const int4* smem_i4 = reinterpret_cast<const int4*>(gather_load_buffer(cur_stage));
-                                    #pragma unroll
-                                    for (int j = 0; j < kVecsPerLane; ++j) {
-                                        const int local_vi = lane_id + j * 32;
-                                        if (local_vi < chunk_int4) {
-                                            int4 raw = smem_i4[local_vi];
-                                            const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-                                            #pragma unroll
-                                            for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                                                float2 v = __bfloat1622float2(bv2[p]);
-                                                acc[j][p].x += v.x;
-                                                acc[j][p].y += v.y;
-                                            }
-                                        }
-                                    }
-                                    stage = next_stage;
-                                }
-                                #pragma unroll
-                                for (int j = 0; j < kVecsPerLane; ++j) {
-                                    const int vi = chunk_base + lane_id + j * 32;
-                                    if (vi < chunk_end) {
-                                        int4 packed;
-                                        __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
-                                        #pragma unroll
-                                        for (int p = 0; p < kBfloat162PerInt4; ++p)
-                                            pv2[p] = __float22bfloat162_rn(acc[j][p]);
-                                        tma_i4[vi] = packed;
-                                    }
-                                }
-                            }
+                        if (lane_id == 0) {
+                            tma_load_1d(tma_buffer,
+                                        token_out_i4 + token_idx * hidden_int4,
+                                        tma_mbarrier, hidden_bytes, false);
+                            mbarrier_arrive_and_expect_tx(tma_mbarrier, hidden_bytes);
                         }
+                        __syncwarp();
+                        mbarrier_wait(tma_mbarrier, tma_phase);
                     }
                     __syncwarp();
 #ifdef MK_PERF_TRACE
@@ -3487,46 +3338,6 @@ __device__ void combine_worker_v2(
                     if (lane_id < num_topk)
                         *reinterpret_cast<float*>(tma_buffer + hidden_bytes + sizeof(SourceMeta) + lane_id * sizeof(float)) =
                             ld_nc_global(topk_weights + token_idx * num_topk + lane_id);
-                    const int meta_end = hidden_bytes + sizeof(SourceMeta) + num_topk * sizeof(float);
-                    if (lane_id == 0) {
-                        for (int byte_idx = meta_end; byte_idx < num_bytes_per_token; ++byte_idx)
-                            tma_buffer[byte_idx] = 0;
-                    }
-#ifdef MK_PERF_TRACE
-                    if (lane_id == 0) {
-                        int64_t now = globaltimer_ns();
-                        comb_pack_meta_work_ns = now - phase_start_ns;
-                        phase_start_ns = now;
-                    }
-#endif
-                    __syncwarp();
-#ifdef MK_PERF_TRACE
-                    if (lane_id == 0) {
-                        int64_t now = globaltimer_ns();
-                        comb_pack_meta_sync_ns = now - phase_start_ns;
-                        comb_pack_meta_ns = comb_pack_meta_work_ns + comb_pack_meta_sync_ns;
-                        phase_start_ns = now;
-                    }
-#endif
-
-#ifdef MK_TOKEN_TRACE
-                    if (lane_id == 0) {
-                        auto* hptr = reinterpret_cast<nv_bfloat16*>(tma_buffer);
-                        SourceMeta send_meta = ld_nc_global(src_meta + token_idx);
-                        int send_prefix_idx = (current_rdma_idx * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_logical_channels + logical_channel_id;
-                        int send_base = gbl_channel_prefix_matrix[send_prefix_idx];
-                        printf("[MK-TOKEN][COMBINE-NVL-SEND] rank=%d token=%lld dst_nvl=%d src_rdma=%d ch=%d logical_ch=%d sender_prefix_idx=%d sender_base=%d queue_tail_before=%d sender_queue_token=%d dst_slot=%d dst_lane_slot=%d meta=(%d,0x%x) tail_ptr=%p dst_ptr=%p topk_w0=%f topk_w1=%f h0=%f\n",
-                               state->rank, (long long)token_idx, dst_nvl_rank, current_rdma_idx, channel_id, logical_channel_id,
-                               send_prefix_idx, send_base, queue_tail_before, send_base + queue_tail_before,
-                               dst_slot_idx, dst_slot_idx % num_max_nvl_chunked_recv_tokens_per_rdma,
-                               send_meta.src_rdma_rank, send_meta.is_token_in_nvl_rank_bits,
-                               (void*)(nvl_channel_tail.buffer() + current_rdma_idx),
-                               (void*)shifted_x_buffers,
-                               ld_nc_global(topk_weights + token_idx * num_topk),
-                               num_topk > 1 ? ld_nc_global(topk_weights + token_idx * num_topk + 1) : 0.0f,
-                               __bfloat162float(hptr[0]));
-                    }
-#endif
 
                     tma_store_fence();
                     __syncwarp();
@@ -4205,6 +4016,27 @@ __device__ void combine_worker_v2(
 // nhits > 1 tokens in gather_ready_queue; nhits == 1 is signaled by compute.
 // ============================================================================
 
+__device__ __forceinline__ void gather_accum_bf162(float2& acc, __nv_bfloat162 value) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint32_t packed = *reinterpret_cast<uint32_t*>(&value);
+    uint16_t lo = static_cast<uint16_t>(packed & 0xffffu);
+    uint16_t hi = static_cast<uint16_t>(packed >> 16);
+    asm volatile("add.rn.f32.bf16 %0, %1, %0;" : "+f"(acc.x) : "h"(lo));
+    asm volatile("add.rn.f32.bf16 %0, %1, %0;" : "+f"(acc.y) : "h"(hi));
+#else
+    float2 v = __bfloat1622float2(value);
+    acc.x += v.x;
+    acc.y += v.y;
+#endif
+}
+
+__device__ __forceinline__ void gather_accum_int4(float2* acc, int4 raw) {
+    const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    #pragma unroll
+    for (int p = 0; p < 4; ++p)
+        gather_accum_bf162(acc[p], bv2[p]);
+}
+
 __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
     const int tid = threadIdx.x;
     const int total_tokens = state->combine_num_tokens;
@@ -4252,109 +4084,82 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         const int hidden_int4 = hidden / kElemsPerInt4;
         const int num_topk = state->num_topk;
         int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
+        int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
         int first_token = -1;
         int last_token = -1;
         int nhit_sum = 0;
-
-        for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
-            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
-            const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
-            const int first_slot = state->token_slot_list[token_idx * num_topk];
-            if (batch_idx == 0)
-                first_token = token_idx;
-            last_token = token_idx;
-            nhit_sum += nhits;
-
-#ifdef GATHER_ALIGN
-        // One gather SM owns one gather task and reduces the full hidden dimension.
-        constexpr int kGatherChunkInt4_g = 128;
-        constexpr int kVecsPerLane_g = kGatherChunkInt4_g / 32;
-        const int lane_id_g = tid % 32;
-
-        if (tid < 32) {
-            for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4_g) {
-                const int chunk_end = min(chunk_base + kGatherChunkInt4_g, hidden_int4);
-                const int chunk_int4 = chunk_end - chunk_base;
-                float2 acc[kVecsPerLane_g][kBfloat162PerInt4];
-                #pragma unroll
-                for (int j = 0; j < kVecsPerLane_g; ++j) {
-                    #pragma unroll
-                    for (int p = 0; p < kBfloat162PerInt4; ++p)
-                        acc[j][p] = make_float2(0.0f, 0.0f);
-                }
-
-                for (int k = 0; k < nhits; ++k) {
-                    int slot = state->token_slot_list[token_idx * num_topk + k];
-                    #pragma unroll
-                    for (int j = 0; j < kVecsPerLane_g; ++j) {
-                        const int local_vi = lane_id_g + j * 32;
-                        if (local_vi < chunk_int4) {
-                            int4 raw;
-                            asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
-                                : "l"(slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base + local_vi));
-                            const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-                            #pragma unroll
-                            for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                                float2 v = __bfloat1622float2(bv2[p]);
-                                acc[j][p].x += v.x;
-                                acc[j][p].y += v.y;
-                            }
-                        }
-                    }
-                }
-
-                #pragma unroll
-                for (int j = 0; j < kVecsPerLane_g; ++j) {
-                    const int vi = chunk_base + lane_id_g + j * 32;
-                    if (vi < chunk_end) {
-                        int4 packed;
-                        __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
-                        #pragma unroll
-                        for (int p = 0; p < kBfloat162PerInt4; ++p)
-                            pv2[p] = __float22bfloat162_rn(acc[j][p]);
-                        asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};"
-                            :: "l"(slot_base_i4 + (int64_t)first_slot * hidden_int4 + vi),
-                               "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w));
-                    }
-                }
+        if (tid == 0) {
+            for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
+                const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+                const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
+                if (batch_idx == 0)
+                    first_token = token_idx;
+                last_token = token_idx;
+                nhit_sum += nhits;
             }
         }
-#else
-        for (int vi = tid; vi < hidden_int4; vi += blockDim.x) {
-            float2 acc[kBfloat162PerInt4];
+
+        constexpr int kGatherChunkInt4 = 128;
+        constexpr int kGatherVecsPerLane = kGatherChunkInt4 / 32;
+        const int warp_id = tid >> 5;
+        const int lane_id = tid & 31;
+        const int num_warps = (blockDim.x + 31) >> 5;
+        const int chunks_per_token = (hidden_int4 + kGatherChunkInt4 - 1) / kGatherChunkInt4;
+        const int total_work = batch_count * chunks_per_token;
+
+        for (int work = warp_id; work < total_work; work += num_warps) {
+            const int batch_idx = work / chunks_per_token;
+            const int chunk = work - batch_idx * chunks_per_token;
+            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+            const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
+            const int chunk_base = chunk * kGatherChunkInt4;
+            const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
+            float2 acc[kGatherVecsPerLane][kBfloat162PerInt4];
+
             #pragma unroll
-            for (int p = 0; p < kBfloat162PerInt4; ++p)
-                acc[p] = make_float2(0.0f, 0.0f);
+            for (int j = 0; j < kGatherVecsPerLane; ++j) {
+                #pragma unroll
+                for (int p = 0; p < kBfloat162PerInt4; ++p)
+                    acc[j][p] = make_float2(0.0f, 0.0f);
+            }
 
             for (int k = 0; k < nhits; ++k) {
                 int slot = state->token_slot_list[token_idx * num_topk + k];
-                int4 raw = slot_base_i4[(int64_t)slot * hidden_int4 + vi];
-                const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
                 #pragma unroll
-                for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                    float2 v = __bfloat1622float2(bv2[p]);
-                    acc[p].x += v.x;
-                    acc[p].y += v.y;
+                for (int j = 0; j < kGatherVecsPerLane; ++j) {
+                    const int vi = chunk_base + lane_id + j * 32;
+                    if (vi < chunk_end) {
+                        int4 raw;
+                        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
+                            : "l"(slot_base_i4 + (int64_t)slot * hidden_int4 + vi));
+                        gather_accum_int4(acc[j], raw);
+                    }
                 }
             }
 
-            int4 packed;
-            __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
             #pragma unroll
-            for (int p = 0; p < kBfloat162PerInt4; ++p)
-                pv2[p] = __float22bfloat162_rn(acc[p]);
-            slot_base_i4[(int64_t)first_slot * hidden_int4 + vi] = packed;
+            for (int j = 0; j < kGatherVecsPerLane; ++j) {
+                const int vi = chunk_base + lane_id + j * 32;
+                if (vi < chunk_end) {
+                    int4 packed;
+                    __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
+                    #pragma unroll
+                    for (int p = 0; p < kBfloat162PerInt4; ++p)
+                        pv2[p] = __float22bfloat162_rn(acc[j][p]);
+                    token_out_i4[(int64_t)token_idx * hidden_int4 + vi] = packed;
+                }
+            }
         }
-#endif
 
-            __syncthreads();
-            __threadfence();
-            __syncthreads();
-            if (tid == 0)
-                atomicExch(&state->combine_token_ready[token_idx], 1);
-            __syncthreads();
+        __syncthreads();
+        __threadfence();
+        __syncthreads();
+        for (int batch_idx = tid; batch_idx < batch_count; batch_idx += blockDim.x) {
+            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+            atomicExch(&state->combine_token_ready[token_idx], 1);
         }
+        __syncthreads();
 #ifdef MK_PERF_TRACE
         if (tid == 0) {
             perf_reduce_done_ns = globaltimer_ns();
