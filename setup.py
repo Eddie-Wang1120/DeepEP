@@ -118,6 +118,13 @@ if __name__ == '__main__':
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
 
+    # MegaKernel async publish offload: move NVL receiver publish work to dedicated warps
+    mk_async_publish = int(os.getenv('MK_ASYNC_PUBLISH', 0))
+    assert mk_async_publish in (0, 1), 'MK_ASYNC_PUBLISH must be 0 or 1'
+    if mk_async_publish:
+        cxx_flags.append('-DMK_ASYNC_PUBLISH=1')
+        nvcc_flags.append('-DMK_ASYNC_PUBLISH=1')
+
     # MegaKernel gather reduce path:
     #   0 = fast full-block reduce (default), 1 = align with original combine warp reduce
     if int(os.getenv('GATHER_ALIGN', 0)):
