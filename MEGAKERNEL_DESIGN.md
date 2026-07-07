@@ -2206,3 +2206,274 @@ combine 慢 → 等待 compute_slot_ready → compute 空泡(gap) → scheduler 
 - 提前在 task queue 中预留位置或准备 metadata
 - 实际发射仍等 slot ready，但减少 publish 延迟
 - 复杂度较高，收益不确定
+
+---
+
+## [废弃] 统一调度器 + Gather Task 方案
+
+> **已废弃**：该方案让 gather 与 compute 共享 96 SM 池，引入统一调度器复杂度过高。
+> 替代方案见下方 "[最新] 独立 Gather SM 方案"。
+
+---
+
+## [最新] 独立 Gather SM 方案
+
+### 目标
+
+1. Dispatch 相对原始 DeepEP 基本不掉速
+2. Compute 不受 gather 影响（96 SM 池全部做 GEMM）
+3. Combine 相对原始 DeepEP 基本不掉速（退化为纯 TMA send）
+4. Gather 利用 B300 剩余的 2 个空闲 SM 独立完成
+
+### SM 分配（B300 = 148 SM）
+
+```
+24 SM  - Dispatch
+2  SM  - Scheduler
+96 SM  - Compute (纯 GEMM，不做 gather)
+24 SM  - Combine sender (纯 TMA send)
+2  SM  - Gather (独立角色，各自轮询 ready token)
+───────
+148 SM 总计
+```
+
+### 核心设计
+
+- **Gather 是独立角色**，不与 compute 共享 SM 也不经过统一调度器
+- 2 个 Gather SM 各自独立轮询 `token_done_count[]`，发现某 token 的所有 slot 已 compute 完毕后立即执行 K-way weighted reduce
+- 通过 `atomicCAS(&gather_claimed[t], 0, 1)` 保证每个 token 只被一个 Gather SM 处理
+- 不需要 task queue，不需要优先级调度，不需要 group barrier
+
+### 数据流
+
+```
+Dispatch (receiver publish)
+    │
+    │  写 recv_token_source_info, token_nhits, token_slot_list
+    │  写 expert_slot_ready[slot] = 1
+    ▼
+Scheduler (扫描 expert_slot_ready → 入队 compute_task)
+    │
+    ▼
+Compute Worker (32 SM group)
+    │  读 input, 执行 GEMM (gate/up → SwiGLU → down)
+    │  写 compute_output_slot[slot] (per-slot row)
+    │  __threadfence()
+    │  atomicAdd(&token_done_count[token], 1)
+    ▼
+Gather SM (2 个独立 SM，各自轮询)
+    │  轮询 token_done_count[t] >= token_nhits[t]
+    │  atomicCAS(&gather_claimed[t], 0, 1) 成功 → claim 该 token
+    │  读 token_slot_list 获取 K 个 slot 地址
+    │  从 compute_output_slot 加载 K 行 bf16
+    │  fp32 weighted reduce (结果写回 first_slot)
+    │  __threadfence()
+    │  st_release(&combine_token_ready[token], 1)
+    ▼
+Combine Sender (24 SM)
+    等 combine_token_ready[token]
+    读 first_slot 的 pre-reduced 数据
+    pack meta + topk_weights
+    TMA send
+```
+
+### Gather SM 工作逻辑（伪代码）
+
+```c
+__device__ void gather_sm_main(MegaKernelState* state) {
+    int cursor = 0;  // 从 token 0 开始轮询
+    int total_tokens = state->combine_num_tokens;  // 最终 recv token 总数
+    int done_count = 0;
+
+    while (done_count < total_tokens) {
+        // 轮询找到下一个 ready 且未被 claim 的 token
+        int t = cursor;
+        cursor = (cursor + 1) % total_tokens;
+
+        int nhits = state->token_nhits[t];
+        if (nhits == 0) { done_count++; continue; }  // 无需 gather 的 token
+
+        // acquire 语义读 token_done_count
+        int completed = ld_acquire(&state->token_done_count[t]);
+        if (completed < nhits) continue;
+
+        // CAS claim 该 token
+        if (atomicCAS(&state->gather_claimed[t], 0, 1) != 0) continue;
+
+        // --- 执行 K-way weighted fp32 reduce ---
+        int K = nhits;
+        int hidden = state->combine_hidden;
+        for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) {
+                int slot = state->token_slot_list[t * state->num_topk + k];
+                float w = state->recv_token_route_weights[slot];
+                __nv_bfloat16 val = state->compute_output_slot[slot * hidden + h];
+                acc += w * __bfloat162float(val);
+            }
+            int first_slot = state->token_slot_list[t * state->num_topk + 0];
+            state->compute_output_slot[first_slot * hidden + h] = __float2bfloat16(acc);
+        }
+        __syncthreads();
+
+        // Publish
+        __threadfence();
+        st_release(&state->combine_token_ready[t], 1);
+        done_count++;
+    }
+}
+```
+
+### 新增/变更数据结构
+
+```c
+// 相对前一版（统一调度器方案），变更如下：
+// 保留：
+int* token_done_count;          // [max_total_recv_tokens], compute worker atomicAdd
+int* combine_token_ready;       // [max_total_recv_tokens], gather SM st_release
+
+// 新增：
+int* gather_claimed;            // [max_total_recv_tokens], CAS 防止两个 gather SM 重复处理
+
+// 删除（不再需要）：
+// - gather_enqueued (被 gather_claimed 替代)
+// - gather_task_head / gather_task_tail / gather_tasks / max_gather_tasks (无需 task queue)
+// - ComputeTask.type / ComputeTask.token_idx (compute task 回归纯 compute)
+```
+
+### 同步保证
+
+1. **Compute → Gather 可见性**: compute 端 `__threadfence()` + `atomicAdd(token_done_count)`;
+   gather SM 通过 `ld_acquire(token_done_count)` 观察到完成值时，隐含 compute_output_slot 数据已全局可见
+2. **Gather → Combine 可见性**: gather 端 `__threadfence()` + `st_release(combine_token_ready)`;
+   combine 端 `ld_acquire(combine_token_ready)`
+3. **防重复处理**: `atomicCAS(&gather_claimed[t], 0, 1)` 保证每个 token 只被一个 SM 处理
+
+### Combine 改动（同前）
+
+原来:
+```
+wait compute_slot_ready[slot] (per-slot, K 次)
+gather K 行 from compute_output_slot
+fp32 weighted reduce
+pack meta
+TMA send
+```
+
+改为:
+```
+wait combine_token_ready[token] (per-token, 1 次)
+读 compute_output_slot[first_slot] (已经是 pre-reduced 数据)
+pack meta
+TMA send
+```
+
+### 性能预期
+
+- **Dispatch**: 不变
+- **Compute**: 不变（96 SM 全部做 GEMM，output 仅多一个 atomicAdd）
+- **Gather**: 2 SM 各 128 threads，每 token reduce 量 = K × hidden × 2B 读 + hidden × 4B 计算。
+  K=8, hidden=7168 时每 token 约 112KB 读 + 28KB 写，L2 bandwidth ~5TB/s 下约 25-50us/token。
+  2 SM 并行处理不同 token，吞吐约 40-80 token/ms。若不够再扩展方案。
+- **Combine**: 纯 TMA send，接近原始 DeepEP
+- **Scheduler**: 不需要扫描 gather（回归纯 compute 调度），比之前更简单
+
+### 实现步骤
+
+#### Step 1: 数据结构变更
+
+- MegaKernelState 新增 `gather_claimed`，删除 `gather_task_head/tail/tasks/max_gather_tasks`
+- ComputeTask 回归纯 compute 结构（去掉 type/token_idx）
+- 分配 `gather_claimed` 内存，cudaMemset 0
+
+#### Step 2: 新增 Gather SM 角色
+
+- `SMRole` enum 新增 `kGather`
+- 启动 kernel 时分配 2 个 SM 给 gather（SM id 146, 147）
+- Gather SM 入口: 轮询 `token_done_count`，CAS claim，执行 reduce，signal `combine_token_ready`
+
+#### Step 3: Compute Worker output 阶段
+
+- 每个 slot 计算完毕后 `atomicAdd(&token_done_count[token], 1)`
+- 不再需要 signal compute_slot_ready（combine 已经不依赖它）
+
+#### Step 4: Combine Sender 简化
+
+- 等 `combine_token_ready[token]` 而非 per-slot ready
+- 直接从 first_slot 读 pre-reduced 数据
+
+#### Step 5: 清理统一调度器相关代码
+
+- 去掉 scheduler 中 gather 扫描/入队逻辑
+- 去掉 worker 中 gather task dispatch 分支
+
+#### Step 6: 编译验证 + 功能测试
+
+### 后续优化方向
+
+1. 如果 2 SM 不够用，可从 combine 借 SM（combine 24→22, gather 2→4）
+2. Gather SM 内部可用 warp-level reduce 加速 hidden 维度归约
+3. 轮询策略优化：按 token_id 递增扫描（配合 combine 顺序发送减少等待）
+4. 多 token batch：单次 claim 多个连续 ready token 一起处理
+
+---
+
+## Gather SM 精度 Bug 根因分析
+
+### 问题现象
+
+将 nhits>1 的 reduce 操作从 combine SM 迁移到 gather SM 后，cosine_similarity 从 0.9999 下降到 0.919。
+特征：megakernel norm（3.5147）< baseline norm（3.8234），说明部分 token 的 multi-hit reduce 值**偏小**（缺少了部分 slot 的累加）。
+
+### 根因
+
+这里有两个独立问题：
+
+1. **Dispatch race condition：gather SM 过早读取了 `token_nhits` 的中间值。**
+
+Dispatch 流程（可能由多个 dispatch SM 对同一 token 分批执行）：
+1. `atomicAdd(&token_nhits[token], num_hits)` — nhits 递增
+2. 写 `token_slot_list[token * num_topk + hit_base + h]` — slot 列表
+3. `atomicAdd(&token_compute_expected[token], num_hits)` — expected 递增
+4. `__threadfence()`
+5. `st_na_release(&expert_slot_ready[slot], 1)` — compute 可开始
+
+如果 token 有 3 个 nhits（由两个 dispatch SM 分别贡献 2+1），gather SM 可能在第一个 dispatch SM 完成后读到 `token_nhits=2`。此时恰好前 2 个 slot 的 compute 也已完成（`token_done_count=2`），gather 就以 nhits=2 执行 reduce——**漏掉了第 3 个 slot**。
+
+2. **Gather 计算路径不与原始 combine reduce 对齐会带来剩余精度 diff。**
+
+原始 combine reduce 使用单 warp、chunked 处理：`chunk_base` 外循环 + `lane_id + j * 32` 寻址 + `acc[kVecsPerLane][kBfloat162PerInt4]` 二维累加器。快速 gather reduce 使用 full-block 并行：`vi = tid; vi < hidden_int4; vi += blockDim.x`，每个线程只维护一维 `acc[kBfloat162PerInt4]`。
+
+虽然两者数学上都在做 bf16→float2→累加→bf16 pack，但实际编译后的访存、寄存器分配、rounding 时机和执行路径不同，会导致 observable precision diff。验证结果显示：`GATHER_ALIGN=1` 使用与原始 combine 对齐的单 warp chunked reduce 后，精度恢复正确；因此剩余精度 diff 的主因是 gather reduce 计算路径未对齐，而不是 per-slot wait、cache invalidation 或额外 fence。
+
+### 修复
+
+Gather SM 保留两个开关/修复点：
+
+1. Token ready 判断增加三重检查：
+```cpp
+int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
+int expected = ld_acquire_global(&state->token_compute_expected[token_idx]);
+if (nhits != expected) continue;  // dispatch still writing
+int completed = atomicAdd(&state->token_done_count[token_idx], 0);
+if (completed < nhits) continue;  // compute not done yet
+```
+
+只有当 `nhits == expected` 且 `completed >= nhits` 时才认为 token ready。理由：
+- `nhits != expected` 表示至少有一个 dispatch SM 还在写入中间状态（nhits 先写，slot_list 再写，expected 最后写）
+- 一致后，`completed >= nhits` 保证所有 slot 的 compute 已完成
+
+2. `GATHER_ALIGN` 编译开关控制 reduce 计算路径：
+- 默认 `GATHER_ALIGN=0`：使用 full-block fast reduce，性能更好，但可能存在小的 precision diff
+- `GATHER_ALIGN=1`：使用与原始 combine 对齐的 single-warp chunked reduce，精度对齐 baseline，用于验证/精度优先场景
+
+### 其他排除的假设
+
+| 假设 | 排除理由 |
+|------|----------|
+| `ld_nc_global` 读 stale 数据（combine 侧） | 不是主要原因；恢复/调整 load 路径不能单独修复精度 |
+| `__threadfence` 或额外 acquire/fence 缺失 | 不是主要原因；额外 per-slot acquire/fence 会影响性能且不能解释最终 diff |
+| Scheduler 少调度 compute task | Scheduler 与 gather 无交互，只管 expert slot 调度 |
+| combine 的 per-slot wait/cache invalidation | 不是主要原因；per-token `combine_token_ready` 已表达 gather 完成 |
+| gather 计算路径不同 | 已确认会导致剩余 precision diff；`GATHER_ALIGN=1` 可对齐原始 combine reduce |
+

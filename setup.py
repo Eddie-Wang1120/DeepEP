@@ -124,6 +124,12 @@ if __name__ == '__main__':
         cxx_flags.append('-DCOMBINE_TMA_LOAD')
         nvcc_flags.append('-DCOMBINE_TMA_LOAD')
 
+    # MegaKernel gather reduce path:
+    #   0 = fast full-block reduce (default), 1 = align with original combine warp reduce
+    if int(os.getenv('GATHER_ALIGN', 0)):
+        cxx_flags.append('-DGATHER_ALIGN')
+        nvcc_flags.append('-DGATHER_ALIGN')
+
     # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
     #   0 = WMMA, 1 = 1-CTA UMMA, 2 = 2-CTA UMMA (default)
     mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '2'))

@@ -56,11 +56,6 @@ constexpr int MK_TIMEOUT_LOG_BUDGET = 8;
 constexpr int MK_PRIORITY_SCAN_WINDOW_TOKENS = 128;
 constexpr int MK_PRIORITY_MAX_ENQUEUE_PER_LOOP = 2;
 constexpr int MK_DISPATCH_ROLE_COUNT = 5;
-// Publish-offload (dispatch->compute bridge). NVL receiver enqueues recv_token_idx
-// into a per-receiver-warp SPSC ring; a dedicated publisher warp consumes it and
-// does topk scan / slot alloc / ready publish off the receive critical path.
-// Stage 1 only allocates the backing state; no logic consumes it yet.
-constexpr int PUB_RING_DEPTH = 64;
 
 enum TimeoutLogSite {
     kTimeoutLogComputeRoundFlush = 0,
@@ -288,22 +283,6 @@ struct MegaKernelState {
 
     // --- Dispatch SM config ---
     int num_dispatch_channels;        // = num_dispatch_sms / 2 (physical even/odd SM pairing)
-
-    // --- Publish offload (dispatch->compute bridge), Stage 1: backing state only ---
-    // receiver copies token data + stashes topk/meta into pending_* (indexed by
-    // recv_token_idx, overwrite-safe), then pushes recv_token_idx into its SPSC ring.
-    // publisher warp consumes, does the slot alloc / metadata writes / ready publish.
-    int* token_publish_done;          // [max_total_recv_tokens] set by publisher when a token is fully published
-    int* pending_topk_idx;            // [max_total_recv_tokens * num_topk] receiver-stashed expert ids
-    float* pending_topk_weights;      // [max_total_recv_tokens * num_topk] receiver-stashed routing weights
-    internode::SourceMeta* pending_meta; // [max_total_recv_tokens] receiver-stashed SourceMeta
-    int* pub_ring;                    // [num_pub_warps_total * PUB_RING_DEPTH] recv_token_idx queue
-    int* pub_ring_head;               // [num_pub_warps_total] consumer cursor (publisher)
-    int* pub_ring_tail;               // [num_pub_warps_total] producer cursor (receiver)
-    int* recv_warp_done;              // [num_pub_warps_total] receiver warp finished producing
-    int* publish_done_count;          // atomic: how many publisher warps have drained
-    int* publish_all_done;            // flag: 1 once all publishers drained (scheduler/gather use)
-    int num_pub_warps_total;          // = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS
 
 #ifdef MK_PERF_TRACE
     // Per-logical-channel timing. Each logical channel has sender and forwarder rows
@@ -3199,17 +3178,19 @@ __device__ void combine_worker_v2(
                     // per-slot rows to compute_output_slot; the same-rank reduce happens here.
                     const int nh = state->token_nhits[token_idx];
                     const bool is_single_hit = (nh == 1);
-                    // All tokens pass through gather now. Gather does no work for nhits=0,
-                    // only signals for nhits=1, and performs local reduce for nhits>1.
-                    auto gather_wait_start = clock64();
-                    while (ld_acquire_global(&state->combine_token_ready[token_idx]) != 1) {
-                        if (clock64() - gather_wait_start > NUM_TIMEOUT_CYCLES) {
-                            if (timeout_log_once(state, kTimeoutLogComputeReady))
-                                printf("MK combine gather-semaphore timeout, rank=%d token=%lld nh=%d\n",
-                                       state->rank, (long long)token_idx, nh);
-                            trap();
+                    // Gather semaphore experiment: only nhits <= 1 tokens pass through gather.
+                    // Multi-hit tokens bypass gather and use the original combine-side reduce path.
+                    if (nh <= 1) {
+                        auto gather_wait_start = clock64();
+                        while (ld_acquire_global(&state->combine_token_ready[token_idx]) != 1) {
+                            if (clock64() - gather_wait_start > NUM_TIMEOUT_CYCLES) {
+                                if (timeout_log_once(state, kTimeoutLogComputeReady))
+                                    printf("MK combine gather-semaphore timeout, rank=%d token=%lld nh=%d\n",
+                                           state->rank, (long long)token_idx, nh);
+                                trap();
+                            }
+                            __nanosleep(32);
                         }
-                        __nanosleep(32);
                     }
                     {
                         constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
@@ -3222,8 +3203,27 @@ __device__ void combine_worker_v2(
                         int lane_wait_slot = -1;
                         int lane_wait_from_flush = 0;
 #endif
-                        // No per-slot spin here: combine_token_ready is the per-token
-                        // readiness signal emitted after gather has finished its work.
+                        if (lane_id < nh) {
+                            int slot = state->token_slot_list[token_idx * num_topk + lane_id];
+                            auto wait_start = clock64();
+#ifdef MK_PERF_TRACE
+                            int64_t wait_start_ns = globaltimer_ns();
+#endif
+                            while (ld_acquire_global(&state->compute_slot_ready[slot]) != 1) {
+                                if (clock64() - wait_start > NUM_TIMEOUT_CYCLES) {
+                                    if (timeout_log_once(state, kTimeoutLogComputeReady))
+                                        printf("MK combine per-slot-ready timeout, rank=%d token=%lld slot=%d nh=%d\n",
+                                               state->rank, (long long)token_idx, slot, nh);
+                                    trap();
+                                }
+                                __nanosleep(32);
+                            }
+#ifdef MK_PERF_TRACE
+                            lane_slot_wait_ns = globaltimer_ns() - wait_start_ns;
+                            lane_wait_slot = slot;
+                            lane_wait_from_flush = ld_nc_global(&state->compute_slot_from_flush[slot]);
+#endif
+                        }
                         __syncwarp();
 #ifdef MK_PERF_TRACE
                         int64_t wait_ready_flush_sum = 0;
@@ -3271,22 +3271,17 @@ __device__ void combine_worker_v2(
                         }
 #endif
                         constexpr int kVecsPerLane = kGatherChunkInt4 / 32;
-                        if (true) {
-                            const int slot = (nh > 0) ? state->token_slot_list[token_idx * num_topk] : 0;
+                        if (is_single_hit) {
+                            const int slot = state->token_slot_list[token_idx * num_topk];
 #ifdef COMBINE_TMA_LOAD
-                            if (nh > 0) {
-                                if (lane_id == 0) {
-                                    tma_load_1d(tma_buffer,
-                                                slot_base_i4 + (int64_t)slot * hidden_int4,
-                                                gather_mbarrier(0), hidden_bytes, false);
-                                    mbarrier_arrive_and_expect_tx(gather_mbarrier(0), hidden_bytes);
-                                }
-                                __syncwarp();
-                                mbarrier_wait(gather_mbarrier(0), gather_tma_phase[0]);
-                            } else {
-                                for (int vi = lane_id; vi < hidden_int4; vi += 32)
-                                    tma_i4[vi] = make_int4(0, 0, 0, 0);
+                            if (lane_id == 0) {
+                                tma_load_1d(tma_buffer,
+                                            slot_base_i4 + (int64_t)slot * hidden_int4,
+                                            gather_mbarrier(0), hidden_bytes, false);
+                                mbarrier_arrive_and_expect_tx(gather_mbarrier(0), hidden_bytes);
                             }
+                            __syncwarp();
+                            mbarrier_wait(gather_mbarrier(0), gather_tma_phase[0]);
 #else
                             for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4) {
                                 const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
@@ -3294,7 +3289,7 @@ __device__ void combine_worker_v2(
                                 for (int j = 0; j < kVecsPerLane; ++j) {
                                     const int vi = chunk_base + lane_id + j * 32;
                                     if (vi < chunk_end)
-                                        tma_i4[vi] = (nh > 0) ? ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi) : make_int4(0, 0, 0, 0);
+                                        tma_i4[vi] = ld_nc_global(slot_base_i4 + (int64_t)slot * hidden_int4 + vi);
                                 }
                             }
 #endif
@@ -4095,17 +4090,18 @@ __device__ void combine_worker_v2(
 }
 
 // ============================================================================
-// Dedicated Gather Worker
-// Releases combine_token_ready for nhits <= 1 tokens and performs local
-// same-rank reduce for nhits > 1 tokens into the token's first_slot.
+// Semaphore-only Gather Worker (experiment)
+// Handles only nhits <= 1 tokens by releasing combine_token_ready. It performs
+// no hidden-state compute or data movement. Multi-hit gather/reduce remains in
+// combine_worker_v2.
 // ============================================================================
 
-__device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
+__device__ void gather_worker_noop(MegaKernelState* state, int gather_sm_idx) {
     const int tid = threadIdx.x;
     const int total_tokens = state->combine_num_tokens;
     if (total_tokens == 0) return;
 
-    int cursor = 0;
+    int cursor = gather_sm_idx % total_tokens;
     __shared__ int s_should_exit;
     while (true) {
         if (tid == 0)
@@ -4114,28 +4110,24 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         if (s_should_exit) break;
 
         int token_idx = cursor;
-        cursor++;
-        if (cursor >= total_tokens) cursor = 0;
+        cursor += state->num_gather_sms;
+        if (cursor >= total_tokens) cursor %= total_tokens;
 
         if (ld_nc_global(&state->gather_claimed[token_idx]) != 0) continue;
 
-        // Must ensure dispatch has finished writing ALL hits for this token.
-        // Race: multiple dispatch SMs may atomicAdd token_nhits/token_compute_expected
-        // at different times. We need both to be equal AND token_done_count to match,
-        // guaranteeing all dispatches + all computes are done for this token.
-        int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
-        if (nhits == 0) continue;
-        int expected = ld_acquire_global(&state->token_compute_expected[token_idx]);
-        if (nhits != expected) continue;  // dispatch still in progress
-
+        int nhits = state->token_nhits[token_idx];
+        if (nhits > 1) continue;
         int completed = 0;
-        if (tid == 0)
-            completed = atomicAdd(&state->token_done_count[token_idx], 0);
-        __shared__ int s_completed;
-        if (tid == 0) s_completed = completed;
-        __syncthreads();
-        completed = s_completed;
-        if (completed < nhits) continue;
+        if (nhits > 0) {
+            if (tid == 0)
+                completed = atomicAdd(&state->token_done_count[token_idx], 0);
+            completed = __shfl_sync(0xffffffff, completed, 0);
+            __shared__ int s_completed;
+            if (tid == 0) s_completed = completed;
+            __syncthreads();
+            completed = s_completed;
+            if (completed < nhits) continue;
+        }
 
         int claimed_success = 0;
         if (tid == 0)
@@ -4145,103 +4137,8 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         __syncthreads();
         if (!s_claimed) continue;
 
-        if (nhits > 1) {
-            constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
-            constexpr int kBfloat162PerInt4 = kElemsPerInt4 / 2;
-            const int hidden = state->combine_hidden;
-            const int hidden_int4 = hidden / kElemsPerInt4;
-            const int num_topk = state->num_topk;
-            const int first_slot = state->token_slot_list[token_idx * num_topk];
-            int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
-
-#ifdef GATHER_ALIGN
-            // Aligned mode: single warp, chunked, matches original combine reduce exactly
-            constexpr int kGatherChunkInt4_g = 128;
-            constexpr int kVecsPerLane_g = kGatherChunkInt4_g / 32;
-            const int lane_id_g = tid % 32;
-
-            if (tid < 32) {
-                for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4_g) {
-                    const int chunk_end = min(chunk_base + kGatherChunkInt4_g, hidden_int4);
-                    const int chunk_int4 = chunk_end - chunk_base;
-                    float2 acc[kVecsPerLane_g][kBfloat162PerInt4];
-                    #pragma unroll
-                    for (int j = 0; j < kVecsPerLane_g; ++j) {
-                        #pragma unroll
-                        for (int p = 0; p < kBfloat162PerInt4; ++p)
-                            acc[j][p] = make_float2(0.0f, 0.0f);
-                    }
-
-                    for (int k = 0; k < nhits; ++k) {
-                        int slot = state->token_slot_list[token_idx * num_topk + k];
-                        #pragma unroll
-                        for (int j = 0; j < kVecsPerLane_g; ++j) {
-                            const int local_vi = lane_id_g + j * 32;
-                            if (local_vi < chunk_int4) {
-                                int4 raw;
-                                asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
-                                    : "l"(slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base + local_vi));
-                                const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-                                #pragma unroll
-                                for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                                    float2 v = __bfloat1622float2(bv2[p]);
-                                    acc[j][p].x += v.x;
-                                    acc[j][p].y += v.y;
-                                }
-                            }
-                        }
-                    }
-
-                    #pragma unroll
-                    for (int j = 0; j < kVecsPerLane_g; ++j) {
-                        const int vi = chunk_base + lane_id_g + j * 32;
-                        if (vi < chunk_end) {
-                            int4 packed;
-                            __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
-                            #pragma unroll
-                            for (int p = 0; p < kBfloat162PerInt4; ++p)
-                                pv2[p] = __float22bfloat162_rn(acc[j][p]);
-                            asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};"
-                                :: "l"(slot_base_i4 + (int64_t)first_slot * hidden_int4 + vi),
-                                   "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w));
-                        }
-                    }
-                }
-            }
-#else
-            // Fast mode: full block parallel reduce
-            for (int vi = tid; vi < hidden_int4; vi += blockDim.x) {
-                float2 acc[kBfloat162PerInt4];
-                #pragma unroll
-                for (int p = 0; p < kBfloat162PerInt4; ++p)
-                    acc[p] = make_float2(0.0f, 0.0f);
-
-                for (int k = 0; k < nhits; ++k) {
-                    int slot = state->token_slot_list[token_idx * num_topk + k];
-                    int4 raw = slot_base_i4[(int64_t)slot * hidden_int4 + vi];
-                    const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-                    #pragma unroll
-                    for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                        float2 v = __bfloat1622float2(bv2[p]);
-                        acc[p].x += v.x;
-                        acc[p].y += v.y;
-                    }
-                }
-
-                int4 packed;
-                __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
-                #pragma unroll
-                for (int p = 0; p < kBfloat162PerInt4; ++p)
-                    pv2[p] = __float22bfloat162_rn(acc[p]);
-                slot_base_i4[(int64_t)first_slot * hidden_int4 + vi] = packed;
-            }
-#endif
-        }
-
-        __syncthreads();
-        __threadfence();
         if (tid == 0) {
+            __threadfence();
             atomicExch(&state->combine_token_ready[token_idx], 1);
         }
         __syncthreads();
@@ -4277,7 +4174,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
     auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
 
     // Determine SM role based on blockIdx.x
-    // Layout: [Dispatch] [Combine] [Scheduler] [Compute groups] [Gather]
+    // Layout: [Dispatch] [Combine] [Scheduler] [Compute groups] [Gather noop]
     SmRole role;
     int role_idx;
 
@@ -4318,7 +4215,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             break;
 
         case SmRole::kGather:
-            gather_worker(state, role_idx);
+            gather_worker_noop(state, role_idx);
             break;
 
         default:
@@ -5893,39 +5790,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&expert_compute_done, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_compute_done, 0, num_local_experts * sizeof(int)));
 
-    // Publish-offload backing state (Stage 1: allocate + zero only, no consumer yet).
-    // num_pub_warps_total = one publisher per NVL receiver warp per receiver SM.
-    const int num_pub_warps_total = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS;
-    int* token_publish_done;
-    int* pending_topk_idx;
-    float* pending_topk_weights;
-    internode::SourceMeta* pending_meta;
-    int* pub_ring;
-    int* pub_ring_head;
-    int* pub_ring_tail;
-    int* recv_warp_done;
-    int* publish_done_count;
-    int* publish_all_done;
-    CUDA_CHECK(cudaMalloc(&token_publish_done, (size_t)max_total_recv_tokens * sizeof(int)));
-    CUDA_CHECK(cudaMemset(token_publish_done, 0, (size_t)max_total_recv_tokens * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&pending_topk_idx, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
-    CUDA_CHECK(cudaMemset(pending_topk_idx, 0xff, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&pending_topk_weights, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
-    CUDA_CHECK(cudaMemset(pending_topk_weights, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&pending_meta, (size_t)max_total_recv_tokens * sizeof(internode::SourceMeta)));
-    CUDA_CHECK(cudaMalloc(&pub_ring, (size_t)num_pub_warps_total * PUB_RING_DEPTH * sizeof(int)));
-    CUDA_CHECK(cudaMemset(pub_ring, 0, (size_t)num_pub_warps_total * PUB_RING_DEPTH * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&pub_ring_head, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMemset(pub_ring_head, 0, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&pub_ring_tail, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMemset(pub_ring_tail, 0, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&recv_warp_done, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMemset(recv_warp_done, 0, (size_t)num_pub_warps_total * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&publish_done_count, sizeof(int)));
-    CUDA_CHECK(cudaMemset(publish_done_count, 0, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&publish_all_done, sizeof(int)));
-    CUDA_CHECK(cudaMemset(publish_all_done, 0, sizeof(int)));
-
     // Combine input namespace from dispatch receive.
     CUDA_CHECK(cudaMalloc(&combine_input, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMemset(combine_input, 0, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
@@ -6157,20 +6021,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.combine_done_count = combine_done_count;
     host_state.combine_all_done = combine_all_done;
     host_state.num_gather_sms = 2;
-
-    // Publish-offload backing state (Stage 1)
-    host_state.token_publish_done = token_publish_done;
-    host_state.pending_topk_idx = pending_topk_idx;
-    host_state.pending_topk_weights = pending_topk_weights;
-    host_state.pending_meta = pending_meta;
-    host_state.pub_ring = pub_ring;
-    host_state.pub_ring_head = pub_ring_head;
-    host_state.pub_ring_tail = pub_ring_tail;
-    host_state.recv_warp_done = recv_warp_done;
-    host_state.publish_done_count = publish_done_count;
-    host_state.publish_all_done = publish_all_done;
-    host_state.num_pub_warps_total = num_pub_warps_total;
-
 
     // Expert weights
     host_state.W_gateup = W_gateup;
@@ -6688,16 +6538,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.combine_token_ready));
     CUDA_CHECK(cudaFree(host_state.combine_done_count));
     CUDA_CHECK(cudaFree(host_state.combine_all_done));
-    CUDA_CHECK(cudaFree(host_state.token_publish_done));
-    CUDA_CHECK(cudaFree(host_state.pending_topk_idx));
-    CUDA_CHECK(cudaFree(host_state.pending_topk_weights));
-    CUDA_CHECK(cudaFree(host_state.pending_meta));
-    CUDA_CHECK(cudaFree(host_state.pub_ring));
-    CUDA_CHECK(cudaFree(host_state.pub_ring_head));
-    CUDA_CHECK(cudaFree(host_state.pub_ring_tail));
-    CUDA_CHECK(cudaFree(host_state.recv_warp_done));
-    CUDA_CHECK(cudaFree(host_state.publish_done_count));
-    CUDA_CHECK(cudaFree(host_state.publish_all_done));
     CUDA_CHECK(cudaFree(host_state.combined_x));
     CUDA_CHECK(cudaFree(host_state.combined_topk_weights));
     CUDA_CHECK(cudaFree(host_state.combine_input));
