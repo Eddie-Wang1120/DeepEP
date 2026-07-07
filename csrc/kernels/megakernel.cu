@@ -47,7 +47,8 @@ namespace megakernel {
 
 constexpr int COMPUTE_BATCH_SIZE = 256;  // Tokens per expert batch before triggering GEMM; UMMA paths use fixed padded M=256.
 constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
-constexpr int COMPUTE_SCHEDULER_SMS = 2; // Scheduler region; only #0 does scheduler work today, #1 idles.
+constexpr int COMPUTE_SCHEDULER_SMS = 2;
+constexpr int GATHER_SCHED_TID_BEGIN = 576; // per scheduler CTA: tid >= this builds gather tasks
 constexpr int MK_COMPUTE_CLUSTER_DIM = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
@@ -101,7 +102,7 @@ enum class SmRole {
     kCombine,       // DeepEP combine (even SM = NVLSender+RDMAReceiver, odd SM = Forwarder)
     kScheduler,     // Enqueues expert compute batches for dynamic compute groups
     kCompute,       // Pops compute tasks, does GEMM+SwiGLU
-    kGather         // Dedicated gather SM placeholder (no-op in this experiment)
+    kGather         // Dedicated gather SM worker for nhits>1 local reduce
 };
 
 struct ComputeTask {
@@ -176,9 +177,6 @@ struct MegaKernelState {
     // --- Compute signaling / per-slot output path (MEGAKERNEL_COMPUTE_DESIGN section III) ---
     int* token_compute_expected;        // [max_total_recv_tokens] how many local experts must compute this token
     __nv_bfloat16* compute_output_slot; // [num_local_experts * max_tokens_per_expert, hidden] per-slot output
-    int* compute_slot_ready;            // [num_local_experts * max_tokens_per_expert] per-slot ready flag
-    int* compute_slot_from_flush;       // [num_local_experts * max_tokens_per_expert] whether ready came from final flush task
-    int64_t* compute_slot_ready_ts;     // [num_local_experts * max_tokens_per_expert] ready publish timestamp (perf/debug)
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
     int* token_slot_list;               // [max_total_recv_tokens * num_topk] absolute slot ids per hit
     int* priority_token_cursor;         // scheduler combine-order cursor for token priority scan
@@ -196,11 +194,17 @@ struct MegaKernelState {
     int* expert_enqueue_cursor;         // [num_local_experts] how many slots have been enqueued
     int* compute_group_task_idx;        // [num_compute_groups] broadcast popped task idx to group SMs
 
-    // --- Dedicated Gather SM state (semaphore-only experiment) ---
+    // --- Dedicated Gather SM state ---
     int* token_done_count;              // [max_total_recv_tokens] atomicAdd by compute worker per slot completion
-    int* gather_claimed;                // [max_total_recv_tokens] CAS flag: 0=unclaimed, 1=claimed by a gather SM
-    int* combine_token_ready;           // [max_total_recv_tokens] set by gather SM when all local slots are ready
-    int num_gather_sms;                 // number of dedicated gather SMs (fixed 2 in this experiment)
+    int* gather_claimed;                // [max_total_recv_tokens] CAS flag: scheduler has batched this token for gather
+    int* combine_token_ready;           // [max_total_recv_tokens] set when token is ready for combine
+    int* gather_ready_queue;            // [max_total_recv_tokens] token storage for scheduler-built gather tasks
+    int* gather_ready_head;             // task queue consumer cursor; gather SMs CAS-pop one task at a time
+    int* gather_ready_tail;             // ordered visible task tail published by scheduler lanes
+    int* gather_ready_reserve_tail;     // token-storage reservation cursor into gather_ready_queue
+    int* gather_task_count;             // task metadata reservation cursor
+    int* gather_task_tokens;            // [max_total_recv_tokens] task_idx -> token_base in gather_ready_queue
+    int* gather_task_nhits;             // [max_total_recv_tokens] task_idx -> number of tokens in the task
     int* combine_done_count;            // atomic: how many combine SMs have fully finished
     int* combine_all_done;              // flag: 1 once all combine SMs finished; gather SMs poll this to exit
 
@@ -357,7 +361,7 @@ struct MegaKernelState {
     int64_t* perf_disp_allrecv_tokens;      // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver tokens
     int64_t* perf_disp_allrecv_local_hits;  // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver local hits
     int64_t* perf_comb_tma_wait_ns;        // sum: combine sender tma_store_wait before reusing smem buffer
-    int64_t* perf_comb_wait_ready_ns;      // sum: combine sender wait on per-slot compute_slot_ready
+    int64_t* perf_comb_wait_ready_ns;      // sum: combine sender wait on per-token combine_token_ready
     int64_t* perf_comb_wait_ready_single_ns; // sum: ready wait for nh==1 tokens
     int64_t* perf_comb_wait_ready_multi_ns;  // sum: ready wait for nh>1 tokens
     int64_t* perf_comb_wait_ready_flush_ns;  // sum: per-slot ready wait for slots computed by final flush tasks
@@ -440,7 +444,7 @@ struct MegaKernelState {
     //   17 = ts after done-count atomic phase + sync
     //   18 = ts after fp32->bf16 finalize phase + sync
     //   19 = ts after the post-finalize threadfence_system + sync
-    //   20 = ts after compute_slot_ready publish + sync (== signal done)
+    //   20 = ts after token-ready publish + sync (== signal done)
     //   21 = compute task queue index
     //   22 = expert-local start_slot
     //   23 = expert-local end_slot (exclusive)
@@ -462,6 +466,12 @@ struct MegaKernelState {
     int64_t* perf_down_loop_other; int64_t* perf_down_cluster_sync; int64_t* perf_down_epilogue;
     int* perf_compute_multi_expert_rows;  // [max_compute_tasks]
     int* perf_compute_task_has_multi;     // [max_compute_tasks] output-phase s_has_multi_finalize (1=slow path)
+    // Per-gather-batch timing buffer. Fields:
+    // 0=start, 1=end, 2=gather_sm_idx, 3=batch_size, 4=first_token, 5=last_token,
+    // 6=nhit_sum, 7=scan_done_ts, 8=reduce_done_ts, 9=signal_done_ts
+    static constexpr int MK_PERF_NUM_GATHER_FIELDS = 10;
+    int64_t* perf_gather_task;            // [max_compute_tasks * MK_PERF_NUM_GATHER_FIELDS]
+    int* perf_gather_task_count;          // atomic write cursor into perf_gather_task
     // Queue handoff diagnostics, indexed by compute task queue index.
     int64_t* perf_task_publish_ts;        // scheduler published task tail
     int64_t* perf_task_pop_start_ts;      // compute group leader started dequeue loop
@@ -1815,11 +1825,105 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     return true;
 }
 
+__device__ __forceinline__ void scheduler_compute_sync(int num_threads) {
+    asm volatile("barrier.sync 3, %0;" :: "r"(num_threads));
+}
+
+__device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_result, int num_threads) {
+    if (threadIdx.x == 0)
+        *shared_result = 1;
+    scheduler_compute_sync(num_threads);
+    if (!predicate)
+        atomicExch(shared_result, 0);
+    scheduler_compute_sync(num_threads);
+    int result = *shared_result;
+    scheduler_compute_sync(num_threads);
+    return result;
+}
+
+__device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* state, int scheduler_id, int num_schedulers) {
+    const int tid = threadIdx.x;
+    if (tid < GATHER_SCHED_TID_BEGIN)
+        return;
+
+    constexpr int kGatherBatchTokens = 64;
+    const int gather_tid = tid - GATHER_SCHED_TID_BEGIN;
+    const int gather_threads = blockDim.x - GATHER_SCHED_TID_BEGIN;
+    if (gather_threads <= 0)
+        return;
+
+    const int gather_lane = gather_tid & 31;
+    const int gather_warp_idx = gather_tid >> 5;
+    const int gather_num_warps = (gather_threads + 31) / 32;
+    if (gather_lane != 0)
+        return;
+
+    int batch_tokens[kGatherBatchTokens];
+    int batch_count = 0;
+    const int total_tokens = state->combine_num_tokens;
+
+    // Interleave by token index so scheduler SM0 scans token_idx % 2 == 0 and
+    // scheduler SM1 scans token_idx % 2 == 1. Gather scheduler warp leaders build
+    // concrete gather tasks; gather SMs only pop and execute those tasks.
+    for (int token = scheduler_id + gather_warp_idx * num_schedulers;
+         token < total_tokens && batch_count < kGatherBatchTokens;
+         token += gather_num_warps * num_schedulers) {
+        if (ld_nc_global(&state->gather_claimed[token]) != 0)
+            continue;
+        int nhits = ld_acquire_global(&state->token_nhits[token]);
+        if (nhits <= 1)
+            continue;
+        int expected = ld_acquire_global(&state->token_compute_expected[token]);
+        if (expected != nhits)
+            continue;
+        int done = ld_acquire_global(&state->token_done_count[token]);
+        if (done < nhits)
+            continue;
+        if (atomicCAS(&state->gather_claimed[token], 0, 1) == 0)
+            batch_tokens[batch_count++] = token;
+    }
+    if (batch_count == 0)
+        return;
+
+    int token_base = atomicAdd(state->gather_ready_reserve_tail, batch_count);
+    if (token_base + batch_count > state->max_total_recv_tokens) {
+        printf("MK gather task token queue overflow, rank=%d base=%d count=%d max=%d\n",
+               state->rank, token_base, batch_count, state->max_total_recv_tokens);
+        trap();
+    }
+    for (int i = 0; i < batch_count; ++i)
+        state->gather_ready_queue[token_base + i] = batch_tokens[i];
+
+    int task_idx = atomicAdd(state->gather_task_count, 1);
+    if (task_idx >= state->max_total_recv_tokens) {
+        printf("MK gather task queue overflow, rank=%d task=%d max=%d\n",
+               state->rank, task_idx, state->max_total_recv_tokens);
+        trap();
+    }
+    state->gather_task_tokens[task_idx] = token_base;
+    state->gather_task_nhits[task_idx] = batch_count;
+    __threadfence();
+    while (atomicCAS(state->gather_ready_tail, task_idx, task_idx + 1) != task_idx) {
+        if (ld_acquire_global(state->combine_all_done) != 0)
+            break;
+        __nanosleep(32);
+    }
+}
+
 __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_id, int num_schedulers) {
     const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
+    const int num_threads = min(GATHER_SCHED_TID_BEGIN, static_cast<int>(blockDim.x));
     const int num_local_experts = state->num_local_experts;
     const int max_tpe = state->max_tokens_per_expert;
+
+    if (tid >= GATHER_SCHED_TID_BEGIN) {
+        while (ld_acquire_global(state->combine_all_done) == 0) {
+            scheduler_scan_gather_tokens(state, scheduler_id, num_schedulers);
+            __nanosleep(64);
+        }
+        return;
+    }
+
     bool tail_enqueued = false;
 
     // Shared memory for cooperative priority batch-ready check
@@ -1839,6 +1943,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     __shared__ int s_priority_token_has_not_full;
     __shared__ int s_priority_done;  // signals priority loop exit
     __shared__ int s_dispatch_done;
+    __shared__ int s_compute_all_result;
 
 #ifdef MK_PERF_TRACE
     if (tid == 0 && scheduler_id == 0)
@@ -1874,8 +1979,11 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
             s_dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count) ? 1 : 0;
         }
-        __syncthreads();
+        scheduler_compute_sync(num_threads);
         bool dispatch_done = (s_dispatch_done != 0);
+
+        if (tail_enqueued)
+            break;
 
 #ifdef MK_PERF_TRACE
         if (tid == 0 && scheduler_id == 0) {
@@ -1900,20 +2008,20 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
                 s_priority_alloc_count = old_count;  // reuse shared var to broadcast old_count
             }
-            __syncthreads();
+            scheduler_compute_sync(num_threads);
             old_count = s_priority_alloc_count;
 
             // Cooperative scan: each thread checks a contiguous chunk of slots starting from old_count.
             // We scan in waves of num_threads slots at a time, finding the contiguous prefix.
             int count = old_count;
             while (count < max_tpe) {
-                int my_slot = count + tid;
+                int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                 int my_ready = 0;
                 if (my_slot < max_tpe) {
                     my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
                 }
                 // All threads report: if all slots in this wave are ready, advance
-                int all_ready = __syncthreads_and(my_ready || (my_slot >= max_tpe));
+                int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
                 if (!all_ready) {
                     // Find the first non-ready slot in this wave via warp vote
                     // Thread 0 does a sequential scan of just this wave's portion
@@ -1927,7 +2035,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         }
                         s_priority_alloc_count = count;  // broadcast final count
                     }
-                    __syncthreads();
+                    scheduler_compute_sync(num_threads);
                     count = s_priority_alloc_count;
                     break;
                 }
@@ -1955,7 +2063,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 }
             }
 #endif
-            __syncthreads();
+            scheduler_compute_sync(num_threads);
         }
 #ifdef MK_PERF_TRACE
         sched_scan_acc += globaltimer_ns() - sched_scan_start;
@@ -1980,7 +2088,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 s_priority_hit_idx = 0;
                 s_priority_token_has_not_full = 0;
             }
-            __syncthreads();
+            scheduler_compute_sync(num_threads);
 
             // Cooperative priority loop
             while (true) {
@@ -2038,25 +2146,27 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         break;
                     }
                 }
-                __syncthreads();
+                scheduler_compute_sync(num_threads);
 
                 if (s_priority_done)
                     break;
                 if (s_priority_expert_id < 0) {
-                    __syncthreads();
+                    scheduler_compute_sync(num_threads);
                     continue;
                 }
 
                 // All threads cooperatively check COMPUTE_BATCH_SIZE slots
                 int ready_base = s_priority_ready_base;
                 int my_ready = 1;
-                for (int s = tid; s < COMPUTE_BATCH_SIZE; s += num_threads) {
-                    if (ld_acquire_global(&state->expert_slot_ready[ready_base + s]) == 0) {
-                        my_ready = 0;
-                        break;
+                if (tid < num_threads) {
+                    for (int s = tid; s < COMPUTE_BATCH_SIZE; s += num_threads) {
+                        if (ld_acquire_global(&state->expert_slot_ready[ready_base + s]) == 0) {
+                            my_ready = 0;
+                            break;
+                        }
                     }
                 }
-                int batch_ready = __syncthreads_and(my_ready);
+                int batch_ready = scheduler_compute_all(my_ready, &s_compute_all_result, num_threads);
 
                 // Thread 0 processes the result
                 if (tid == 0) {
@@ -2081,7 +2191,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         }
                     }
                 }
-                __syncthreads();
+                scheduler_compute_sync(num_threads);
             }
 
             // Advance cursor
@@ -2090,7 +2200,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     st_na_release(state->priority_token_cursor, s_priority_new_cursor);
             }
         }
-        __syncthreads();
+        scheduler_compute_sync(num_threads);
         int priority_enqueued_local = (scheduler_id == 0) ? s_priority_enqueued : 0;
 
 #ifdef MK_PERF_TRACE
@@ -2121,7 +2231,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 }
             }
         }
-        __syncthreads();
+        scheduler_compute_sync(num_threads);
 #ifdef MK_PERF_TRACE
         sched_normal_acc += globaltimer_ns() - sched_normal_start;
         sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
@@ -2140,18 +2250,18 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
                     s_priority_alloc_count = old_count;
                 }
-                __syncthreads();
+                scheduler_compute_sync(num_threads);
                 old_count = s_priority_alloc_count;
 
                 // Cooperative scan (same pattern as above)
                 int count = old_count;
                 while (count < max_tpe) {
-                    int my_slot = count + tid;
+                    int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                     int my_ready = 0;
                     if (my_slot < max_tpe) {
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
                     }
-                    int all_ready = __syncthreads_and(my_ready || (my_slot >= max_tpe));
+                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         if (tid == 0) {
                             for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
@@ -2163,7 +2273,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                             }
                             s_priority_alloc_count = count;
                         }
-                        __syncthreads();
+                        scheduler_compute_sync(num_threads);
                         count = s_priority_alloc_count;
                         break;
                     }
@@ -2200,7 +2310,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     sched_scan_start = globaltimer_ns();
 #endif
                 }
-                __syncthreads();
+                scheduler_compute_sync(num_threads);
             }
 #ifdef MK_PERF_TRACE
             int64_t sched_done_publish_start = globaltimer_ns();
@@ -2225,7 +2335,6 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         if (tail_enqueued)
             break;
 
-        __syncthreads();
 #ifdef MK_PERF_TRACE
         int64_t sched_idle_start = globaltimer_ns();
 #endif
@@ -2630,11 +2739,12 @@ __device__ void compute_worker(
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
 #endif
 
-        // ==== Signal: per-slot ready publish (change B) ====
+        // ==== Signal: per-token ready publish ====
         // compute wrote per-slot rows into compute_output_slot. The same-rank multi-expert
-        // reduce is now done by the combine sender (change C), which gathers a token's nh
-        // slots and fp32-sums them before sending. So compute only needs to publish a
-        // per-slot ready flag; NO donecount, NO group_is_last broadcast, NO fp32 finalize.
+        // reduce is now done by the combine sender / gather worker, which gather a token's nh
+        // slots and fp32-sum them before sending. Compute only advances token_done_count and
+        // publishes nhits==1 tokens directly; nhits>1 tokens are claimed/enqueued by scheduler
+        // lanes (tid >= GATHER_SCHED_TID_BEGIN) once all local expert slots are done.
         {
 #ifdef MK_PERF_TRACE
             if (perf_leader) {
@@ -2647,20 +2757,14 @@ __device__ void compute_worker(
                 s_perf_multi_expert_rows = mr;
             }
 #endif
-            const int slot_base_sig = expert_id * max_tpe + start_slot;
-            const int task_is_flush = task.is_flush;
-#ifdef MK_PERF_TRACE
-            const int64_t slot_ready_ts = globaltimer_ns();
-#endif
             for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
-                const int slot = slot_base_sig + row;
-                st_na_global(&state->compute_slot_from_flush[slot], task_is_flush);
-#ifdef MK_PERF_TRACE
-                st_na_global(&state->compute_slot_ready_ts[slot], slot_ready_ts);
-#endif
-                st_na_release(&state->compute_slot_ready[slot], 1);
                 const int recv_token = s_recv_token_idx[row];
-                atomicAdd(&state->token_done_count[recv_token], 1);
+                int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
+                int nhits = ld_acquire_global(&state->token_nhits[recv_token]);
+                if (nhits == 1 && done >= 1) {
+                    __threadfence();
+                    atomicExch(&state->combine_token_ready[recv_token], 1);
+                }
             }
             compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 #ifdef MK_PERF_TRACE
@@ -3138,10 +3242,9 @@ __device__ void combine_worker_v2(
                 int num_tokens_in_chunk = min(num_max_nvl_chunked_send_tokens, producer_token_end_idx - static_cast<int>(token_idx));
 
                 for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
-                    // Change B/C: the per-slot ready wait + gather-reduce below replaces the
-                    // old per-token ready gate. compute now publishes per-slot flags
-                    // (compute_slot_ready), waited inside the gather block. nh==0 tokens
-                    // (no local expert) send zeros.
+                    // The gather-reduce below consumes a single per-token readiness signal
+                    // (combine_token_ready): nhits==1 is published by compute, nhits>1 by the
+                    // gather worker after reduce. nh==0 tokens (no local expert) send zeros.
                     __syncwarp();
                     // NOTE: DeepEP's combine NVL sender forwards every token in the
                     // [token_start_idx, token_end_idx) range unconditionally. The range from
@@ -3197,19 +3300,22 @@ __device__ void combine_worker_v2(
                     // Change C: gather this token's nh local-expert slots and fp32-reduce
                     // them directly into tma_buffer (per-lane registers). compute now writes
                     // per-slot rows to compute_output_slot; the same-rank reduce happens here.
-                    const int nh = state->token_nhits[token_idx];
+                    const int nh = ld_acquire_global(&state->token_nhits[token_idx]);
                     const bool is_single_hit = (nh == 1);
-                    // All tokens pass through gather now. Gather does no work for nhits=0,
-                    // only signals for nhits=1, and performs local reduce for nhits>1.
-                    auto gather_wait_start = clock64();
-                    while (ld_acquire_global(&state->combine_token_ready[token_idx]) != 1) {
-                        if (clock64() - gather_wait_start > NUM_TIMEOUT_CYCLES) {
-                            if (timeout_log_once(state, kTimeoutLogComputeReady))
-                                printf("MK combine gather-semaphore timeout, rank=%d token=%lld nh=%d\n",
-                                       state->rank, (long long)token_idx, nh);
-                            trap();
+                    // All computed tokens use the unified per-token ready signal:
+                    // nhits==1 is published by compute, nhits>1 by gather after reduce.
+                    // nhits==0 has no producer and will be zero-filled below.
+                    if (nh > 0) {
+                        auto gather_wait_start = clock64();
+                        while (ld_acquire_global(&state->combine_token_ready[token_idx]) != 1) {
+                            if (clock64() - gather_wait_start > NUM_TIMEOUT_CYCLES) {
+                                if (timeout_log_once(state, kTimeoutLogComputeReady))
+                                    printf("MK combine gather-semaphore timeout, rank=%d token=%lld nh=%d\n",
+                                           state->rank, (long long)token_idx, nh);
+                                trap();
+                            }
+                            __nanosleep(32);
                         }
-                        __nanosleep(32);
                     }
                     {
                         constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
@@ -3222,8 +3328,7 @@ __device__ void combine_worker_v2(
                         int lane_wait_slot = -1;
                         int lane_wait_from_flush = 0;
 #endif
-                        // No per-slot spin here: combine_token_ready is the per-token
-                        // readiness signal emitted after gather has finished its work.
+                        // No per-slot wait here. combine_token_ready is the only readiness signal.
                         __syncwarp();
 #ifdef MK_PERF_TRACE
                         int64_t wait_ready_flush_sum = 0;
@@ -4096,8 +4201,8 @@ __device__ void combine_worker_v2(
 
 // ============================================================================
 // Dedicated Gather Worker
-// Releases combine_token_ready for nhits <= 1 tokens and performs local
-// same-rank reduce for nhits > 1 tokens into the token's first_slot.
+// Pops scheduler-built gather tasks. Each task owns a compact batch of ready
+// nhits > 1 tokens in gather_ready_queue; nhits == 1 is signaled by compute.
 // ============================================================================
 
 __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
@@ -4105,146 +4210,170 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
     const int total_tokens = state->combine_num_tokens;
     if (total_tokens == 0) return;
 
-    int cursor = 0;
-    __shared__ int s_should_exit;
+    __shared__ int s_token_base;
+    __shared__ int s_batch_count;
+    __shared__ int s_has_task;
+
     while (true) {
-        if (tid == 0)
-            s_should_exit = (ld_acquire_global(state->combine_all_done) != 0) ? 1 : 0;
+#ifdef MK_PERF_TRACE
+        int64_t perf_start_ns = globaltimer_ns();
+        int64_t perf_scan_done_ns = 0;
+        int64_t perf_reduce_done_ns = 0;
+#endif
+        if (tid == 0) {
+            s_has_task = 0;
+            s_token_base = 0;
+            s_batch_count = 0;
+            while (ld_acquire_global(state->combine_all_done) == 0) {
+                int head = ld_acquire_global(state->gather_ready_head);
+                int tail = ld_acquire_global(state->gather_ready_tail);
+                if (head < tail && atomicCAS(state->gather_ready_head, head, head + 1) == head) {
+                    s_token_base = ld_acquire_global(&state->gather_task_tokens[head]);
+                    s_batch_count = ld_acquire_global(&state->gather_task_nhits[head]);
+                    s_has_task = (s_batch_count > 0) ? 1 : 0;
+                    break;
+                }
+                __nanosleep(64);
+            }
+        }
         __syncthreads();
-        if (s_should_exit) break;
-
-        int token_idx = cursor;
-        cursor++;
-        if (cursor >= total_tokens) cursor = 0;
-
-        if (ld_nc_global(&state->gather_claimed[token_idx]) != 0) continue;
-
-        // Must ensure dispatch has finished writing ALL hits for this token.
-        // Race: multiple dispatch SMs may atomicAdd token_nhits/token_compute_expected
-        // at different times. We need both to be equal AND token_done_count to match,
-        // guaranteeing all dispatches + all computes are done for this token.
-        int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
-        if (nhits == 0) continue;
-        int expected = ld_acquire_global(&state->token_compute_expected[token_idx]);
-        if (nhits != expected) continue;  // dispatch still in progress
-
-        int completed = 0;
+        if (!s_has_task)
+            break;
+#ifdef MK_PERF_TRACE
         if (tid == 0)
-            completed = atomicAdd(&state->token_done_count[token_idx], 0);
-        __shared__ int s_completed;
-        if (tid == 0) s_completed = completed;
-        __syncthreads();
-        completed = s_completed;
-        if (completed < nhits) continue;
+            perf_scan_done_ns = globaltimer_ns();
+#endif
 
-        int claimed_success = 0;
-        if (tid == 0)
-            claimed_success = (atomicCAS(&state->gather_claimed[token_idx], 0, 1) == 0) ? 1 : 0;
-        __shared__ int s_claimed;
-        if (tid == 0) s_claimed = claimed_success;
-        __syncthreads();
-        if (!s_claimed) continue;
+        const int token_base = s_token_base;
+        const int batch_count = s_batch_count;
+        constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
+        constexpr int kBfloat162PerInt4 = kElemsPerInt4 / 2;
+        const int hidden = state->combine_hidden;
+        const int hidden_int4 = hidden / kElemsPerInt4;
+        const int num_topk = state->num_topk;
+        int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
+        int first_token = -1;
+        int last_token = -1;
+        int nhit_sum = 0;
 
-        if (nhits > 1) {
-            constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
-            constexpr int kBfloat162PerInt4 = kElemsPerInt4 / 2;
-            const int hidden = state->combine_hidden;
-            const int hidden_int4 = hidden / kElemsPerInt4;
-            const int num_topk = state->num_topk;
+        for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
+            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+            const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
             const int first_slot = state->token_slot_list[token_idx * num_topk];
-            int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
+            if (batch_idx == 0)
+                first_token = token_idx;
+            last_token = token_idx;
+            nhit_sum += nhits;
 
 #ifdef GATHER_ALIGN
-            // Aligned mode: single warp, chunked, matches original combine reduce exactly
-            constexpr int kGatherChunkInt4_g = 128;
-            constexpr int kVecsPerLane_g = kGatherChunkInt4_g / 32;
-            const int lane_id_g = tid % 32;
+        // One gather SM owns one gather task and reduces the full hidden dimension.
+        constexpr int kGatherChunkInt4_g = 128;
+        constexpr int kVecsPerLane_g = kGatherChunkInt4_g / 32;
+        const int lane_id_g = tid % 32;
 
-            if (tid < 32) {
-                for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4_g) {
-                    const int chunk_end = min(chunk_base + kGatherChunkInt4_g, hidden_int4);
-                    const int chunk_int4 = chunk_end - chunk_base;
-                    float2 acc[kVecsPerLane_g][kBfloat162PerInt4];
-                    #pragma unroll
-                    for (int j = 0; j < kVecsPerLane_g; ++j) {
-                        #pragma unroll
-                        for (int p = 0; p < kBfloat162PerInt4; ++p)
-                            acc[j][p] = make_float2(0.0f, 0.0f);
-                    }
-
-                    for (int k = 0; k < nhits; ++k) {
-                        int slot = state->token_slot_list[token_idx * num_topk + k];
-                        #pragma unroll
-                        for (int j = 0; j < kVecsPerLane_g; ++j) {
-                            const int local_vi = lane_id_g + j * 32;
-                            if (local_vi < chunk_int4) {
-                                int4 raw;
-                                asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
-                                    : "l"(slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base + local_vi));
-                                const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
-                                #pragma unroll
-                                for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                                    float2 v = __bfloat1622float2(bv2[p]);
-                                    acc[j][p].x += v.x;
-                                    acc[j][p].y += v.y;
-                                }
-                            }
-                        }
-                    }
-
-                    #pragma unroll
-                    for (int j = 0; j < kVecsPerLane_g; ++j) {
-                        const int vi = chunk_base + lane_id_g + j * 32;
-                        if (vi < chunk_end) {
-                            int4 packed;
-                            __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
-                            #pragma unroll
-                            for (int p = 0; p < kBfloat162PerInt4; ++p)
-                                pv2[p] = __float22bfloat162_rn(acc[j][p]);
-                            asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};"
-                                :: "l"(slot_base_i4 + (int64_t)first_slot * hidden_int4 + vi),
-                                   "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w));
-                        }
-                    }
-                }
-            }
-#else
-            // Fast mode: full block parallel reduce
-            for (int vi = tid; vi < hidden_int4; vi += blockDim.x) {
-                float2 acc[kBfloat162PerInt4];
+        if (tid < 32) {
+            for (int chunk_base = 0; chunk_base < hidden_int4; chunk_base += kGatherChunkInt4_g) {
+                const int chunk_end = min(chunk_base + kGatherChunkInt4_g, hidden_int4);
+                const int chunk_int4 = chunk_end - chunk_base;
+                float2 acc[kVecsPerLane_g][kBfloat162PerInt4];
                 #pragma unroll
-                for (int p = 0; p < kBfloat162PerInt4; ++p)
-                    acc[p] = make_float2(0.0f, 0.0f);
+                for (int j = 0; j < kVecsPerLane_g; ++j) {
+                    #pragma unroll
+                    for (int p = 0; p < kBfloat162PerInt4; ++p)
+                        acc[j][p] = make_float2(0.0f, 0.0f);
+                }
 
                 for (int k = 0; k < nhits; ++k) {
                     int slot = state->token_slot_list[token_idx * num_topk + k];
-                    int4 raw = slot_base_i4[(int64_t)slot * hidden_int4 + vi];
-                    const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
                     #pragma unroll
-                    for (int p = 0; p < kBfloat162PerInt4; ++p) {
-                        float2 v = __bfloat1622float2(bv2[p]);
-                        acc[p].x += v.x;
-                        acc[p].y += v.y;
+                    for (int j = 0; j < kVecsPerLane_g; ++j) {
+                        const int local_vi = lane_id_g + j * 32;
+                        if (local_vi < chunk_int4) {
+                            int4 raw;
+                            asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
+                                : "l"(slot_base_i4 + (int64_t)slot * hidden_int4 + chunk_base + local_vi));
+                            const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                            #pragma unroll
+                            for (int p = 0; p < kBfloat162PerInt4; ++p) {
+                                float2 v = __bfloat1622float2(bv2[p]);
+                                acc[j][p].x += v.x;
+                                acc[j][p].y += v.y;
+                            }
+                        }
                     }
                 }
 
-                int4 packed;
-                __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
                 #pragma unroll
-                for (int p = 0; p < kBfloat162PerInt4; ++p)
-                    pv2[p] = __float22bfloat162_rn(acc[p]);
-                slot_base_i4[(int64_t)first_slot * hidden_int4 + vi] = packed;
+                for (int j = 0; j < kVecsPerLane_g; ++j) {
+                    const int vi = chunk_base + lane_id_g + j * 32;
+                    if (vi < chunk_end) {
+                        int4 packed;
+                        __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
+                        #pragma unroll
+                        for (int p = 0; p < kBfloat162PerInt4; ++p)
+                            pv2[p] = __float22bfloat162_rn(acc[j][p]);
+                        asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};"
+                            :: "l"(slot_base_i4 + (int64_t)first_slot * hidden_int4 + vi),
+                               "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w));
+                    }
+                }
             }
-#endif
         }
+#else
+        for (int vi = tid; vi < hidden_int4; vi += blockDim.x) {
+            float2 acc[kBfloat162PerInt4];
+            #pragma unroll
+            for (int p = 0; p < kBfloat162PerInt4; ++p)
+                acc[p] = make_float2(0.0f, 0.0f);
 
-        __syncthreads();
-        __threadfence();
-        if (tid == 0) {
-            atomicExch(&state->combine_token_ready[token_idx], 1);
+            for (int k = 0; k < nhits; ++k) {
+                int slot = state->token_slot_list[token_idx * num_topk + k];
+                int4 raw = slot_base_i4[(int64_t)slot * hidden_int4 + vi];
+                const __nv_bfloat162* bv2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                #pragma unroll
+                for (int p = 0; p < kBfloat162PerInt4; ++p) {
+                    float2 v = __bfloat1622float2(bv2[p]);
+                    acc[p].x += v.x;
+                    acc[p].y += v.y;
+                }
+            }
+
+            int4 packed;
+            __nv_bfloat162* pv2 = reinterpret_cast<__nv_bfloat162*>(&packed);
+            #pragma unroll
+            for (int p = 0; p < kBfloat162PerInt4; ++p)
+                pv2[p] = __float22bfloat162_rn(acc[p]);
+            slot_base_i4[(int64_t)first_slot * hidden_int4 + vi] = packed;
         }
-        __syncthreads();
+#endif
+
+            __syncthreads();
+            __threadfence();
+            __syncthreads();
+            if (tid == 0)
+                atomicExch(&state->combine_token_ready[token_idx], 1);
+            __syncthreads();
+        }
+#ifdef MK_PERF_TRACE
+        if (tid == 0) {
+            perf_reduce_done_ns = globaltimer_ns();
+            int slot = atomicAdd(state->perf_gather_task_count, 1);
+            if (slot < state->max_compute_tasks) {
+                int64_t* rec = state->perf_gather_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS;
+                rec[0] = perf_start_ns;
+                rec[1] = perf_reduce_done_ns;
+                rec[2] = gather_sm_idx;
+                rec[3] = batch_count;
+                rec[4] = first_token;
+                rec[5] = last_token;
+                rec[6] = nhit_sum;
+                rec[7] = perf_scan_done_ns;
+                rec[8] = perf_reduce_done_ns;
+                rec[9] = perf_reduce_done_ns;
+            }
+        }
+#endif
     }
 }
 
@@ -4648,6 +4777,15 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     std::vector<int64_t> compute_task(compute_task_count > 0 ? (size_t)compute_task_count * NCF : 1);
     if (compute_task_count > 0)
         CUDA_CHECK(cudaMemcpy(compute_task.data(), host_state.perf_compute_task, (size_t)compute_task_count * NCF * sizeof(int64_t), cudaMemcpyDeviceToHost));
+
+    int gather_task_count = 0;
+    constexpr int NGF = MegaKernelState::MK_PERF_NUM_GATHER_FIELDS;
+    CUDA_CHECK(cudaMemcpy(&gather_task_count, host_state.perf_gather_task_count, sizeof(int), cudaMemcpyDeviceToHost));
+    if (gather_task_count > host_state.max_compute_tasks)
+        gather_task_count = host_state.max_compute_tasks;
+    std::vector<int64_t> gather_task(gather_task_count > 0 ? (size_t)gather_task_count * NGF : 1);
+    if (gather_task_count > 0)
+        CUDA_CHECK(cudaMemcpy(gather_task.data(), host_state.perf_gather_task, (size_t)gather_task_count * NGF * sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     // Root-cause diagnostic parallel arrays: full UMMA breakdown + multi-expert rows.
     const int diag_n = compute_task_count > 0 ? compute_task_count : 1;
@@ -5574,6 +5712,47 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                    "\"args\":{\"sort_index\":%d}}",
                 host_state.rank, tid, tid);
     }
+    {
+        int tid = compute_tid_base + num_compute_groups;
+        emit_comma();
+        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
+                   "\"args\":{\"name\":\"gather_task\"}}",
+                host_state.rank, tid);
+        emit_comma();
+        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
+                   "\"args\":{\"sort_index\":%d}}",
+                host_state.rank, tid, tid);
+    }
+    auto gather_phase_us = [](int64_t a, int64_t b) -> double {
+        if (a == 0 || b == 0 || b <= a) return 0.0;
+        return (b - a) / 1000.0;
+    };
+    for (int t = 0; t < gather_task_count; ++t) {
+        int64_t* rec = &gather_task[(size_t)t * NGF];
+        int64_t start = rec[0], end = rec[1];
+        if (start == 0 || end == 0 || end <= start) continue;
+        int gather_sm = static_cast<int>(rec[2]);
+        int batch_size = static_cast<int>(rec[3]);
+        int first_token = static_cast<int>(rec[4]);
+        int last_token = static_cast<int>(rec[5]);
+        int nhit_sum = static_cast<int>(rec[6]);
+        double scan_us = gather_phase_us(start, rec[7]);
+        double reduce_us = gather_phase_us(rec[7], rec[8]);
+        double signal_us = gather_phase_us(rec[8], rec[9]);
+        int tid = compute_tid_base + num_compute_groups;
+        if (!emit_perf_args) {
+            emit_event("gather_task", "gather_sm", start, end, pid, tid);
+            continue;
+        }
+        emit_comma();
+        fprintf(f, "{\"name\":\"gather_task\",\"cat\":\"gather_sm\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
+                   "\"pid\":%d,\"tid\":%d,\"args\":{\"gather_sm_idx\":%d,\"batch_size\":%d,"
+                   "\"first_token\":%d,\"last_token\":%d,\"nhit_sum\":%d,"
+                   "\"scan_us\":%.3f,\"reduce_us\":%.3f,\"signal_us\":%.3f}}",
+                (start - base_ts) / 1000.0, (end - start) / 1000.0,
+                pid, tid, gather_sm, batch_size, first_token, last_token, nhit_sum,
+                scan_us, reduce_us, signal_us);
+    }
     for (int t = 0; t < compute_task_count; ++t) {
         int64_t* rec = &compute_task[(size_t)t * NCF];
         int64_t start = rec[0];
@@ -5872,16 +6051,37 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&compute_group_task_idx, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_task_idx, 0xff, num_compute_groups * sizeof(int)));
 
-    // Dedicated gather SM semaphore state (no compute/copy in gather for this experiment).
+    // Dedicated gather SM task queue state.
     int* token_done_count;
     int* gather_claimed;
     int* combine_token_ready;
+    int* gather_ready_queue;
+    int* gather_ready_head;
+    int* gather_ready_tail;
+    int* gather_ready_reserve_tail;
+    int* gather_task_count;
+    int* gather_task_tokens;
+    int* gather_task_nhits;
     CUDA_CHECK(cudaMalloc(&token_done_count, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_done_count, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_claimed, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(gather_claimed, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&combine_token_ready, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_token_ready, 0, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_ready_queue, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_ready_queue, 0, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_ready_head, sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_ready_head, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_ready_tail, sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_ready_tail, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_ready_reserve_tail, sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_ready_reserve_tail, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_task_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_task_count, 0, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_task_tokens, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_task_tokens, 0, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&gather_task_nhits, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_task_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     int* combine_done_count;
     int* combine_all_done;
     CUDA_CHECK(cudaMalloc(&combine_done_count, sizeof(int)));
@@ -5940,23 +6140,14 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&token_compute_expected, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_compute_expected, 0, (size_t)max_total_recv_tokens * sizeof(int)));
 
-    // Per-slot output path scratch + reverse map + per-slot ready (MEGAKERNEL_COMPUTE_DESIGN III).
+    // Per-slot output path scratch + reverse map (MEGAKERNEL_COMPUTE_DESIGN III).
     __nv_bfloat16* compute_output_slot;
-    int* compute_slot_ready;
-    int* compute_slot_from_flush;
-    int64_t* compute_slot_ready_ts;
     int* token_nhits;
     int* token_slot_list;
     int* priority_token_cursor;
     int* expert_batch_enqueued;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
     CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
-    CUDA_CHECK(cudaMalloc(&compute_slot_ready, total_expert_slots * sizeof(int)));
-    CUDA_CHECK(cudaMemset(compute_slot_ready, 0, total_expert_slots * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&compute_slot_from_flush, total_expert_slots * sizeof(int)));
-    CUDA_CHECK(cudaMemset(compute_slot_from_flush, 0, total_expert_slots * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&compute_slot_ready_ts, total_expert_slots * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(compute_slot_ready_ts, 0, total_expert_slots * sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&token_nhits, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&token_slot_list, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
@@ -6150,13 +6341,19 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.expert_enqueue_cursor = expert_enqueue_cursor;
     host_state.compute_group_task_idx = compute_group_task_idx;
 
-    // Dedicated gather SM semaphore state
+    // Dedicated gather SM task queue state
     host_state.token_done_count = token_done_count;
     host_state.gather_claimed = gather_claimed;
     host_state.combine_token_ready = combine_token_ready;
+    host_state.gather_ready_queue = gather_ready_queue;
+    host_state.gather_ready_head = gather_ready_head;
+    host_state.gather_ready_tail = gather_ready_tail;
+    host_state.gather_ready_reserve_tail = gather_ready_reserve_tail;
+    host_state.gather_task_count = gather_task_count;
+    host_state.gather_task_tokens = gather_task_tokens;
+    host_state.gather_task_nhits = gather_task_nhits;
     host_state.combine_done_count = combine_done_count;
     host_state.combine_all_done = combine_all_done;
-    host_state.num_gather_sms = 2;
 
     // Publish-offload backing state (Stage 1)
     host_state.token_publish_done = token_publish_done;
@@ -6216,9 +6413,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.expert_compute_done = expert_compute_done;
     host_state.token_compute_expected = token_compute_expected;
     host_state.compute_output_slot = compute_output_slot;
-    host_state.compute_slot_ready = compute_slot_ready;
-    host_state.compute_slot_from_flush = compute_slot_from_flush;
-    host_state.compute_slot_ready_ts = compute_slot_ready_ts;
     host_state.token_nhits = token_nhits;
     host_state.token_slot_list = token_slot_list;
     host_state.priority_token_cursor = priority_token_cursor;
@@ -6560,6 +6754,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.perf_compute_task = perf_compute_task;
     host_state.perf_compute_task_count = perf_compute_task_count;
 
+    const size_t gather_task_bytes = (size_t)max_compute_tasks * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS * sizeof(int64_t);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_gather_task, gather_task_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_gather_task, 0, gather_task_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_gather_task_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(host_state.perf_gather_task_count, 0, sizeof(int)));
+
     // Root-cause diagnostic parallel arrays (one entry per compute-task slot).
     const size_t diag_i64_bytes = (size_t)max_compute_tasks * sizeof(int64_t);
     const size_t diag_i32_bytes = (size_t)max_compute_tasks * sizeof(int);
@@ -6666,9 +6866,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.expert_compute_done));
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
-    CUDA_CHECK(cudaFree(host_state.compute_slot_ready));
-    CUDA_CHECK(cudaFree(host_state.compute_slot_from_flush));
-    CUDA_CHECK(cudaFree(host_state.compute_slot_ready_ts));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
     CUDA_CHECK(cudaFree(host_state.token_slot_list));
     CUDA_CHECK(cudaFree(host_state.priority_token_cursor));
@@ -6686,6 +6883,13 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.token_done_count));
     CUDA_CHECK(cudaFree(host_state.gather_claimed));
     CUDA_CHECK(cudaFree(host_state.combine_token_ready));
+    CUDA_CHECK(cudaFree(host_state.gather_ready_queue));
+    CUDA_CHECK(cudaFree(host_state.gather_ready_head));
+    CUDA_CHECK(cudaFree(host_state.gather_ready_tail));
+    CUDA_CHECK(cudaFree(host_state.gather_ready_reserve_tail));
+    CUDA_CHECK(cudaFree(host_state.gather_task_count));
+    CUDA_CHECK(cudaFree(host_state.gather_task_tokens));
+    CUDA_CHECK(cudaFree(host_state.gather_task_nhits));
     CUDA_CHECK(cudaFree(host_state.combine_done_count));
     CUDA_CHECK(cudaFree(host_state.combine_all_done));
     CUDA_CHECK(cudaFree(host_state.token_publish_done));
@@ -6830,6 +7034,8 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_dispatch_done));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task_count));
+    CUDA_CHECK(cudaFree(host_state.perf_gather_task));
+    CUDA_CHECK(cudaFree(host_state.perf_gather_task_count));
     CUDA_CHECK(cudaFree(host_state.perf_up_setup));
     CUDA_CHECK(cudaFree(host_state.perf_up_tmem_alloc));
     CUDA_CHECK(cudaFree(host_state.perf_up_prologue));
