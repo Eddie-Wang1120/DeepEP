@@ -49,7 +49,7 @@ namespace umma {
 
 using namespace cute;
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ARGS
 // Full per-tile UMMA timing breakdown (ns), accumulated by the group leader thread.
 // Every internal phase of umma_up_swiglu_tile / umma_down_proj_tile is captured so a
 // future perf run can pinpoint exactly which sub-step dominates p3a/p4a — no blind spot.
@@ -1083,7 +1083,7 @@ __device__ void umma_up_swiglu_tile(
     const CUtensorMap* desc_wgate, const CUtensorMap* desc_wup,
     int i_tile, __nv_bfloat16* gate_out, const float* route_w,
     int M, int I, int d, char* cluster_smem, bool& tmem_allocated, uint32_t& accum_iter
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ARGS
     , UmmaPerf* perf = nullptr
 #endif
     ) {

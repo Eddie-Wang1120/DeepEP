@@ -1225,7 +1225,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
     }
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
     cudaEvent_t dispatch_start_ev, dispatch_end_ev;
     AT_CUDA_CHECK(cudaEventCreate(&dispatch_start_ev));
     AT_CUDA_CHECK(cudaEventCreate(&dispatch_end_ev));
@@ -1273,7 +1273,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         num_channels,
                         low_latency_mode);
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
     AT_CUDA_CHECK(cudaEventRecord(dispatch_end_ev, comm_stream));
     AT_CUDA_CHECK(cudaEventSynchronize(dispatch_end_ev));
     float dispatch_ms = 0.0f;
@@ -1471,7 +1471,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     // Launch data combine
     auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
     cudaEvent_t combine_start_ev, combine_end_ev;
     AT_CUDA_CHECK(cudaEventCreate(&combine_start_ev));
     AT_CUDA_CHECK(cudaEventCreate(&combine_end_ev));
@@ -1508,7 +1508,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels,
                        low_latency_mode);
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
     AT_CUDA_CHECK(cudaEventRecord(combine_end_ev, comm_stream));
     AT_CUDA_CHECK(cudaEventSynchronize(combine_end_ev));
     float combine_ms = 0.0f;
@@ -1557,7 +1557,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 #endif
 }
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
 void Buffer::dump_deepep_perf_trace() {
     // Emit a Perfetto-compatible JSON array for this rank's baseline dispatch/combine timing.
     // File naming matches what aggregate_mk_perf_traces.py expects.
@@ -2316,7 +2316,7 @@ torch::Tensor Buffer::megakernel_forward(
 
     AT_CUDA_CHECK(cudaGetLastError());
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
 
     // Align all ranks after notify/state setup and immediately before the timed megakernel launch.
     // This keeps dispatch fwd_wait_meta / recv_wait_prefix from measuring host-side node launch skew.
@@ -2421,7 +2421,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("W_down_fp8") = py::none(),
              py::arg("W_gateup_fp8_sf") = py::none(),
              py::arg("W_down_fp8_sf") = py::none())
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
 #endif
         ;

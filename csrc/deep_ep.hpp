@@ -324,7 +324,7 @@ public:
         const pybind11::object& W_gateup_fp8_sf,
         const pybind11::object& W_down_fp8_sf);
 
-#ifdef MK_PERF_TRACE
+#if MK_PERF_TRACE_ENABLED
     // Baseline perf trace state: accumulated across dispatch/combine calls, dumped on request.
     float deepep_perf_trace_dispatch_ms_ = 0.0f;
     float deepep_perf_trace_combine_ms_ = 0.0f;

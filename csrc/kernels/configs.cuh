@@ -14,6 +14,14 @@
 static_assert(MK_COMPUTE_KERNEL >= 0 && MK_COMPUTE_KERNEL <= 2,
               "MK_COMPUTE_KERNEL must be 0 (WMMA), 1 (1-CTA UMMA), or 2 (2-CTA UMMA)");
 
+// MegaKernel Perfetto trace levels:
+//   0 = disabled, 1 = block-level events, 2 = full event args and diagnostics.
+#ifndef MK_PERF_TRACE
+#define MK_PERF_TRACE 0
+#endif
+#define MK_PERF_TRACE_ENABLED (MK_PERF_TRACE > 0)
+#define MK_PERF_TRACE_ARGS (MK_PERF_TRACE >= 2)
+
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
 
