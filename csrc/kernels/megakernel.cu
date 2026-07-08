@@ -1021,12 +1021,12 @@ __device__ void publish_worker_v2(int dispatch_sm_idx, int src_nvl_rank, MegaKer
 #endif
         int done = atomicAdd(state->publish_done_count, 1) + 1;
         if (done == state->num_pub_warps_total) {
-            __threadfence_system();
+            __threadfence();
 #if MK_PERF_TRACE_ARGS
             int64_t all_done_ts = globaltimer_ns();
             *state->perf_async_publish_all_done_ts = all_done_ts;
 #endif
-            st_release_sys_global(state->publish_all_done, 1);
+            st_na_release(state->publish_all_done, 1);
         }
 #if MK_PERF_TRACE_ARGS
         int64_t end_ns = globaltimer_ns();
@@ -2092,7 +2092,7 @@ __device__ void dispatch_worker_v2(
             atomicAdd(&state->channel_dispatch_done[logical_channel_id], 1);
             int done_count = atomicAdd(state->dispatch_done_count, 1) + 1;
             if (done_count == state->expected_dispatch_done_count)
-                st_release_sys_global(state->dispatch_done, 1);
+                st_na_release(state->dispatch_done, 1);
         }
     }
 
@@ -2550,7 +2550,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
         cursor = cursor_start;
 
     const int scan_groups = (total_tokens > cursor_start) ? ((total_tokens - cursor_start + warp_stride - 1) / warp_stride) : 0;
-    const bool dispatch_finished = ld_acquire_sys_global(state->publish_all_done) != 0;
+    const bool dispatch_finished = ld_acquire_global(state->publish_all_done) != 0;
     const int target_batch_tokens = dispatch_finished ? kGatherTailBatchTokens : kGatherBatchTokens;
     const int max_scan_groups = scan_groups;
     int scan_steps = 0;
@@ -2684,9 +2684,9 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         // Thread 0 loads dispatch_done and broadcasts via shared memory
         if (tid == 0) {
 #if MK_ASYNC_PUBLISH
-            s_dispatch_done = (ld_acquire_sys_global(state->publish_all_done) != 0) ? 1 : 0;
+            s_dispatch_done = (ld_acquire_global(state->publish_all_done) != 0) ? 1 : 0;
 #else
-            int dispatch_done_count = ld_acquire_sys_global(state->dispatch_done_count);
+            int dispatch_done_count = ld_acquire_global(state->dispatch_done_count);
             s_dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count) ? 1 : 0;
 #endif
         }
@@ -3706,8 +3706,8 @@ __device__ void combine_worker_v2(
 
             for (int dst_rdma_rank = 0; dst_rdma_rank < kNumRDMARanks_C; ++dst_rdma_rank) {
                 int rdma_prefix_idx = dst_rdma_rank * num_logical_channels + logical_channel_id;
-                int channel_end = ld_acquire_sys_global(rdma_channel_prefix_matrix + rdma_prefix_idx);
-                int channel_count = ld_acquire_sys_global(state->combine_rdma_channel_token_count + rdma_prefix_idx);
+                int channel_end = ld_nc_global(rdma_channel_prefix_matrix + rdma_prefix_idx);
+                int channel_count = ld_nc_global(state->combine_rdma_channel_token_count + rdma_prefix_idx);
                 int channel_start = channel_end - channel_count;
                 int rank_shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
                 int rdma_token_start = rank_shift + channel_start;
@@ -3849,8 +3849,8 @@ __device__ void combine_worker_v2(
         int nvl_sender_count = 0;
         if (lane_id < kNumRDMARanks_C) {
             nvl_sender_prefix_idx = (lane_id * NUM_MAX_NVL_PEERS + dst_nvl_rank) * num_logical_channels + logical_channel_id;
-            token_start_idx = ld_acquire_sys_global(gbl_channel_prefix_matrix + nvl_sender_prefix_idx);
-            nvl_sender_count = ld_acquire_sys_global(state->combine_gbl_channel_token_count + nvl_sender_prefix_idx);
+            token_start_idx = ld_nc_global(gbl_channel_prefix_matrix + nvl_sender_prefix_idx);
+            nvl_sender_count = ld_nc_global(state->combine_gbl_channel_token_count + nvl_sender_prefix_idx);
             token_end_idx = token_start_idx + nvl_sender_count;
             EP_DEVICE_ASSERT(token_start_idx >= 0 and nvl_sender_count >= 0 and token_end_idx <= num_tokens);
         }
@@ -4232,8 +4232,8 @@ __device__ void combine_worker_v2(
             // RDMA prefix entries for later logical channels may not be available yet.
             // Use this channel's explicit count to recover its local start.
             int rdma_prefix_idx = dst_rdma_rank * num_logical_channels + logical_channel_id;
-            int channel_end = ld_acquire_sys_global(rdma_channel_prefix_matrix + rdma_prefix_idx);
-            int num_tokens_to_combine = ld_acquire_sys_global(state->combine_rdma_channel_token_count + rdma_prefix_idx);
+            int channel_end = ld_nc_global(rdma_channel_prefix_matrix + rdma_prefix_idx);
+            int num_tokens_to_combine = ld_nc_global(state->combine_rdma_channel_token_count + rdma_prefix_idx);
             int channel_start = channel_end - num_tokens_to_combine;
             int num_tokens_prefix = channel_start + (dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1]);
             int* logical_combined_nvl_head = combined_nvl_head_base + num_tokens_prefix * NUM_MAX_NVL_PEERS;
