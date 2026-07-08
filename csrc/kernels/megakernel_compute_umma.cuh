@@ -49,23 +49,6 @@ namespace umma {
 
 using namespace cute;
 
-#if MK_PERF_TRACE_ARGS
-// Full per-tile UMMA timing breakdown (ns), accumulated by the group leader thread.
-// Every internal phase of umma_up_swiglu_tile / umma_down_proj_tile is captured so a
-// future perf run can pinpoint exactly which sub-step dominates p3a/p4a — no blind spot.
-struct UmmaPerf {
-    int64_t setup_ns;          // entry -> just before TMEM alloc/sync (fragment/partition setup)
-    int64_t tmem_alloc_ns;     // TMEM allocate + its cluster_sync/umma_sync128 (first call only)
-    int64_t prologue_ns;       // partition/TMA-setup + barrier init + cluster_sync before mainloop
-    int64_t tma_wait_ns;       // accumulated wait_barrier(tma_barrier)
-    int64_t mma_issue_ns;      // gemm() issue + umma_arrive (between tma wait and mma wait)
-    int64_t mma_wait_ns;       // accumulated wait_barrier(mma_barrier)
-    int64_t loop_other_ns;     // mainloop time not in tma_wait/mma_issue/mma_wait (copy t2r, loop overhead)
-    int64_t cluster_sync_ns;   // accumulated cute::cluster_sync() (whole-CTA, 800 threads)
-    int64_t epilogue_ns;       // SwiGLU/cast epilogue + final stores + umma_sync128
-};
-#endif
-
 // Named barrier over exactly the 128 threads (4 warps) that run the UMMA kernel
 // inside an 800-thread megakernel block. Plain __syncthreads() would wait for all
 // 800 threads and deadlock, since only thread_id<128 enter this code path.
@@ -1082,11 +1065,7 @@ __device__ void umma_up_swiglu_tile(
     const CUtensorMap* desc_a, const CUtensorMap* desc_gate_cd, const CUtensorMap* desc_act_cd,
     const CUtensorMap* desc_wgate, const CUtensorMap* desc_wup,
     int i_tile, __nv_bfloat16* gate_out, const float* route_w,
-    int M, int I, int d, char* cluster_smem, bool& tmem_allocated, uint32_t& accum_iter
-#if MK_PERF_TRACE_ARGS
-    , UmmaPerf* perf = nullptr
-#endif
-    ) {
+    int M, int I, int d, char* cluster_smem, bool& tmem_allocated, uint32_t& accum_iter) {
     const int n_tiles = (I + kDgBlockN - 1) / kDgBlockN;
     const int m_block = i_tile / n_tiles;
     const int n_block = i_tile - m_block * n_tiles;

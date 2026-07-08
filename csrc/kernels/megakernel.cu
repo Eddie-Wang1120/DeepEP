@@ -47,7 +47,7 @@ namespace megakernel {
 // Configuration
 // ============================================================================
 
-constexpr int COMPUTE_BATCH_SIZE = 512;  // Tokens per expert batch before triggering GEMM; UMMA paths use fixed padded M=256.
+constexpr int COMPUTE_BATCH_SIZE = 1024;  // Tokens per expert batch before triggering GEMM; UMMA paths use fixed padded M=COMPUTE_BATCH_SIZE.
 constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
 constexpr int COMPUTE_SCHEDULER_SMS = 2;
 constexpr int PRIORITY_SCHED_TID_BEGIN = 576; // one warp per scheduler CTA handles combine-order priority batches
@@ -527,24 +527,16 @@ struct MegaKernelState {
     //   23 = expert-local end_slot (exclusive)
     //   24 = absolute slot base (= expert_id * max_tokens_per_expert + start_slot)
     //   25 = is_flush task flag
-    static constexpr int MK_PERF_NUM_COMPUTE_FIELDS = 26;
-    int64_t* perf_compute_task;        // [max_compute_tasks * MK_PERF_NUM_COMPUTE_FIELDS]
-    int* perf_compute_task_count;      // atomic write cursor into perf_compute_task
+    //   26 = valid record flag
+    static constexpr int MK_PERF_NUM_COMPUTE_FIELDS = 27;
+    int64_t* perf_compute_task;        // [max_compute_tasks * MK_PERF_NUM_COMPUTE_FIELDS], indexed by queue task_idx
+    int* perf_compute_task_count;      // legacy counter; trace export scans valid records by task_idx
 #endif
 #if MK_PERF_TRACE_ARGS
     // Root-cause diagnostics, parallel arrays indexed by the same compute-task slot.
     // Rendered as args on each compute X-event (no extra COMPUTE_FIELDS).
-    // Full UMMA per-phase breakdown (ns) for up/down GEMM, so a single perf run
-    // pinpoints exactly which UMMA sub-step (setup/tmem_alloc/prologue/tma_wait/
-    // mma_issue/mma_wait/loop_other/cluster_sync/epilogue) dominates p3a/p4a.
-    int64_t* perf_up_setup;        int64_t* perf_up_tmem_alloc;   int64_t* perf_up_prologue;
-    int64_t* perf_up_tma_wait;     int64_t* perf_up_mma_issue;    int64_t* perf_up_mma_wait;
-    int64_t* perf_up_loop_other;   int64_t* perf_up_cluster_sync; int64_t* perf_up_epilogue;
-    int64_t* perf_down_setup;      int64_t* perf_down_tmem_alloc; int64_t* perf_down_prologue;
-    int64_t* perf_down_tma_wait;   int64_t* perf_down_mma_issue;  int64_t* perf_down_mma_wait;
-    int64_t* perf_down_loop_other; int64_t* perf_down_cluster_sync; int64_t* perf_down_epilogue;
     int* perf_compute_multi_expert_rows;  // [max_compute_tasks]
-    int* perf_compute_task_has_multi;     // [max_compute_tasks] output-phase s_has_multi_finalize (1=slow path)
+    int* perf_compute_task_has_multi;     // [max_compute_tasks] output-phase multi-expert flag
 #endif
 #if MK_PERF_TRACE_ENABLED
     // Per-gather-batch timing buffer. Fields:
@@ -562,6 +554,7 @@ struct MegaKernelState {
     int64_t* perf_task_pop_done_ts;       // compute group leader acquired this task
     int64_t* perf_task_bcast_done_ts;     // task_idx broadcast sync done for the group
     int64_t* perf_task_start_ts;          // compute task body timing start
+    int64_t* perf_task_prev_end_ts;       // previous task end timestamp in the same compute group
     int64_t* perf_task_prev_gap_ns;       // this group's task_start - previous task end
     int* perf_task_pop_attempts;          // number of queue polls/CAS attempts for this task
     int* perf_task_cas_failures;          // failed CAS attempts before acquiring this task
@@ -3028,7 +3021,7 @@ __device__ void compute_worker(
     int compute_sm_idx,  // 0-based index among compute SMs
     int num_compute_sms,
     MegaKernelState* state,
-    float* smem_wmma_buf
+    uint8_t* smem_buffer
 ) {
     if constexpr (kComputeDType == ComputeDType::kFP8E4M3) {
         if (threadIdx.x == 0 && compute_sm_idx == 0)
@@ -3068,12 +3061,41 @@ __device__ void compute_worker(
     __nv_bfloat16* up_buf   = gu_buf + gu_stride;         // act = silu(gate)*up*route_w (down-proj A operand)
     __nv_bfloat16* down_buf = up_buf + act_stride;
 
-    __shared__ int s_recv_token_idx[COMPUTE_BATCH_SIZE];
-    __shared__ unsigned char s_is_single[COMPUTE_BATCH_SIZE];
-    __shared__ int s_has_multi_finalize;
+    auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
+
+    using ComputeUmmaSmemLayout = umma::DgSmemLayout<umma::kDgRunMulticast>;
+    constexpr size_t kComputeUmmaBarrierBytes =
+        (ComputeUmmaSmemLayout::kNumStages * 3 + ComputeUmmaSmemLayout::kNumEpilogueStages * 2 + 1) *
+        sizeof(cutlass::arch::ClusterTransactionBarrier) + sizeof(uint32_t);
+    constexpr size_t kComputeUmmaScratchBytes =
+        ComputeUmmaSmemLayout::SMEM_CD_SIZE +
+        ComputeUmmaSmemLayout::kNumStages *
+            (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
+        kComputeUmmaBarrierBytes;
+    constexpr size_t kComputeWmmaScratchBytes =
+        (kNumCombineForwarderWarps + 1) * 2 * WMMA_M * WMMA_N * sizeof(float);
+    constexpr size_t kComputeScratchBytes =
+        kComputeWmmaScratchBytes > kComputeUmmaScratchBytes ? kComputeWmmaScratchBytes : kComputeUmmaScratchBytes;
+    constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
+
+    constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
+    constexpr size_t kRouteWAlignPad = alignof(float) - 1;
+    constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
+    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
+    static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
+                  kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
+                  "compute dynamic smem metadata must fit after compute scratch");
+
+    uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
+    int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
+    compute_smem += kRecvTokenIdxBytes;
+    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
+    constexpr size_t kRouteWOffset =
+        (kComputeMetaOffset + kRecvTokenIdxBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
     // Per-row route weight, gathered once and consumed inside the fused
     // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
-    __shared__ float s_route_w[COMPUTE_BATCH_SIZE];
+    float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
 
     // TMEM alloc-once flag: first UMMA call allocates, subsequent calls reuse.
     bool umma_tmem_allocated = false;
@@ -3104,6 +3126,7 @@ __device__ void compute_worker(
                 if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
                     task_idx = head;
 #if MK_PERF_TRACE_ARGS
+                    pop_done_ns = globaltimer_ns();
                     if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
                         state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
                         state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
@@ -3142,7 +3165,6 @@ __device__ void compute_worker(
             continue;
         }
 
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
         ComputeTask task = state->compute_tasks[task_idx];
         int expert_id = task.expert_id;
         int start_slot = task.start_slot;
@@ -3186,19 +3208,13 @@ __device__ void compute_worker(
         int64_t perf_sig_fence_ns = 0, perf_sig_publish_ns = 0;
         if (perf_leader && task_idx >= 0 && task_idx < state->max_compute_tasks) {
             state->perf_task_start_ts[task_idx] = compute_task_start_ns;
+            state->perf_task_prev_end_ts[task_idx] = last_task_end_ns;
             state->perf_task_prev_gap_ns[task_idx] = last_task_end_ns == 0 ? 0 : compute_task_start_ns - last_task_end_ns;
         }
-        // Root-cause diagnostics (rendered as args, no new COMPUTE_FIELDS):
-        //   full UMMA per-phase breakdown for up/down GEMM (leader thread only),
-        //   plus multi-expert finalize row count.
-        __shared__ umma::UmmaPerf s_perf_up, s_perf_down;
+        // Root-cause diagnostics rendered as args on compute X-events.
         __shared__ int s_perf_multi_expert_rows;
-        // Output-phase task-has-multi decision (before slow path recomputes
-        // s_has_multi_finalize against group_is_last). 1 = slow path was taken.
         __shared__ int s_perf_task_has_multi;
         if (perf_leader) {
-            s_perf_up = umma::UmmaPerf{};
-            s_perf_down = umma::UmmaPerf{};
             s_perf_multi_expert_rows = 0;
             s_perf_task_has_multi = 0;
         }
@@ -3424,13 +3440,17 @@ __device__ void compute_worker(
 
 #if MK_PERF_TRACE_ENABLED
         if (perf_leader) {
-            int slot = atomicAdd(state->perf_compute_task_count, 1);
-            if (slot < state->max_compute_tasks) {
+#if MK_PERF_TRACE_ARGS
+            last_task_end_ns = compute_task_end_ns;
+#endif
+            int slot = task_idx;
+            if (slot >= 0 && slot < state->max_compute_tasks) {
                 int64_t* rec = state->perf_compute_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
                 rec[0] = compute_task_start_ns;
                 rec[1] = compute_task_end_ns;
                 rec[2] = sm_id;
                 rec[3] = group_id;
+                rec[26] = 1;
 #if MK_PERF_TRACE_ARGS
                 rec[4] = expert_id;
                 rec[5] = batch_size;
@@ -3454,26 +3474,6 @@ __device__ void compute_worker(
                 rec[23] = start_slot + batch_size;
                 rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
                 rec[25] = task.is_flush;
-                last_task_end_ns = compute_task_end_ns;
-                // Root-cause diagnostics (parallel arrays, same slot): full UMMA breakdown.
-                state->perf_up_setup[slot]        = s_perf_up.setup_ns;
-                state->perf_up_tmem_alloc[slot]   = s_perf_up.tmem_alloc_ns;
-                state->perf_up_prologue[slot]     = s_perf_up.prologue_ns;
-                state->perf_up_tma_wait[slot]     = s_perf_up.tma_wait_ns;
-                state->perf_up_mma_issue[slot]    = s_perf_up.mma_issue_ns;
-                state->perf_up_mma_wait[slot]     = s_perf_up.mma_wait_ns;
-                state->perf_up_loop_other[slot]   = s_perf_up.loop_other_ns;
-                state->perf_up_cluster_sync[slot] = s_perf_up.cluster_sync_ns;
-                state->perf_up_epilogue[slot]     = s_perf_up.epilogue_ns;
-                state->perf_down_setup[slot]        = s_perf_down.setup_ns;
-                state->perf_down_tmem_alloc[slot]   = s_perf_down.tmem_alloc_ns;
-                state->perf_down_prologue[slot]     = s_perf_down.prologue_ns;
-                state->perf_down_tma_wait[slot]     = s_perf_down.tma_wait_ns;
-                state->perf_down_mma_issue[slot]    = s_perf_down.mma_issue_ns;
-                state->perf_down_mma_wait[slot]     = s_perf_down.mma_wait_ns;
-                state->perf_down_loop_other[slot]   = s_perf_down.loop_other_ns;
-                state->perf_down_cluster_sync[slot] = s_perf_down.cluster_sync_ns;
-                state->perf_down_epilogue[slot]     = s_perf_down.epilogue_ns;
                 state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
                 state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
 #endif
@@ -4873,9 +4873,8 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
     //            state->buffer_ptrs, state->combine_buffer_ptrs);
     // }
 
-    // Reuse dynamic shared memory for WMMA output on compute SMs.
+    // Role-specific workers reuse the single dynamic shared-memory allocation.
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
 
     // Determine SM role based on blockIdx.x
     // Layout: [Dispatch] [Combine] [Scheduler] [Compute groups] [Gather]
@@ -4915,7 +4914,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             break;
 
         case SmRole::kCompute:
-            compute_worker<kComputeDType>(sm_id, role_idx, num_compute_sms, state, smem_wmma_buf);
+            compute_worker<kComputeDType>(sm_id, role_idx, num_compute_sms, state, smem_buffer);
             break;
 
         case SmRole::kGather:
@@ -5045,10 +5044,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     CUDA_CHECK(cudaMemcpy(combine_lch_ts.data(), host_state.perf_combine_lch_ts, num_logical_channels * 2 * NLP * sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     constexpr int NCF = MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
-    int compute_task_count = 0;
-    CUDA_CHECK(cudaMemcpy(&compute_task_count, host_state.perf_compute_task_count, sizeof(int), cudaMemcpyDeviceToHost));
-    if (compute_task_count > host_state.max_compute_tasks)
-        compute_task_count = host_state.max_compute_tasks;
+    int compute_task_count = host_state.max_compute_tasks;
     std::vector<int64_t> compute_task(compute_task_count > 0 ? (size_t)compute_task_count * NCF : 1);
     if (compute_task_count > 0)
         CUDA_CHECK(cudaMemcpy(compute_task.data(), host_state.perf_compute_task, (size_t)compute_task_count * NCF * sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -5073,7 +5069,9 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
     }
     for (int t = 0; t < compute_task_count; ++t) {
-        int64_t trace_ts = compute_task[(size_t)t * NCF];
+        int64_t* rec = &compute_task[(size_t)t * NCF];
+        if (rec[26] == 0) continue;
+        int64_t trace_ts = rec[0];
         if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
     }
     for (int t = 0; t < gather_task_count; ++t) {
@@ -5172,6 +5170,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     }
     for (int t = 0; t < compute_task_count; ++t) {
         int64_t* rec = &compute_task[(size_t)t * NCF];
+        if (rec[26] == 0) continue;
         int group_id = static_cast<int>(rec[3]);
         int tid = compute_tid_base + group_id;
         emit_event("compute_task", "compute_group", rec[0], rec[1], host_state.rank, tid);
@@ -5465,35 +5464,15 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_ready, host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_stall_dispatch_done, host_state.perf_sched_stall_dispatch_done, sizeof(int64_t), cudaMemcpyDeviceToHost));
 
-    // Root-cause diagnostic parallel arrays: full UMMA breakdown + multi-expert rows.
+    // Root-cause diagnostic parallel arrays: multi-expert rows.
     const int diag_n = compute_task_count > 0 ? compute_task_count : 1;
-    std::vector<int64_t> d_up_setup(diag_n), d_up_tmem(diag_n), d_up_prologue(diag_n),
-        d_up_tma(diag_n), d_up_mma_issue(diag_n), d_up_mma_wait(diag_n),
-        d_up_loop(diag_n), d_up_csync(diag_n), d_up_epi(diag_n);
-    std::vector<int64_t> d_dn_setup(diag_n), d_dn_tmem(diag_n), d_dn_prologue(diag_n),
-        d_dn_tma(diag_n), d_dn_mma_issue(diag_n), d_dn_mma_wait(diag_n),
-        d_dn_loop(diag_n), d_dn_csync(diag_n), d_dn_epi(diag_n);
     std::vector<int> diag_multi_rows(diag_n);
     std::vector<int> diag_task_has_multi(diag_n);
     const int queue_diag_n = host_state.max_compute_tasks > 0 ? host_state.max_compute_tasks : 1;
     std::vector<int64_t> q_publish(queue_diag_n), q_pop_start(queue_diag_n), q_pop_done(queue_diag_n),
-        q_bcast_done(queue_diag_n), q_task_start(queue_diag_n), q_prev_gap(queue_diag_n);
+        q_bcast_done(queue_diag_n), q_task_start(queue_diag_n), q_prev_end(queue_diag_n), q_prev_gap(queue_diag_n);
     std::vector<int> q_source(queue_diag_n), q_pop_attempts(queue_diag_n), q_cas_failures(queue_diag_n), q_group_id(queue_diag_n);
     if (compute_task_count > 0) {
-        const size_t b = (size_t)compute_task_count * sizeof(int64_t);
-        auto cp = [&](std::vector<int64_t>& v, int64_t* src) {
-            CUDA_CHECK(cudaMemcpy(v.data(), src, b, cudaMemcpyDeviceToHost));
-        };
-        cp(d_up_setup, host_state.perf_up_setup);     cp(d_up_tmem, host_state.perf_up_tmem_alloc);
-        cp(d_up_prologue, host_state.perf_up_prologue); cp(d_up_tma, host_state.perf_up_tma_wait);
-        cp(d_up_mma_issue, host_state.perf_up_mma_issue); cp(d_up_mma_wait, host_state.perf_up_mma_wait);
-        cp(d_up_loop, host_state.perf_up_loop_other); cp(d_up_csync, host_state.perf_up_cluster_sync);
-        cp(d_up_epi, host_state.perf_up_epilogue);
-        cp(d_dn_setup, host_state.perf_down_setup);   cp(d_dn_tmem, host_state.perf_down_tmem_alloc);
-        cp(d_dn_prologue, host_state.perf_down_prologue); cp(d_dn_tma, host_state.perf_down_tma_wait);
-        cp(d_dn_mma_issue, host_state.perf_down_mma_issue); cp(d_dn_mma_wait, host_state.perf_down_mma_wait);
-        cp(d_dn_loop, host_state.perf_down_loop_other); cp(d_dn_csync, host_state.perf_down_cluster_sync);
-        cp(d_dn_epi, host_state.perf_down_epilogue);
         CUDA_CHECK(cudaMemcpy(diag_multi_rows.data(), host_state.perf_compute_multi_expert_rows, (size_t)compute_task_count * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(diag_task_has_multi.data(), host_state.perf_compute_task_has_multi, (size_t)compute_task_count * sizeof(int), cudaMemcpyDeviceToHost));
     }
@@ -5506,6 +5485,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         CUDA_CHECK(cudaMemcpy(q_pop_done.data(), host_state.perf_task_pop_done_ts, qb64, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(q_bcast_done.data(), host_state.perf_task_bcast_done_ts, qb64, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(q_task_start.data(), host_state.perf_task_start_ts, qb64, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(q_prev_end.data(), host_state.perf_task_prev_end_ts, qb64, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(q_prev_gap.data(), host_state.perf_task_prev_gap_ns, qb64, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(q_pop_attempts.data(), host_state.perf_task_pop_attempts, qb32, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(q_cas_failures.data(), host_state.perf_task_cas_failures, qb32, cudaMemcpyDeviceToHost));
@@ -5526,7 +5506,9 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
     }
     for (int t = 0; t < compute_task_count; ++t) {
-        int64_t trace_ts = compute_task[(size_t)t * NCF];
+        int64_t* rec = &compute_task[(size_t)t * NCF];
+        if (rec[26] == 0) continue;
+        int64_t trace_ts = rec[0];
         if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
     }
     for (int t = 0; t < gather_task_count; ++t) {
@@ -5871,24 +5853,24 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     fprintf(f, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":%lld}}",
             host_state.rank, (long long)base_ts);
 
-    int lch_tid_base = 0;
-    int compute_tid_base = num_logical_channels * 4;
-    const int num_compute_groups = host_state.num_compute_sms / COMPUTE_GROUP_SIZE;
-    for (int group_id = 0; group_id < num_compute_groups; ++group_id) {
-        int tid = compute_tid_base + group_id;
+    const int args_lch_tid_base = 0;
+    const int args_block_compute_tid_base = num_logical_channels * 4;
+    const int args_block_num_compute_groups = host_state.num_compute_sms / COMPUTE_GROUP_SIZE;
+    for (int group_id = 0; group_id < args_block_num_compute_groups; ++group_id) {
+        int tid = args_block_compute_tid_base + group_id;
         emit_comma();
         fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"compute_group_%d\"}}",
                 host_state.rank, tid, group_id);
     }
     {
-        int tid = compute_tid_base + num_compute_groups;
+        int tid = args_block_compute_tid_base + args_block_num_compute_groups;
         emit_comma();
         fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"gather_task\"}}",
                 host_state.rank, tid);
     }
 
     for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
-        int dispatch_sender_tid = lch_tid_base + logical_channel_id * 5;
+        int dispatch_sender_tid = args_lch_tid_base + logical_channel_id * 5;
         emit_comma();
         fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
                    "\"args\":{\"name\":\"dispatch_sender_lch_%d\"}}",
@@ -6167,7 +6149,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     };
 
     for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
-        int dispatch_sender_tid = lch_tid_base + logical_channel_id * 5;
+        int dispatch_sender_tid = args_lch_tid_base + logical_channel_id * 5;
         int64_t* dsp = &dispatch_lch_ts[(logical_channel_id * 2) * NLP];
         int64_t last_role = -1, last_slot = -1, last_work_ns = 0, last_arrive_to_release_ns = 0;
         int64_t last_recv_prefix_wait_ns = 0, last_recv_prefix_src_nvl = -1, last_recv_prefix_src_rdma = -1;
@@ -6572,6 +6554,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     }
     for (int t = 0; t < compute_task_count; ++t) {
         int64_t* rec = &compute_task[(size_t)t * NCF];
+        if (rec[26] == 0) continue;
         int64_t start = rec[0];
         int64_t end = rec[1];
         if (start == 0 || end == 0 || end <= start) continue;
@@ -6621,8 +6604,6 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         double sig_finalize_us  = phase_us(sig_donecount, sig_finalize);
         double sig_fence_us     = phase_us(sig_finalize, sig_fence);
         double sig_publish_us   = phase_us(sig_fence, sig_publish);
-        // Root-cause diagnostics: FULL UMMA per-phase breakdown (us) for up/down GEMM,
-        // so the dominant sub-step inside p3a/p4a is never a blind spot.
         auto ns_us = [](int64_t v) -> double { return v > 0 ? v / 1000.0 : 0.0; };
         int multi_expert_rows = diag_multi_rows[t];
         int task_has_multi = diag_task_has_multi[t];
@@ -6633,6 +6614,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t task_bcast_done = have_queue_diag ? q_bcast_done[queue_task_idx] : 0;
         int64_t task_start_diag = have_queue_diag ? q_task_start[queue_task_idx] : 0;
         int64_t task_prev_gap = have_queue_diag ? q_prev_gap[queue_task_idx] : 0;
+        int64_t task_prev_end = (task_start_diag != 0 && task_prev_gap != 0) ? task_start_diag - task_prev_gap : 0;
         int task_pop_attempts = have_queue_diag ? q_pop_attempts[queue_task_idx] : 0;
         int task_cas_failures = have_queue_diag ? q_cas_failures[queue_task_idx] : 0;
         int task_group_diag = have_queue_diag ? q_group_id[queue_task_idx] : -1;
@@ -6641,7 +6623,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         double pop_wait_us = phase_us(task_pop_start, task_pop_done);
         double pop_to_bcast_us = phase_us(task_pop_done, task_bcast_done);
         double bcast_to_start_us = phase_us(task_bcast_done, task_start_diag);
+        double prev_end_to_pop_start_us = phase_us(task_prev_end, task_pop_start);
+        double pop_done_to_bcast_us = pop_to_bcast_us;
+        double bcast_done_to_start_us = bcast_to_start_us;
         double prev_task_gap_us = ns_us(task_prev_gap);
+        double boundary_unattributed_us = prev_task_gap_us - prev_end_to_pop_start_us - pop_wait_us - pop_done_to_bcast_us - bcast_done_to_start_us;
+        if (boundary_unattributed_us < 0.0 && boundary_unattributed_us > -0.001)
+            boundary_unattributed_us = 0.0;
         if (!emit_perf_args) {
             emit_event("compute_task", "compute_group", start, end, pid, tid);
             continue;
@@ -6658,15 +6646,11 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                    "\"p5a_out_compute_us\":%.3f,\"p5b_out_barrier_us\":%.3f,"
                    "\"p6a_donecount_us\":%.3f,\"p6b_fp32finalize_us\":%.3f,"
                    "\"p6c_fence_us\":%.3f,\"p6d_publish_us\":%.3f,"
-                   "\"up_setup_us\":%.3f,\"up_tmem_alloc_us\":%.3f,\"up_prologue_us\":%.3f,"
-                   "\"up_tma_wait_us\":%.3f,\"up_mma_issue_us\":%.3f,\"up_mma_wait_us\":%.3f,"
-                   "\"up_loop_other_us\":%.3f,\"up_cluster_sync_us\":%.3f,\"up_epilogue_us\":%.3f,"
-                   "\"down_setup_us\":%.3f,\"down_tmem_alloc_us\":%.3f,\"down_prologue_us\":%.3f,"
-                   "\"down_tma_wait_us\":%.3f,\"down_mma_issue_us\":%.3f,\"down_mma_wait_us\":%.3f,"
-                   "\"down_loop_other_us\":%.3f,\"down_cluster_sync_us\":%.3f,\"down_epilogue_us\":%.3f,"
                    "\"queue_task_idx\":%d,\"queue_group_id\":%d,\"queue_source\":%d,\"prev_task_gap_us\":%.3f,"
                    "\"publish_to_pop_us\":%.3f,\"pop_wait_us\":%.3f,\"pop_to_bcast_us\":%.3f,"
-                   "\"bcast_to_start_us\":%.3f,\"pop_attempts\":%d,\"cas_failures\":%d,"
+                   "\"bcast_to_start_us\":%.3f,\"prev_end_to_pop_start_us\":%.3f,"
+                   "\"pop_done_to_bcast_us\":%.3f,\"bcast_done_to_start_us\":%.3f,"
+                   "\"boundary_unattributed_us\":%.3f,\"pop_attempts\":%d,\"cas_failures\":%d,"
                    "\"p6b_multi_expert_rows\":%d,\"p6_task_has_multi\":%d}}",
                 expert_id, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid, expert_id, sm_id, group_id, batch_size,
                 start_slot, end_slot, static_cast<long long>(abs_slot_base), is_flush_task,
@@ -6675,15 +6659,11 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                 up_compute_us, up_barrier_us, down_compute_us, down_barrier_us,
                 out_compute_us, out_barrier_us,
                 sig_donecount_us, sig_finalize_us, sig_fence_us, sig_publish_us,
-                ns_us(d_up_setup[t]), ns_us(d_up_tmem[t]), ns_us(d_up_prologue[t]),
-                ns_us(d_up_tma[t]), ns_us(d_up_mma_issue[t]), ns_us(d_up_mma_wait[t]),
-                ns_us(d_up_loop[t]), ns_us(d_up_csync[t]), ns_us(d_up_epi[t]),
-                ns_us(d_dn_setup[t]), ns_us(d_dn_tmem[t]), ns_us(d_dn_prologue[t]),
-                ns_us(d_dn_tma[t]), ns_us(d_dn_mma_issue[t]), ns_us(d_dn_mma_wait[t]),
-                ns_us(d_dn_loop[t]), ns_us(d_dn_csync[t]), ns_us(d_dn_epi[t]),
                 queue_task_idx, task_group_diag, task_source, prev_task_gap_us,
                 publish_to_pop_us, pop_wait_us, pop_to_bcast_us,
-                bcast_to_start_us, task_pop_attempts, task_cas_failures,
+                bcast_to_start_us, prev_end_to_pop_start_us,
+                pop_done_to_bcast_us, bcast_done_to_start_us, boundary_unattributed_us,
+                task_pop_attempts, task_cas_failures,
                 multi_expert_rows, task_has_multi);
     }
 
@@ -7778,24 +7758,6 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMalloc(p, diag_i64_bytes));
         CUDA_CHECK(cudaMemset(*p, 0, diag_i64_bytes));
     };
-    alloc_diag_i64(&host_state.perf_up_setup);
-    alloc_diag_i64(&host_state.perf_up_tmem_alloc);
-    alloc_diag_i64(&host_state.perf_up_prologue);
-    alloc_diag_i64(&host_state.perf_up_tma_wait);
-    alloc_diag_i64(&host_state.perf_up_mma_issue);
-    alloc_diag_i64(&host_state.perf_up_mma_wait);
-    alloc_diag_i64(&host_state.perf_up_loop_other);
-    alloc_diag_i64(&host_state.perf_up_cluster_sync);
-    alloc_diag_i64(&host_state.perf_up_epilogue);
-    alloc_diag_i64(&host_state.perf_down_setup);
-    alloc_diag_i64(&host_state.perf_down_tmem_alloc);
-    alloc_diag_i64(&host_state.perf_down_prologue);
-    alloc_diag_i64(&host_state.perf_down_tma_wait);
-    alloc_diag_i64(&host_state.perf_down_mma_issue);
-    alloc_diag_i64(&host_state.perf_down_mma_wait);
-    alloc_diag_i64(&host_state.perf_down_loop_other);
-    alloc_diag_i64(&host_state.perf_down_cluster_sync);
-    alloc_diag_i64(&host_state.perf_down_epilogue);
     CUDA_CHECK(cudaMalloc(&host_state.perf_compute_multi_expert_rows, diag_i32_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_compute_multi_expert_rows, 0, diag_i32_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_compute_task_has_multi, diag_i32_bytes));
@@ -7807,6 +7769,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     alloc_diag_i64(&host_state.perf_task_pop_done_ts);
     alloc_diag_i64(&host_state.perf_task_bcast_done_ts);
     alloc_diag_i64(&host_state.perf_task_start_ts);
+    alloc_diag_i64(&host_state.perf_task_prev_end_ts);
     alloc_diag_i64(&host_state.perf_task_prev_gap_ns);
     CUDA_CHECK(cudaMalloc(&host_state.perf_task_pop_attempts, diag_i32_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_task_pop_attempts, 0, diag_i32_bytes));
@@ -8106,24 +8069,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_slot));
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_ready));
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_dispatch_done));
-    CUDA_CHECK(cudaFree(host_state.perf_up_setup));
-    CUDA_CHECK(cudaFree(host_state.perf_up_tmem_alloc));
-    CUDA_CHECK(cudaFree(host_state.perf_up_prologue));
-    CUDA_CHECK(cudaFree(host_state.perf_up_tma_wait));
-    CUDA_CHECK(cudaFree(host_state.perf_up_mma_issue));
-    CUDA_CHECK(cudaFree(host_state.perf_up_mma_wait));
-    CUDA_CHECK(cudaFree(host_state.perf_up_loop_other));
-    CUDA_CHECK(cudaFree(host_state.perf_up_cluster_sync));
-    CUDA_CHECK(cudaFree(host_state.perf_up_epilogue));
-    CUDA_CHECK(cudaFree(host_state.perf_down_setup));
-    CUDA_CHECK(cudaFree(host_state.perf_down_tmem_alloc));
-    CUDA_CHECK(cudaFree(host_state.perf_down_prologue));
-    CUDA_CHECK(cudaFree(host_state.perf_down_tma_wait));
-    CUDA_CHECK(cudaFree(host_state.perf_down_mma_issue));
-    CUDA_CHECK(cudaFree(host_state.perf_down_mma_wait));
-    CUDA_CHECK(cudaFree(host_state.perf_down_loop_other));
-    CUDA_CHECK(cudaFree(host_state.perf_down_cluster_sync));
-    CUDA_CHECK(cudaFree(host_state.perf_down_epilogue));
     CUDA_CHECK(cudaFree(host_state.perf_compute_multi_expert_rows));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task_has_multi));
     CUDA_CHECK(cudaFree(host_state.perf_task_publish_ts));
@@ -8132,6 +8077,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_task_pop_done_ts));
     CUDA_CHECK(cudaFree(host_state.perf_task_bcast_done_ts));
     CUDA_CHECK(cudaFree(host_state.perf_task_start_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_task_prev_end_ts));
     CUDA_CHECK(cudaFree(host_state.perf_task_prev_gap_ns));
     CUDA_CHECK(cudaFree(host_state.perf_task_pop_attempts));
     CUDA_CHECK(cudaFree(host_state.perf_task_cas_failures));
