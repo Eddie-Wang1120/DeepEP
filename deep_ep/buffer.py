@@ -709,20 +709,20 @@ class Buffer:
                            total_sms: int = 148, stage: int = 1,
                            dispatch_config: Optional[Config] = None,
                            combine_config: Optional[Config] = None,
+                           hidden_states_scales: Optional[torch.Tensor] = None,
                            W_gateup_fp8: Optional[torch.Tensor] = None,
                            W_down_fp8: Optional[torch.Tensor] = None,
                            W_gateup_fp8_sf: Optional[torch.Tensor] = None,
-                           W_down_fp8_sf: Optional[torch.Tensor] = None,
-                           enable_fp8_compute: bool = False) -> torch.Tensor:
+                           W_down_fp8_sf: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Fused MoE MegaKernel: dispatch + TensorCore GEMM + SwiGLU + combine in a single persistent kernel.
 
         Arguments:
-            x: input tokens [num_tokens, hidden], bf16
+            x: input tokens [num_tokens, hidden], dtype decides BF16 or FP8 mode
             topk_idx: expert assignments [num_tokens, topk], int32
             topk_weights: routing weights [num_tokens, topk], float32
-            W_gateup: pairwise interleaved gate/up weights [num_local_experts, 2 * intermediate, hidden], bf16
-            W_down: down weights [num_local_experts, hidden, intermediate], bf16
+            W_gateup: pairwise interleaved gate/up weights [num_local_experts, 2 * intermediate, hidden], bf16 for BF16 mode
+            W_down: down weights [num_local_experts, hidden, intermediate], bf16 for BF16 mode
             num_experts: total number of experts across all ranks
             num_dispatch_sms: number of SMs for dispatch phase (unused, reserved)
             num_combine_sms: number of SMs for combine phase (unused, reserved)
@@ -730,11 +730,11 @@ class Buffer:
             stage: logical channels per physical channel; compiled to a C++ template specialization
             dispatch_config: DeepEP dispatch Config; defaults to get_dispatch_config(num_ranks)
             combine_config: DeepEP combine Config; defaults to get_combine_config(num_ranks)
+            hidden_states_scales: packed UE8M0 int32 scales required when x is FP8, and must be None when x is BF16
             W_gateup_fp8: optional FP8 gate/up weights stored as uint8 [num_local_experts, 2 * intermediate, hidden]
             W_down_fp8: optional FP8 down weights stored as uint8 [num_local_experts, hidden, intermediate]
             W_gateup_fp8_sf: optional packed UE8M0 scales stored as int32 [num_local_experts, 2 * intermediate, ceil(hidden / 512)]
             W_down_fp8_sf: optional packed UE8M0 scales stored as int32 [num_local_experts, hidden, ceil(intermediate / 512)]
-            enable_fp8_compute: enables FP8 state/TMA setup when all FP8 tensors are supplied
 
         Returns:
             output: [num_tokens, hidden], bf16
@@ -744,5 +744,5 @@ class Buffer:
         return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gateup, W_down,
                                               num_experts, num_dispatch_sms, num_combine_sms, total_sms,
                                               stage, dispatch_config, combine_config,
-                                              W_gateup_fp8, W_down_fp8, W_gateup_fp8_sf, W_down_fp8_sf,
-                                              enable_fp8_compute)
+                                              hidden_states_scales,
+                                              W_gateup_fp8, W_down_fp8, W_gateup_fp8_sf, W_down_fp8_sf)

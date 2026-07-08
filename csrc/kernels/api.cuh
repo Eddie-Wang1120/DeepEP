@@ -351,11 +351,16 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 // MegaKernel v7: Fused dispatch + compute + combine (persistent kernel)
 namespace megakernel {
 
+enum class ComputeDType {
+    kBF16 = 0,
+    kFP8E4M3 = 1,
+};
+
 struct MegaKernelState;
 
 MegaKernelState* allocate_megakernel_state_v7(
     const int4* x,
-    const float* x_scales,
+    const uint32_t* x_scales,
     const topk_idx_t* topk_idx,
     const float* topk_weights,
     const bool* is_token_in_rank,
@@ -368,6 +373,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     void** combine_buffer_ptrs,
     int num_tokens,
     int hidden_dim,
+    int hidden_int4,
     int intermediate_dim,
     int num_scales,
     int num_topk,
@@ -387,7 +393,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int combine_num_max_nvl_chunked_recv_tokens,
     const __nv_bfloat16* W_gateup,
     const __nv_bfloat16* W_down,
-    bool enable_fp8_compute,
+    ComputeDType compute_dtype,
     const void* W_gateup_fp8,
     const void* W_down_fp8,
     const uint32_t* W_gateup_fp8_sf,
@@ -413,6 +419,7 @@ void launch_megakernel_v7(
     int total_sms,
     int smem_size,
     int stage,
+    ComputeDType compute_dtype,
     cudaStream_t stream);
 
 }  // namespace megakernel

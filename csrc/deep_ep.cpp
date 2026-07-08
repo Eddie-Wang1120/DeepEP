@@ -1960,16 +1960,17 @@ torch::Tensor Buffer::megakernel_forward(
     int stage,
     const Config& dispatch_config,
     const Config& combine_config,
+    const pybind11::object& hidden_states_scales_obj,
     const pybind11::object& W_gateup_fp8_obj,
     const pybind11::object& W_down_fp8_obj,
     const pybind11::object& W_gateup_fp8_sf_obj,
-    const pybind11::object& W_down_fp8_sf_obj,
-    bool enable_fp8_compute) {
+    const pybind11::object& W_down_fp8_sf_obj) {
 #ifndef DISABLE_NVSHMEM
     auto optional_tensor = [](const pybind11::object& obj) -> torch::Tensor {
         if (obj.is_none()) return torch::Tensor();
         return obj.cast<torch::Tensor>();
     };
+    torch::Tensor hidden_states_scales = optional_tensor(hidden_states_scales_obj);
     torch::Tensor W_gateup_fp8 = optional_tensor(W_gateup_fp8_obj);
     torch::Tensor W_down_fp8 = optional_tensor(W_down_fp8_obj);
     torch::Tensor W_gateup_fp8_sf = optional_tensor(W_gateup_fp8_sf_obj);
@@ -1983,14 +1984,19 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
     EP_HOST_ASSERT(W_gateup.dim() == 3 and W_gateup.is_contiguous());
     EP_HOST_ASSERT(W_down.dim() == 3 and W_down.is_contiguous());
-    EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(W_gateup.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(num_experts > 0);
     EP_HOST_ASSERT(num_ranks > 0 and num_experts % num_ranks == 0);
     EP_HOST_ASSERT(stage >= 1 and stage <= 3);
+
+    const bool use_fp8_compute = x.scalar_type() == torch::kFloat8_e4m3fn;
+    EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 || use_fp8_compute);
+    EP_HOST_ASSERT(use_fp8_compute == hidden_states_scales.defined());
+    if (!use_fp8_compute) {
+        EP_HOST_ASSERT(W_gateup.scalar_type() == torch::kBFloat16);
+        EP_HOST_ASSERT(W_down.scalar_type() == torch::kBFloat16);
+    }
 
     const int num_tokens = x.size(0);
     const int hidden_dim = x.size(1);
@@ -2013,16 +2019,31 @@ torch::Tensor Buffer::megakernel_forward(
     const bool has_any_fp8_tensors = W_gateup_fp8.defined() || W_down_fp8.defined() ||
         W_gateup_fp8_sf.defined() || W_down_fp8_sf.defined();
     EP_HOST_ASSERT(!has_any_fp8_tensors || has_all_fp8_tensors);
-    const bool build_fp8_compute = enable_fp8_compute && has_all_fp8_tensors;
+    EP_HOST_ASSERT(use_fp8_compute == has_all_fp8_tensors);
+    const bool build_fp8_compute = use_fp8_compute;
     const int fp8_hidden_scale_k_packed = (hidden_dim + 128 * 4 - 1) / (128 * 4);
     const int fp8_intermediate_scale_k_packed = (intermediate_dim + 128 * 4 - 1) / (128 * 4);
+
+    const uint32_t* x_scales_ptr = nullptr;
+    int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (use_fp8_compute) {
+        EP_HOST_ASSERT(hidden_states_scales.dim() == 2 and hidden_states_scales.is_contiguous());
+        EP_HOST_ASSERT(hidden_states_scales.scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(hidden_states_scales.size(0) == num_tokens);
+        EP_HOST_ASSERT(hidden_states_scales.size(1) == fp8_hidden_scale_k_packed);
+        num_scales = static_cast<int>(hidden_states_scales.size(1));
+        x_scales_ptr = reinterpret_cast<const uint32_t*>(hidden_states_scales.data_ptr<int>());
+        scale_token_stride = static_cast<int>(hidden_states_scales.stride(0));
+        scale_hidden_stride = static_cast<int>(hidden_states_scales.stride(1));
+    }
+
     if (build_fp8_compute) {
         EP_HOST_ASSERT(W_gateup_fp8.dim() == 3 and W_gateup_fp8.is_contiguous());
         EP_HOST_ASSERT(W_down_fp8.dim() == 3 and W_down_fp8.is_contiguous());
         EP_HOST_ASSERT(W_gateup_fp8_sf.dim() == 3 and W_gateup_fp8_sf.is_contiguous());
         EP_HOST_ASSERT(W_down_fp8_sf.dim() == 3 and W_down_fp8_sf.is_contiguous());
-        EP_HOST_ASSERT(W_gateup_fp8.scalar_type() == torch::kUInt8);
-        EP_HOST_ASSERT(W_down_fp8.scalar_type() == torch::kUInt8);
+        EP_HOST_ASSERT(W_gateup_fp8.scalar_type() == torch::kUInt8 || W_gateup_fp8.scalar_type() == torch::kFloat8_e4m3fn);
+        EP_HOST_ASSERT(W_down_fp8.scalar_type() == torch::kUInt8 || W_down_fp8.scalar_type() == torch::kFloat8_e4m3fn);
         EP_HOST_ASSERT(W_gateup_fp8_sf.scalar_type() == torch::kInt32);
         EP_HOST_ASSERT(W_down_fp8_sf.scalar_type() == torch::kInt32);
         EP_HOST_ASSERT(W_gateup_fp8.size(0) == num_local_experts && W_gateup_fp8.size(1) == 2 * intermediate_dim && W_gateup_fp8.size(2) == hidden_dim);
@@ -2160,7 +2181,7 @@ torch::Tensor Buffer::megakernel_forward(
         0,  // num_worst_tokens
         num_logical_channels,
         hidden_int4,
-        0,  // num_scales (BF16, no FP8)
+        num_scales,
         num_topk + 1,  // MK-v7 uses num_topk+1 int slots (src_token_idx + topk_idx)
         1,  // expert_alignment
         rdma_channel_prefix_matrix.data_ptr<int>(),
@@ -2243,7 +2264,7 @@ torch::Tensor Buffer::megakernel_forward(
 
     auto* state = megakernel::allocate_megakernel_state_v7(
         reinterpret_cast<const int4*>(x.data_ptr()),
-        nullptr,  // x_scales (BF16 mode, no scales)
+        x_scales_ptr,
         reinterpret_cast<const topk_idx_t*>(topk_idx.data_ptr()),
         topk_weights.data_ptr<float>(),
         is_token_in_rank.data_ptr<bool>(),
@@ -2256,15 +2277,16 @@ torch::Tensor Buffer::megakernel_forward(
         combine_buffer_ptrs_gpu,
         num_tokens,
         hidden_dim,
+        hidden_int4,
         intermediate_dim,
-        0,  // num_scales (BF16)
+        num_scales,
         num_topk,
         num_experts,
         num_local_experts,
         num_ranks,
         rank,
-        0,  // scale_token_stride
-        0,  // scale_hidden_stride
+        scale_token_stride,
+        scale_hidden_stride,
         dispatch_num_max_rdma_chunked_send_tokens,
         dispatch_num_max_rdma_chunked_recv_tokens,
         dispatch_num_max_nvl_chunked_send_tokens,
@@ -2275,7 +2297,7 @@ torch::Tensor Buffer::megakernel_forward(
         combine_num_max_nvl_chunked_recv_tokens,
         reinterpret_cast<const __nv_bfloat16*>(W_gateup.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
-        build_fp8_compute,
+        use_fp8_compute ? megakernel::ComputeDType::kFP8E4M3 : megakernel::ComputeDType::kBF16,
         build_fp8_compute ? W_gateup_fp8.data_ptr() : nullptr,
         build_fp8_compute ? W_down_fp8.data_ptr() : nullptr,
         build_fp8_compute ? reinterpret_cast<const uint32_t*>(W_gateup_fp8_sf.data_ptr<int>()) : nullptr,
@@ -2308,7 +2330,10 @@ torch::Tensor Buffer::megakernel_forward(
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     printf("[MK-HOST][KERNEL][BEFORE] rank=%d state=%p total_sms=%d smem_size=%d stream=%p\n",
            rank, state, active_total_sms, smem_size, stream.stream());
-    megakernel::launch_megakernel_v7(state, active_total_sms, smem_size, stage, stream);
+    megakernel::launch_megakernel_v7(
+        state, active_total_sms, smem_size, stage,
+        use_fp8_compute ? megakernel::ComputeDType::kFP8E4M3 : megakernel::ComputeDType::kBF16,
+        stream);
     printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
 
     AT_CUDA_CHECK(cudaGetLastError());
@@ -2391,11 +2416,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("stage") = 1,
              py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
              py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
+             py::arg("hidden_states_scales") = py::none(),
              py::arg("W_gateup_fp8") = py::none(),
              py::arg("W_down_fp8") = py::none(),
              py::arg("W_gateup_fp8_sf") = py::none(),
-             py::arg("W_down_fp8_sf") = py::none(),
-             py::arg("enable_fp8_compute") = false)
+             py::arg("W_down_fp8_sf") = py::none())
 #ifdef MK_PERF_TRACE
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
 #endif
