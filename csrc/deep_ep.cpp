@@ -1959,8 +1959,22 @@ torch::Tensor Buffer::megakernel_forward(
     int total_sms,
     int stage,
     const Config& dispatch_config,
-    const Config& combine_config) {
+    const Config& combine_config,
+    const pybind11::object& W_gateup_fp8_obj,
+    const pybind11::object& W_down_fp8_obj,
+    const pybind11::object& W_gateup_fp8_sf_obj,
+    const pybind11::object& W_down_fp8_sf_obj,
+    bool enable_fp8_compute) {
 #ifndef DISABLE_NVSHMEM
+    auto optional_tensor = [](const pybind11::object& obj) -> torch::Tensor {
+        if (obj.is_none()) return torch::Tensor();
+        return obj.cast<torch::Tensor>();
+    };
+    torch::Tensor W_gateup_fp8 = optional_tensor(W_gateup_fp8_obj);
+    torch::Tensor W_down_fp8 = optional_tensor(W_down_fp8_obj);
+    torch::Tensor W_gateup_fp8_sf = optional_tensor(W_gateup_fp8_sf_obj);
+    torch::Tensor W_down_fp8_sf = optional_tensor(W_down_fp8_sf_obj);
+
     pybind11::gil_scoped_release release;
 
     // Input validation
@@ -1993,6 +2007,29 @@ torch::Tensor Buffer::megakernel_forward(
     EP_HOST_ASSERT(W_gateup.size(1) % 2 == 0);
     EP_HOST_ASSERT(W_gateup.size(2) == hidden_dim);
     EP_HOST_ASSERT(W_down.size(1) == hidden_dim and W_down.size(2) == intermediate_dim);
+
+    const bool has_all_fp8_tensors = W_gateup_fp8.defined() && W_down_fp8.defined() &&
+        W_gateup_fp8_sf.defined() && W_down_fp8_sf.defined();
+    const bool has_any_fp8_tensors = W_gateup_fp8.defined() || W_down_fp8.defined() ||
+        W_gateup_fp8_sf.defined() || W_down_fp8_sf.defined();
+    EP_HOST_ASSERT(!has_any_fp8_tensors || has_all_fp8_tensors);
+    const bool build_fp8_compute = enable_fp8_compute && has_all_fp8_tensors;
+    const int fp8_hidden_scale_k_packed = (hidden_dim + 128 * 4 - 1) / (128 * 4);
+    const int fp8_intermediate_scale_k_packed = (intermediate_dim + 128 * 4 - 1) / (128 * 4);
+    if (build_fp8_compute) {
+        EP_HOST_ASSERT(W_gateup_fp8.dim() == 3 and W_gateup_fp8.is_contiguous());
+        EP_HOST_ASSERT(W_down_fp8.dim() == 3 and W_down_fp8.is_contiguous());
+        EP_HOST_ASSERT(W_gateup_fp8_sf.dim() == 3 and W_gateup_fp8_sf.is_contiguous());
+        EP_HOST_ASSERT(W_down_fp8_sf.dim() == 3 and W_down_fp8_sf.is_contiguous());
+        EP_HOST_ASSERT(W_gateup_fp8.scalar_type() == torch::kUInt8);
+        EP_HOST_ASSERT(W_down_fp8.scalar_type() == torch::kUInt8);
+        EP_HOST_ASSERT(W_gateup_fp8_sf.scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(W_down_fp8_sf.scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(W_gateup_fp8.size(0) == num_local_experts && W_gateup_fp8.size(1) == 2 * intermediate_dim && W_gateup_fp8.size(2) == hidden_dim);
+        EP_HOST_ASSERT(W_down_fp8.size(0) == num_local_experts && W_down_fp8.size(1) == hidden_dim && W_down_fp8.size(2) == intermediate_dim);
+        EP_HOST_ASSERT(W_gateup_fp8_sf.size(0) == num_local_experts && W_gateup_fp8_sf.size(1) == 2 * intermediate_dim && W_gateup_fp8_sf.size(2) == fp8_hidden_scale_k_packed);
+        EP_HOST_ASSERT(W_down_fp8_sf.size(0) == num_local_experts && W_down_fp8_sf.size(1) == hidden_dim && W_down_fp8_sf.size(2) == fp8_intermediate_scale_k_packed);
+    }
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
     constexpr int compute_group_size = 32;
@@ -2238,6 +2275,11 @@ torch::Tensor Buffer::megakernel_forward(
         combine_num_max_nvl_chunked_recv_tokens,
         reinterpret_cast<const __nv_bfloat16*>(W_gateup.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(W_down.data_ptr()),
+        build_fp8_compute,
+        build_fp8_compute ? W_gateup_fp8.data_ptr() : nullptr,
+        build_fp8_compute ? W_down_fp8.data_ptr() : nullptr,
+        build_fp8_compute ? reinterpret_cast<const uint32_t*>(W_gateup_fp8_sf.data_ptr<int>()) : nullptr,
+        build_fp8_compute ? reinterpret_cast<const uint32_t*>(W_down_fp8_sf.data_ptr<int>()) : nullptr,
         num_dispatch_sms,
         num_forwarder_sms,
         num_compute_sms,
@@ -2348,7 +2390,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("total_sms") = 148,
              py::arg("stage") = 1,
              py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
-             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
+             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
+             py::arg("W_gateup_fp8") = py::none(),
+             py::arg("W_down_fp8") = py::none(),
+             py::arg("W_gateup_fp8_sf") = py::none(),
+             py::arg("W_down_fp8_sf") = py::none(),
+             py::arg("enable_fp8_compute") = false)
 #ifdef MK_PERF_TRACE
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
 #endif

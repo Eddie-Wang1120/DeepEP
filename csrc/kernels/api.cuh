@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 #include "configs.cuh"
@@ -386,6 +387,11 @@ MegaKernelState* allocate_megakernel_state_v7(
     int combine_num_max_nvl_chunked_recv_tokens,
     const __nv_bfloat16* W_gateup,
     const __nv_bfloat16* W_down,
+    bool enable_fp8_compute,
+    const void* W_gateup_fp8,
+    const void* W_down_fp8,
+    const uint32_t* W_gateup_fp8_sf,
+    const uint32_t* W_down_fp8_sf,
     int num_dispatch_sms,
     int num_forwarder_sms,
     int num_compute_sms,

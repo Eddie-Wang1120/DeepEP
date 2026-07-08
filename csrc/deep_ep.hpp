@@ -317,7 +317,12 @@ public:
         int total_sms,
         int stage,
         const Config& dispatch_config,
-        const Config& combine_config);
+        const Config& combine_config,
+        const pybind11::object& W_gateup_fp8,
+        const pybind11::object& W_down_fp8,
+        const pybind11::object& W_gateup_fp8_sf,
+        const pybind11::object& W_down_fp8_sf,
+        bool enable_fp8_compute);
 
 #ifdef MK_PERF_TRACE
     // Baseline perf trace state: accumulated across dispatch/combine calls, dumped on request.
