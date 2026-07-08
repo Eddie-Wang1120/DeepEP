@@ -2199,14 +2199,15 @@ __device__ void dispatch_worker_v2(
 
 __device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
     __syncthreads();
+    memory_fence_gpu();
     if (threadIdx.x == 0) {
-        int phase = ld_acquire_sys_global(&state->compute_group_phase[group_id]);
+        int phase = ld_acquire_global(&state->compute_group_phase[group_id]);
         int arrived = atomicAdd(&state->compute_group_barrier[group_id], 1) + 1;
         if (arrived == group_size) {
-            st_release_sys_global(&state->compute_group_barrier[group_id], 0);
-            st_release_sys_global(&state->compute_group_phase[group_id], phase + 1);
+            st_release_gpu_global(&state->compute_group_barrier[group_id], 0);
+            st_release_gpu_global(&state->compute_group_phase[group_id], phase + 1);
         } else {
-            while (ld_acquire_sys_global(&state->compute_group_phase[group_id]) == phase)
+            while (ld_acquire_global(&state->compute_group_phase[group_id]) == phase)
                 __nanosleep(64);
         }
     }
@@ -3141,11 +3142,11 @@ __device__ void compute_worker(
                 cas_failures += 1;
 #endif
             }
-            st_release_sys_global(&state->compute_group_task_idx[group_id], task_idx);
+            st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
         }
         compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
 
-        int task_idx = ld_acquire_sys_global(&state->compute_group_task_idx[group_id]);
+        int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
 #if MK_PERF_TRACE_ARGS
         if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
             state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
