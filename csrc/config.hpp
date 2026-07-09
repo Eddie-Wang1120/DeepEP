@@ -5,18 +5,50 @@
 
 namespace deep_ep {
 
+namespace megakernel_config {
+
+constexpr int kComputeBatchSize = 1024;  // Tokens per expert batch before triggering GEMM.
+constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
+constexpr int kComputeSchedulerSms = 2;
+constexpr int kPrioritySchedTidBegin = 576;
+constexpr int kGatherSchedTidBegin = 608;
+constexpr int kNormalSchedThreads = kPrioritySchedTidBegin;
+constexpr int kGatherSchedMaxWarps = 6;
+constexpr int kComputeClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+constexpr int kWmmaM = 16;
+constexpr int kWmmaN = 16;
+constexpr int kWmmaK = 16;
+constexpr int kTimeoutLogBudget = 8;
+constexpr int kPriorityScanWindowTokens = 128;
+constexpr int kPriorityMaxEnqueuePerLoop = 2;
+constexpr int kPriorityAlreadySkipEpochs = 64;
+constexpr int kPriorityNotReadyRetryEpochs = 8;
+constexpr int kDispatchRoleCount = 5;
+constexpr int kPubRingDepth = 128;
+constexpr int kPubConsumeBatch = 16;
+constexpr int kPubProduceBatch = 16;
+
+static_assert(kGatherSchedTidBegin >= kPrioritySchedTidBegin,
+              "gather scheduler threads must begin after priority scheduler threads");
+static_assert(kGatherSchedMaxWarps == (800 - kGatherSchedTidBegin) / 32,
+              "kGatherSchedMaxWarps must match the scheduler thread partition");
+static_assert(kComputeGroupSize > 0, "kComputeGroupSize must be positive");
+static_assert(kComputeSchedulerSms > 0, "kComputeSchedulerSms must be positive");
+
+}  // namespace megakernel_config
+
 template <typename dtype_t>
-dtype_t ceil_div(dtype_t a, dtype_t b) {
+__host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {
     return (a + b - 1) / b;
 }
 
 template <typename dtype_t>
-dtype_t align_up(dtype_t a, dtype_t b) {
+__host__ __device__ constexpr dtype_t align_up(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
 template <typename dtype_t>
-dtype_t align_down(dtype_t a, dtype_t b) {
+__host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
     return a / b * b;
 }
 
@@ -187,7 +219,7 @@ struct LowLatencyLayout {
     }
 };
 
-size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
     auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }

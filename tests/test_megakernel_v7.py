@@ -13,6 +13,7 @@ Usage (2 nodes x 8 GPUs):
              test_megakernel_v7.py
 """
 import argparse
+import contextlib
 import math
 import os
 import sys
@@ -28,10 +29,13 @@ from packaging import version
 try:
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.ops as te_ops
-    from transformer_engine.pytorch import moe_permute_with_probs, moe_unpermute
+    from transformer_engine.common import recipe as te_recipe
+    from transformer_engine.pytorch import fp8_autocast, moe_permute_with_probs, moe_unpermute
 except ImportError:
     te = None
     te_ops = None
+    te_recipe = None
+    fp8_autocast = None
     moe_permute_with_probs = None
     moe_unpermute = None
 
@@ -199,7 +203,7 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
 
 sys.path.insert(0, os.path.dirname(__file__))
 import deep_ep
-from utils import init_dist, calc_diff, create_grouped_scores
+from utils import init_dist, calc_diff
 
 
 def print_bitwise_mismatches(baseline_output, megakernel_output, rank, hidden_states=None, topk_idx=None, topk_weights=None, max_print=None):
@@ -319,26 +323,41 @@ def build_te_grouped_experts(W_gate, W_up, W_down, experts_per_rank):
     return te_ops.Sequential(fc1, scaled_act, fc2)
 
 
+def te_fp8_context(enabled):
+    if not enabled:
+        return contextlib.nullcontext()
+    if fp8_autocast is None or te_recipe is None:
+        raise RuntimeError('Transformer Engine fp8_autocast and recipe are required for FP8 TE baseline')
+    recipe = te_recipe.DelayedScaling(fp8_format=te_recipe.Format.HYBRID, amax_history_len=16, amax_compute_algo='max')
+    return fp8_autocast(enabled=True, fp8_recipe=recipe)
+
+
 def moe_compute_on_recv_te(recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list,
-                           te_experts, workspace, experts_per_rank):
-    """TE baseline aligned with sonic_te_compare_20260526: fused permute -> te_ops.Sequential -> fused unpermute."""
+                           te_experts, workspace, experts_per_rank, use_fp8=False):
+    """Megatron expert-only baseline: fused permute -> TE grouped MLP -> fused unpermute.
+
+    This mirrors Megatron-LM's production branch:
+    MoELayer.routed_experts_compute -> TEGroupedMLP -> TE GroupedLinear.
+    """
     if moe_permute_with_probs is None or moe_unpermute is None:
         raise RuntimeError('TE moe_permute_with_probs/moe_unpermute are required for --baseline-impl te')
     if not HAVE_TRITON_AVAILABLE:
         raise RuntimeError('Triton is required for local fused_indices_to_multihot with --baseline-impl te')
+    assert recv_topk_weights.dtype == torch.float32, "Megatron/DeepEP dispatcher expects fp32 router probs"
     routing_map, probs_map = fused_indices_to_multihot(
-        recv_topk_idx, recv_topk_weights.float(), experts_per_rank)
-    num_out_tokens = int(_tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device).sum().item())
+        recv_topk_idx, recv_topk_weights, experts_per_rank)
     tokens_per_expert = _tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device)
+    num_out_tokens = tokens_per_expert.sum().item()
     permuted_x, permuted_probs, row_map = moe_permute_with_probs(
-        recv_x, probs_map, routing_map, num_out_tokens)
-    permuted_output = te_experts(permuted_x, tokens_per_expert, permuted_probs, tokens_per_expert)
+        recv_x, probs_map, routing_map, num_out_tokens=num_out_tokens)
+    with te_fp8_context(use_fp8):
+        permuted_output = te_experts(permuted_x, tokens_per_expert, permuted_probs, tokens_per_expert)
     return moe_unpermute(permuted_output, row_map, restore_shape=recv_x.shape)
 
 
 def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
                           num_experts, experts_per_rank, buffer, config, local_rank, rank, no_compute,
-                          baseline_impl, te_experts=None, te_workspace=None):
+                          baseline_impl, te_experts=None, te_workspace=None, use_fp8=False):
     """
     Baseline: DeepEP dispatch -> expert compute -> DeepEP combine.
     baseline_impl='torch' keeps the original direct local-expert loop.
@@ -347,8 +366,6 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     """
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
-
-    buffer.set_num_sms(24)
 
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
@@ -374,7 +391,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
             te_workspace = {}
         combine_x = moe_compute_on_recv_te(
             recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list,
-            te_experts, te_workspace, experts_per_rank)
+            te_experts, te_workspace, experts_per_rank, use_fp8=use_fp8)
     else:
         combine_x = moe_compute_on_recv(recv_x, recv_topk_idx, recv_topk_weights,
                                         W_gate, W_up, W_down, experts_per_rank)
@@ -394,7 +411,9 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
 
 def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
-                            num_experts, buffer, local_rank, rank, stage):
+                            num_experts, buffer, local_rank, rank, stage,
+                            hidden_states_scales=None, W_gateup_fp8=None, W_down_fp8=None,
+                            W_gateup_fp8_sf=None, W_down_fp8_sf=None):
     """
     MegaKernel v7: single persistent kernel (dispatch + compute + combine fused).
     W_gateup is pairwise interleaved as [g0, u0, g1, u1, ...].
@@ -402,8 +421,7 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
     """
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
-    # SM allocation: 24 dispatch, 8 forwarder (NUM_MAX_NVL_PEERS), rest compute
-    num_dispatch_sms = 24
+    num_dispatch_sms = 48
     # total_sms = num_dispatch_sms + num_forwarder_sms + num_compute_sms
     total_sms = num_sms  # use all available SMs
 
@@ -417,13 +435,87 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
         num_dispatch_sms,
         num_dispatch_sms,  # num_combine_sms = num_dispatch_sms
         total_sms,
-        stage
+        stage,
+        hidden_states_scales=hidden_states_scales,
+        W_gateup_fp8=W_gateup_fp8,
+        W_down_fp8=W_down_fp8,
+        W_gateup_fp8_sf=W_gateup_fp8_sf,
+        W_down_fp8_sf=W_down_fp8_sf,
     )
 
     if local_rank == 0:
         print(f'[Rank {rank}] MegaKernel done: output shape={result.shape}', flush=True)
 
     return result
+
+
+def fp8_scale_k_packed(k):
+    return (k + 128 * 4 - 1) // (128 * 4)
+
+
+def make_unit_fp8_scale(shape, device):
+    return torch.full(shape, 0x7f7f7f7f, dtype=torch.int32, device=device)
+
+
+def make_fp8_megakernel_inputs(x, W_gateup, W_down, hidden, intermediate):
+    if not hasattr(torch, 'float8_e4m3fn'):
+        raise RuntimeError('torch.float8_e4m3fn is required for FP8 megakernel input tests')
+    x_fp8 = x.float().to(torch.float8_e4m3fn).contiguous()
+    W_gateup_fp8 = W_gateup.float().to(torch.float8_e4m3fn).contiguous()
+    W_down_fp8 = W_down.float().to(torch.float8_e4m3fn).contiguous()
+    hidden_scale_k = fp8_scale_k_packed(hidden)
+    intermediate_scale_k = fp8_scale_k_packed(intermediate)
+    hidden_states_scales = make_unit_fp8_scale((x.shape[0], hidden_scale_k), x.device)
+    W_gateup_fp8_sf = make_unit_fp8_scale((W_gateup.shape[0], W_gateup.shape[1], hidden_scale_k), x.device)
+    W_down_fp8_sf = make_unit_fp8_scale((W_down.shape[0], W_down.shape[1], intermediate_scale_k), x.device)
+    return x_fp8, hidden_states_scales, W_gateup_fp8, W_down_fp8, W_gateup_fp8_sf, W_down_fp8_sf
+
+
+def megatron_group_limited_topk(scores, topk, num_groups, group_topk):
+    """Match Megatron-LM group_limited_topk routing for realistic expert/node load."""
+    num_tokens, num_experts = scores.shape
+    if num_groups <= 0 or num_experts % num_groups != 0:
+        raise ValueError(f'num_groups must divide num_experts, got num_groups={num_groups}, num_experts={num_experts}')
+    if group_topk <= 0 or group_topk > num_groups:
+        raise ValueError(f'group_topk must be in [1, num_groups], got group_topk={group_topk}, num_groups={num_groups}')
+    if topk % group_topk != 0:
+        raise ValueError(f'Megatron group_limited_topk requires topk % group_topk == 0, got topk={topk}, group_topk={group_topk}')
+
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1)
+        .topk(topk // group_topk, dim=-1)[0]
+        .sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False).indices
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .reshape(num_tokens, num_experts)
+    )
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    return torch.topk(masked_scores, k=topk, dim=-1)
+
+
+def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group_topk,
+                                score_function, device):
+    """Create dense top-k routing tensors using Megatron's group-limited top-k semantics."""
+    logits = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+    if score_function == 'softmax':
+        topk_logits, topk_idx = megatron_group_limited_topk(logits, topk, num_groups, group_topk)
+        topk_weights = torch.softmax(topk_logits, dim=-1, dtype=torch.float32)
+    elif score_function in ('sigmoid', 'sqrtsoftplus'):
+        if score_function == 'sigmoid':
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = F.softplus(logits.float()).sqrt()
+        topk_weights, topk_idx = megatron_group_limited_topk(scores, topk, num_groups, group_topk)
+        if topk > 1:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    else:
+        raise ValueError(f'Unsupported router score function: {score_function}')
+    return topk_weights.contiguous(), topk_idx.to(deep_ep.topk_idx_t).contiguous()
 
 
 @dataclass(frozen=True)
@@ -464,27 +556,31 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     experts_per_rank = case.experts_per_rank
     num_experts = num_ranks * experts_per_rank
     num_topk = case.num_topk
-    num_topk_groups = num_nodes if case.num_topk_groups is None else case.num_topk_groups
+    router_num_groups = args.router_num_groups or num_nodes
+    router_group_topk = args.router_group_topk or (
+        num_nodes if case.num_topk_groups is None else case.num_topk_groups)
 
     if local_rank == 0:
         print(f'')
         print(f'[Rank {rank}] === Test case {case_idx + 1}/{num_cases} ===', flush=True)
         print(f'[Rank {rank}] Config: num_tokens={num_tokens}, hidden={hidden}, '
               f'intermediate={intermediate}, experts_per_rank={experts_per_rank}, '
-              f'topk={num_topk}, num_topk_groups={num_topk_groups}, num_ranks={num_ranks}', flush=True)
+              f'topk={num_topk}, num_ranks={num_ranks}', flush=True)
+        print(f'[Rank {rank}] Router: score_function={args.router_score_function}, '
+              f'num_groups={router_num_groups}, group_topk={router_group_topk}', flush=True)
+
+    use_fp8 = args.compute_dtype == 'fp8'
+    if use_fp8 and args.baseline_impl != 'te':
+        raise RuntimeError('--compute-dtype fp8 requires --baseline-impl te for the Megatron/TE grouped-MoE baseline')
 
     # Generate test data
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='cuda') * 0.1
 
     # Precompute Megatron-style DeepEP routing once, then feed the same token_indices/token_probs
     # to both the baseline and megakernel paths. The timed paths should not redo router topk.
-    scores = torch.randn(num_tokens, num_experts, dtype=torch.float32, device='cuda').abs() + 1
-    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
-    group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
-    masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
-    topk_weights, topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = topk_weights / topk_weights.sum(dim=1, keepdim=True)
+    topk_weights, topk_idx = make_megatron_router_inputs(
+        num_tokens, num_experts, num_topk, router_num_groups, router_group_topk,
+        args.router_score_function, 'cuda')
 
     # Expert weights (deterministic per rank)
     torch.manual_seed(1000 + rank)
@@ -496,6 +592,11 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     W_gateup[:, 1::2, :] = W_up
     W_gateup = W_gateup.contiguous()
 
+    x_fp8 = hidden_states_scales = W_gateup_fp8 = W_down_fp8 = W_gateup_fp8_sf = W_down_fp8_sf = None
+    if use_fp8:
+        x_fp8, hidden_states_scales, W_gateup_fp8, W_down_fp8, W_gateup_fp8_sf, W_down_fp8_sf = \
+            make_fp8_megakernel_inputs(x, W_gateup, W_down, hidden, intermediate)
+
     te_experts = None
     te_workspace = None
     if args.baseline_impl == 'te' and not args.skip_baseline and not args.no_compute:
@@ -506,6 +607,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     # config_num_sms = 24
     # config = deep_ep.Config(config_num_sms, 1, 256, 16, 256)
     config = None
+    buffer.set_num_sms(24)
     
 
     # --- Path A: Baseline (DeepEP dispatch + expert compute + DeepEP combine) ---
@@ -520,7 +622,7 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
             run_baseline_pipeline(
                 x, topk_idx, topk_weights, W_gate, W_up, W_down,
                 num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute,
-                args.baseline_impl, te_experts, te_workspace)
+                args.baseline_impl, te_experts, te_workspace, use_fp8=use_fp8)
         if args.warmup > 0:
             dist.barrier(group=group)
             torch.cuda.synchronize()
@@ -528,9 +630,14 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         baseline_output = run_baseline_pipeline(
             x, topk_idx, topk_weights, W_gate, W_up, W_down,
             num_experts, experts_per_rank, buffer, config, local_rank, rank, args.no_compute,
-            args.baseline_impl, te_experts, te_workspace)
+            args.baseline_impl, te_experts, te_workspace, use_fp8=use_fp8)
     elif local_rank == 0:
         print(f'[Rank {rank}] Skipping baseline; only checking megakernel_forward completion', flush=True)
+
+    if use_fp8 and not args.run_fp8_megakernel:
+        if local_rank == 0:
+            print(f'[Rank {rank}] FP8 baseline completed; skipping megakernel FP8 because the FP8 UMMA worker is not wired yet', flush=True)
+        return 0.0, 0.0, 1.0
 
     # Sync before megakernel run
     dist.barrier(group=group)
@@ -540,19 +647,30 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     if local_rank == 0:
         print(f'[Rank {rank}] Running megakernel_forward (v7)...', flush=True)
 
+    mk_x = x_fp8 if use_fp8 else x
     for w in range(args.warmup):
         if local_rank == 0:
             print(f'[Rank {rank}] MegaKernel warmup {w + 1}/{args.warmup}', flush=True)
         run_megakernel_pipeline(
-            x, topk_idx, topk_weights, W_gateup, W_down,
-            num_experts, buffer, local_rank, rank, args.stage)
+            mk_x, topk_idx, topk_weights, W_gateup, W_down,
+            num_experts, buffer, local_rank, rank, args.stage,
+            hidden_states_scales=hidden_states_scales,
+            W_gateup_fp8=W_gateup_fp8,
+            W_down_fp8=W_down_fp8,
+            W_gateup_fp8_sf=W_gateup_fp8_sf,
+            W_down_fp8_sf=W_down_fp8_sf)
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
 
     megakernel_output = run_megakernel_pipeline(
-        x, topk_idx, topk_weights, W_gateup, W_down,
-        num_experts, buffer, local_rank, rank, args.stage)
+        mk_x, topk_idx, topk_weights, W_gateup, W_down,
+        num_experts, buffer, local_rank, rank, args.stage,
+        hidden_states_scales=hidden_states_scales,
+        W_gateup_fp8=W_gateup_fp8,
+        W_down_fp8=W_down_fp8,
+        W_gateup_fp8_sf=W_gateup_fp8_sf,
+        W_down_fp8_sf=W_down_fp8_sf)
 
     if args.skip_baseline:
         if local_rank == 0:
@@ -646,8 +764,18 @@ if __name__ == '__main__':
                         help='Expert compute implementation for the baseline path')
     parser.add_argument('--warmup', type=int, default=20,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
-    parser.add_argument('--stage', type=int, default=1,
+    parser.add_argument('--stage', type=int, default=2,
                         help='Logical channels per physical channel for megakernel')
+    parser.add_argument('--compute-dtype', choices=['bf16', 'fp8'], default='bf16',
+                        help='Compute dtype path to exercise; fp8 runs the TE FP8 baseline and skips megakernel unless requested')
+    parser.add_argument('--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'], default='sigmoid',
+                        help='Megatron router score function used to precompute top-k token routing')
+    parser.add_argument('--router-num-groups', type=int, default=0,
+                        help='Megatron group_limited_topk num_groups; 0 uses the node count')
+    parser.add_argument('--router-group-topk', type=int, default=0,
+                        help='Megatron group_limited_topk group_topk; 0 uses the test case value or node count')
+    parser.add_argument('--run-fp8-megakernel', action='store_true',
+                        help='Run the current FP8 megakernel path. This is expected to trap until the FP8 UMMA worker is wired.')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 
@@ -655,6 +783,20 @@ if __name__ == '__main__':
         args.skip_baseline = True
     if os.environ.get('BASELINE_IMPL') in ('torch', 'te'):
         args.baseline_impl = os.environ['BASELINE_IMPL']
+    if os.environ.get('COMPUTE_DTYPE') in ('bf16', 'fp8'):
+        args.compute_dtype = os.environ['COMPUTE_DTYPE']
+    if os.environ.get('ROUTER_SCORE_FUNCTION') in ('sigmoid', 'softmax', 'sqrtsoftplus'):
+        args.router_score_function = os.environ['ROUTER_SCORE_FUNCTION']
+    if os.environ.get('ROUTER_NUM_GROUPS'):
+        args.router_num_groups = int(os.environ['ROUTER_NUM_GROUPS'])
+    if os.environ.get('ROUTER_GROUP_TOPK'):
+        args.router_group_topk = int(os.environ['ROUTER_GROUP_TOPK'])
+    if args.router_num_groups < 0:
+        raise ValueError('--router-num-groups must be >= 0')
+    if args.router_group_topk < 0:
+        raise ValueError('--router-group-topk must be >= 0')
+    if os.environ.get('RUN_FP8_MEGAKERNEL', '0') == '1':
+        args.run_fp8_megakernel = True
     if args.baseline_impl == 'te' and te is None:
         raise RuntimeError('--baseline-impl te requires transformer_engine to be installed')
 

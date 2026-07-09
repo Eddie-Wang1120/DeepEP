@@ -2053,11 +2053,11 @@ torch::Tensor Buffer::megakernel_forward(
     }
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
-    constexpr int compute_group_size = 32;
-    constexpr int compute_cluster_dim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
-    // Scheduler region keeps 2 SMs for layout compatibility; only scheduler SM #0
+    constexpr int compute_group_size = megakernel_config::kComputeGroupSize;
+    constexpr int compute_cluster_dim = megakernel_config::kComputeClusterDim;
+    // Scheduler region keeps fixed SMs for layout compatibility; only scheduler SM #0
     // does work today, #1 idles (see compute_scheduler_worker gating in megakernel.cu).
-    constexpr int compute_scheduler_sms = 2;
+    constexpr int compute_scheduler_sms = megakernel_config::kComputeSchedulerSms;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;

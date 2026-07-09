@@ -19,6 +19,7 @@
  *   - Flush: dispatch_done flag -> compute processes tail < 128
  */
 
+#include "../config.hpp"
 #include "api.cuh"
 #include "buffer.cuh"
 #include "configs.cuh"
@@ -47,30 +48,26 @@ namespace megakernel {
 // Configuration
 // ============================================================================
 
-constexpr int COMPUTE_BATCH_SIZE = 1024;  // Tokens per expert batch before triggering GEMM; UMMA paths use fixed padded M=COMPUTE_BATCH_SIZE.
-constexpr int COMPUTE_GROUP_SIZE = 32;   // SMs cooperating on one expert batch
-constexpr int COMPUTE_SCHEDULER_SMS = 2;
-constexpr int PRIORITY_SCHED_TID_BEGIN = 576; // one warp per scheduler CTA handles combine-order priority batches
-constexpr int GATHER_SCHED_TID_BEGIN = 608;   // tid >= this builds gather tasks
-constexpr int NORMAL_SCHED_THREADS = PRIORITY_SCHED_TID_BEGIN;
-constexpr int GATHER_SCHED_MAX_WARPS = 6;     // 192 gather-scheduler threads / 32 lanes
-constexpr int MK_COMPUTE_CLUSTER_DIM = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
-constexpr int WMMA_M = 16;
-constexpr int WMMA_N = 16;
-constexpr int WMMA_K = 16;
-constexpr int MK_TIMEOUT_LOG_BUDGET = 8;
-constexpr int MK_PRIORITY_SCAN_WINDOW_TOKENS = 128;
-constexpr int MK_PRIORITY_MAX_ENQUEUE_PER_LOOP = 2;
-constexpr int MK_PRIORITY_ALREADY_SKIP_EPOCHS = 64;
-constexpr int MK_PRIORITY_NOT_READY_RETRY_EPOCHS = 8;
-constexpr int MK_DISPATCH_ROLE_COUNT = 5;
-// Publish-offload (dispatch->compute bridge). NVL receiver enqueues recv_token_idx
-// into a per-receiver-warp SPSC ring; a dedicated publisher warp consumes it and
-// does topk scan / slot alloc / ready publish off the receive critical path.
-// Stage 1 only allocates the backing state; no logic consumes it yet.
-constexpr int PUB_RING_DEPTH = 64;
-constexpr int PUB_CONSUME_BATCH = 8;
-constexpr int PUB_PRODUCE_BATCH = 8;
+constexpr int COMPUTE_BATCH_SIZE = megakernel_config::kComputeBatchSize;
+constexpr int COMPUTE_GROUP_SIZE = megakernel_config::kComputeGroupSize;
+constexpr int COMPUTE_SCHEDULER_SMS = megakernel_config::kComputeSchedulerSms;
+constexpr int PRIORITY_SCHED_TID_BEGIN = megakernel_config::kPrioritySchedTidBegin;
+constexpr int GATHER_SCHED_TID_BEGIN = megakernel_config::kGatherSchedTidBegin;
+constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
+constexpr int GATHER_SCHED_MAX_WARPS = megakernel_config::kGatherSchedMaxWarps;
+constexpr int MK_COMPUTE_CLUSTER_DIM = megakernel_config::kComputeClusterDim;
+constexpr int WMMA_M = megakernel_config::kWmmaM;
+constexpr int WMMA_N = megakernel_config::kWmmaN;
+constexpr int WMMA_K = megakernel_config::kWmmaK;
+constexpr int MK_TIMEOUT_LOG_BUDGET = megakernel_config::kTimeoutLogBudget;
+constexpr int MK_PRIORITY_SCAN_WINDOW_TOKENS = megakernel_config::kPriorityScanWindowTokens;
+constexpr int MK_PRIORITY_MAX_ENQUEUE_PER_LOOP = megakernel_config::kPriorityMaxEnqueuePerLoop;
+constexpr int MK_PRIORITY_ALREADY_SKIP_EPOCHS = megakernel_config::kPriorityAlreadySkipEpochs;
+constexpr int MK_PRIORITY_NOT_READY_RETRY_EPOCHS = megakernel_config::kPriorityNotReadyRetryEpochs;
+constexpr int MK_DISPATCH_ROLE_COUNT = megakernel_config::kDispatchRoleCount;
+constexpr int PUB_RING_DEPTH = megakernel_config::kPubRingDepth;
+constexpr int PUB_CONSUME_BATCH = megakernel_config::kPubConsumeBatch;
+constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
 #ifndef MK_ASYNC_PUBLISH
 #define MK_ASYNC_PUBLISH 0
 #endif
@@ -227,10 +224,6 @@ struct MegaKernelState {
     int* combine_done_count;            // atomic: how many combine SMs have fully finished
     int* combine_all_done;              // flag: 1 once all combine SMs finished; gather SMs poll this to exit
 
-    // --- Compute state ---
-    int* compute_done_count;          // Atomic: how many experts have finished compute
-    int* expert_compute_cursor;       // [num_local_experts] — how many tokens already computed
-
     // --- Expert weights ---
     const __nv_bfloat16* W_gateup;    // [num_local_experts, 2 * intermediate, hidden], rows [g0,u0,...]
     const __nv_bfloat16* W_down;      // [num_local_experts, hidden, intermediate]
@@ -266,7 +259,6 @@ struct MegaKernelState {
     __nv_bfloat16* combine_input;     // [max_total_recv_tokens, hidden] DeepEP compact recv-token namespace
     float* combine_input_topk_weights; // [max_total_recv_tokens, num_topk] DeepEP compact recv-token namespace
     internode::SourceMeta* combine_input_src_meta; // [max_total_recv_tokens] DeepEP compact recv-token namespace
-    int* combine_notify_done;         // Atomic flag: combine head metadata has been normalized
     int* combine_rdma_head_work;      // [num_combined_tokens, kNumRDMARanks] normalized combine RDMA heads
     int* combine_nvl_head_work;       // [num_tokens upper bound, NUM_MAX_NVL_PEERS] normalized combine NVL heads
     __nv_bfloat16* gemm_workspace;    // Scratch for gate/up intermediate results
@@ -303,9 +295,6 @@ struct MegaKernelState {
     int num_combine_sms;                      // Must be even (even/odd SM pairing)
     int num_combine_channels;                 // = num_combine_sms / 2
     int num_logical_channels;                 // Logical channel count for dispatch/compute/combine overlap
-
-    // --- Combine signaling (per-expert completion from compute) ---
-    int* expert_compute_done;                 // [num_local_experts] per-expert done flag
 
     // --- Compute dimensions ---
     int hidden_dim;
@@ -1922,7 +1911,6 @@ __device__ void dispatch_worker_v2(
                 if (lane_id == 0)
                     state->pending_meta[recv_token_idx] = meta;
                 __syncwarp();
-                __threadfence();
                 if (lane_id == 0) {
                     while (producer_tail - ld_acquire_global(&state->pub_ring_head[pub_warp_idx]) >= PUB_RING_DEPTH)
                         __nanosleep(32);
@@ -6789,8 +6777,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* recv_token_source_info;
     float* recv_token_route_weights;
     internode::SourceMeta* recv_src_meta;
-    int* compute_done_count;
-    int* expert_compute_cursor;
     int* compute_group_barrier;
     int* compute_group_phase;
     ComputeTask* compute_tasks;
@@ -6804,7 +6790,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     __nv_bfloat16* combine_input;
     float* combine_input_topk_weights;
     internode::SourceMeta* combine_input_src_meta;
-    int* combine_notify_done;
     int* combine_rdma_head_work;
     int* combine_nvl_head_work;
     __nv_bfloat16* gemm_workspace;
@@ -6877,10 +6862,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&recv_src_meta, total_expert_slots * sizeof(internode::SourceMeta)));
 
     // Compute state
-    CUDA_CHECK(cudaMalloc(&compute_done_count, sizeof(int)));
-    CUDA_CHECK(cudaMemset(compute_done_count, 0, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&expert_compute_cursor, num_local_experts * sizeof(int)));
-    CUDA_CHECK(cudaMemset(expert_compute_cursor, 0, num_local_experts * sizeof(int)));
     int num_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
     EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_compute_sms == num_compute_groups * COMPUTE_GROUP_SIZE);
@@ -6946,11 +6927,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(combine_done_count, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&combine_all_done, sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_all_done, 0, sizeof(int)));
-    // Combine per-expert completion signals
-    int* expert_compute_done;
-    CUDA_CHECK(cudaMalloc(&expert_compute_done, num_local_experts * sizeof(int)));
-    CUDA_CHECK(cudaMemset(expert_compute_done, 0, num_local_experts * sizeof(int)));
-
     // Publish-offload backing state (Stage 1: allocate + zero only, no consumer yet).
     // num_pub_warps_total = one publisher per NVL receiver warp per receiver SM.
     const int num_pub_warps_total = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS;
@@ -6987,8 +6963,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&combine_input_topk_weights, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMemset(combine_input_topk_weights, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&combine_input_src_meta, (size_t)max_total_recv_tokens * sizeof(internode::SourceMeta)));
-    CUDA_CHECK(cudaMalloc(&combine_notify_done, sizeof(int)));
-    CUDA_CHECK(cudaMemset(combine_notify_done, 0, sizeof(int)));
 
     // Per-token compute signaling
     int* token_compute_expected;
@@ -7262,8 +7236,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.recv_src_meta = recv_src_meta;
 
     // Compute state
-    host_state.compute_done_count = compute_done_count;
-    host_state.expert_compute_cursor = expert_compute_cursor;
     host_state.compute_group_barrier = compute_group_barrier;
     host_state.compute_group_phase = compute_group_phase;
     host_state.compute_tasks = compute_tasks;
@@ -7328,7 +7300,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.combine_input = combine_input;
     host_state.combine_input_topk_weights = combine_input_topk_weights;
     host_state.combine_input_src_meta = combine_input_src_meta;
-    host_state.combine_notify_done = combine_notify_done;
     host_state.combine_rdma_head_work = combine_rdma_head_work;
     host_state.combine_nvl_head_work = combine_nvl_head_work;
     host_state.gemm_workspace = gemm_workspace;
@@ -7361,7 +7332,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.num_combine_sms = num_combine_sms;
     host_state.num_combine_channels = num_combine_channels;
     host_state.num_logical_channels = num_logical_channels;
-    host_state.expert_compute_done = expert_compute_done;
     host_state.token_compute_expected = token_compute_expected;
     host_state.compute_output_slot = compute_output_slot;
     host_state.token_nhits = token_nhits;
@@ -7883,9 +7853,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.recv_token_source_info));
     CUDA_CHECK(cudaFree(host_state.recv_token_route_weights));
     CUDA_CHECK(cudaFree(host_state.recv_src_meta));
-    CUDA_CHECK(cudaFree(host_state.compute_done_count));
-    CUDA_CHECK(cudaFree(host_state.expert_compute_cursor));
-    CUDA_CHECK(cudaFree(host_state.expert_compute_done));
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
@@ -7935,7 +7902,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.combine_input));
     CUDA_CHECK(cudaFree(host_state.combine_input_topk_weights));
     CUDA_CHECK(cudaFree(host_state.combine_input_src_meta));
-    CUDA_CHECK(cudaFree(host_state.combine_notify_done));
     CUDA_CHECK(cudaFree(host_state.combine_rdma_head_work));
     CUDA_CHECK(cudaFree(host_state.combine_nvl_head_work));
     CUDA_CHECK(cudaFree(host_state.gemm_workspace));

@@ -199,7 +199,7 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
 
 sys.path.insert(0, os.path.dirname(__file__))
 import deep_ep
-from utils import init_dist, calc_diff, create_grouped_scores
+from utils import init_dist, calc_diff
 
 
 def print_bitwise_mismatches(baseline_output, megakernel_output, rank, hidden_states=None, topk_idx=None, topk_weights=None, max_print=None):
@@ -348,7 +348,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
-    buffer.set_num_sms(24)
+    buffer.set_num_sms(64)
 
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
@@ -394,7 +394,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 
 
 def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
-                            num_experts, buffer, config, local_rank, rank):
+                            num_experts, buffer, config, local_rank, rank, stage):
     """
     MegaKernel v7: single persistent kernel (dispatch + compute + combine fused).
     W_gateup is pairwise interleaved as [g0, u0, g1, u1, ...].
@@ -408,7 +408,7 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
     total_sms = num_sms  # use all available SMs
 
     if local_rank == 0:
-        print(f'[Rank {rank}] MegaKernel launch: total_sms={total_sms}, dispatch={num_dispatch_sms}', flush=True)
+        print(f'[Rank {rank}] MegaKernel launch: total_sms={total_sms}, dispatch={num_dispatch_sms}, stage={stage}', flush=True)
 
     result = buffer.megakernel_forward(
         x, topk_idx, topk_weights,
@@ -417,6 +417,7 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
         num_dispatch_sms,
         num_dispatch_sms,  # num_combine_sms = num_dispatch_sms
         total_sms,
+        stage,
         dispatch_config=config,
         combine_config=config
     )
@@ -425,6 +426,53 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
         print(f'[Rank {rank}] MegaKernel done: output shape={result.shape}', flush=True)
 
     return result
+
+
+def megatron_group_limited_topk(scores, topk, num_groups, group_topk):
+    """Match Megatron-LM group_limited_topk routing for realistic expert/node load."""
+    num_tokens, num_experts = scores.shape
+    if num_groups <= 0 or num_experts % num_groups != 0:
+        raise ValueError(f'num_groups must divide num_experts, got num_groups={num_groups}, num_experts={num_experts}')
+    if group_topk <= 0 or group_topk > num_groups:
+        raise ValueError(f'group_topk must be in [1, num_groups], got group_topk={group_topk}, num_groups={num_groups}')
+    if topk % group_topk != 0:
+        raise ValueError(f'Megatron group_limited_topk requires topk % group_topk == 0, got topk={topk}, group_topk={group_topk}')
+
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1)
+        .topk(topk // group_topk, dim=-1)[0]
+        .sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False).indices
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .reshape(num_tokens, num_experts)
+    )
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    return torch.topk(masked_scores, k=topk, dim=-1)
+
+
+def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group_topk,
+                                score_function, device):
+    """Create dense top-k routing tensors using Megatron's group-limited top-k semantics."""
+    logits = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+    if score_function == 'softmax':
+        topk_logits, topk_idx = megatron_group_limited_topk(logits, topk, num_groups, group_topk)
+        topk_weights = torch.softmax(topk_logits, dim=-1, dtype=torch.float32)
+    elif score_function in ('sigmoid', 'sqrtsoftplus'):
+        if score_function == 'sigmoid':
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = F.softplus(logits.float()).sqrt()
+        topk_weights, topk_idx = megatron_group_limited_topk(scores, topk, num_groups, group_topk)
+        if topk > 1:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    else:
+        raise ValueError(f'Unsupported router score function: {score_function}')
+    return topk_weights.contiguous(), topk_idx.to(deep_ep.topk_idx_t).contiguous()
 
 
 @dataclass(frozen=True)
@@ -447,7 +495,7 @@ TEST_CASES = [
     # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6),
-    test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6),
+    test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # Add more cases here, for example:
     # test(num_tokens=8192, hidden=256, intermediate=256, experts_per_rank=8, num_topk=2),
 ]
@@ -466,27 +514,27 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
     experts_per_rank = case.experts_per_rank
     num_experts = num_ranks * experts_per_rank
     num_topk = case.num_topk
-    num_topk_groups = num_nodes if case.num_topk_groups is None else case.num_topk_groups
+    router_num_groups = args.router_num_groups or num_nodes
+    router_group_topk = args.router_group_topk or (
+        num_nodes if case.num_topk_groups is None else case.num_topk_groups)
 
     if local_rank == 0:
         print(f'')
         print(f'[Rank {rank}] === Test case {case_idx + 1}/{num_cases} ===', flush=True)
         print(f'[Rank {rank}] Config: num_tokens={num_tokens}, hidden={hidden}, '
               f'intermediate={intermediate}, experts_per_rank={experts_per_rank}, '
-              f'topk={num_topk}, num_topk_groups={num_topk_groups}, num_ranks={num_ranks}', flush=True)
+              f'topk={num_topk}, num_ranks={num_ranks}', flush=True)
+        print(f'[Rank {rank}] Router: score_function={args.router_score_function}, '
+              f'num_groups={router_num_groups}, group_topk={router_group_topk}', flush=True)
 
     # Generate test data
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device='cuda') * 0.1
 
     # Precompute Megatron-style DeepEP routing once, then feed the same token_indices/token_probs
     # to both the baseline and megakernel paths. The timed paths should not redo router topk.
-    scores = torch.randn(num_tokens, num_experts, dtype=torch.float32, device='cuda').abs() + 1
-    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
-    group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
-    masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
-    topk_weights, topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = topk_weights / topk_weights.sum(dim=1, keepdim=True)
+    topk_weights, topk_idx = make_megatron_router_inputs(
+        num_tokens, num_experts, num_topk, router_num_groups, router_group_topk,
+        args.router_score_function, 'cuda')
 
     # Expert weights (deterministic per rank)
     torch.manual_seed(1000 + rank)
@@ -547,14 +595,14 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
             print(f'[Rank {rank}] MegaKernel warmup {w + 1}/{args.warmup}', flush=True)
         run_megakernel_pipeline(
             x, topk_idx, topk_weights, W_gateup, W_down,
-            num_experts, buffer, config, local_rank, rank)
+            num_experts, buffer, config, local_rank, rank, args.stage)
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
 
     megakernel_output = run_megakernel_pipeline(
         x, topk_idx, topk_weights, W_gateup, W_down,
-        num_experts, buffer, config, local_rank, rank)
+        num_experts, buffer, config, local_rank, rank, args.stage)
 
     if args.skip_baseline:
         if local_rank == 0:
@@ -648,6 +696,14 @@ if __name__ == '__main__':
                         help='Expert compute implementation for the baseline path')
     parser.add_argument('--warmup', type=int, default=20,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
+    parser.add_argument('--stage', type=int, default=2,
+                        help='Logical channels per physical channel for megakernel')
+    parser.add_argument('--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'], default='sigmoid',
+                        help='Megatron router score function used to precompute top-k token routing')
+    parser.add_argument('--router-num-groups', type=int, default=0,
+                        help='Megatron group_limited_topk num_groups; 0 uses the node count')
+    parser.add_argument('--router-group-topk', type=int, default=0,
+                        help='Megatron group_limited_topk group_topk; 0 uses the test case value or node count')
     parser.add_argument('--mpirun', action='store_true', help='Direct launch mode via mpirun (one process per GPU)')
     args = parser.parse_args()
 
@@ -655,6 +711,20 @@ if __name__ == '__main__':
         args.skip_baseline = True
     if os.environ.get('BASELINE_IMPL') in ('torch', 'te'):
         args.baseline_impl = os.environ['BASELINE_IMPL']
+    if os.environ.get('STAGE'):
+        args.stage = int(os.environ['STAGE'])
+    if os.environ.get('ROUTER_SCORE_FUNCTION') in ('sigmoid', 'softmax', 'sqrtsoftplus'):
+        args.router_score_function = os.environ['ROUTER_SCORE_FUNCTION']
+    if os.environ.get('ROUTER_NUM_GROUPS'):
+        args.router_num_groups = int(os.environ['ROUTER_NUM_GROUPS'])
+    if os.environ.get('ROUTER_GROUP_TOPK'):
+        args.router_group_topk = int(os.environ['ROUTER_GROUP_TOPK'])
+    if args.stage <= 0:
+        raise ValueError('--stage must be > 0')
+    if args.router_num_groups < 0:
+        raise ValueError('--router-num-groups must be >= 0')
+    if args.router_group_topk < 0:
+        raise ValueError('--router-group-topk must be >= 0')
     if args.baseline_impl == 'te' and te is None:
         raise RuntimeError('--baseline-impl te requires transformer_engine to be installed')
 
