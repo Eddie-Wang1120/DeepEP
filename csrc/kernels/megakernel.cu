@@ -551,6 +551,60 @@ struct MegaKernelState {
 #endif
 };
 
+__device__ __forceinline__ bool mk_debug_bad_float(float v) {
+    return v != v || v > 3.402823466e38f || v < -3.402823466e38f;
+}
+
+__device__ __forceinline__ bool mk_debug_check_bf16_matrix(
+    const char* stage,
+    const __nv_bfloat16* buf,
+    int rows,
+    int cols,
+    int stride,
+    int rank,
+    int sm_id,
+    int block_id,
+    int group_id,
+    int group_sm_idx,
+    int task_idx,
+    int expert_id) {
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            float v = __bfloat162float(buf[(int64_t)row * stride + col]);
+            if (mk_debug_bad_float(v)) {
+                printf("[MK-NAN][%s] rank=%d block=%d sm=%d group=%d gsm=%d task=%d expert=%d row=%d col=%d v=%f\n",
+                       stage, rank, block_id, sm_id, group_id, group_sm_idx, task_idx, expert_id, row, col, v);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool mk_debug_check_float_vector(
+    const char* stage,
+    const float* buf,
+    int count,
+    int rank,
+    int sm_id,
+    int block_id,
+    int group_id,
+    int group_sm_idx,
+    int task_idx,
+    int expert_id) {
+    for (int i = 0; i < count; ++i) {
+        float v = buf[i];
+        if (mk_debug_bad_float(v)) {
+            printf("[MK-NAN][%s] rank=%d block=%d sm=%d group=%d gsm=%d task=%d expert=%d idx=%d v=%f\n",
+                   stage, rank, block_id, sm_id, group_id, group_sm_idx, task_idx, expert_id, i, v);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// FP8 routing helpers
 // ============================================================================
 // Device GEMM using wmma (for compute phase)
 // ============================================================================
@@ -1028,7 +1082,35 @@ __device__ void publish_worker_v2(int dispatch_sm_idx, int src_nvl_rank, MegaKer
 }
 #endif
 
-template <int kNumRDMARanks, int kStage>
+__device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
+    EP_DEVICE_ASSERT(group_size > 0 && group_size <= COMPUTE_GROUP_SIZE);
+    EP_DEVICE_ASSERT(group_id >= 0 && group_id < state->num_compute_groups);
+    __syncthreads();
+    memory_fence_gpu();
+    if (threadIdx.x == 0) {
+        int phase = ld_acquire_global(&state->compute_group_phase[group_id]);
+        int arrived = atomicAdd(&state->compute_group_barrier[group_id], 1) + 1;
+        if (arrived == group_size) {
+            st_release_gpu_global(&state->compute_group_barrier[group_id], 0);
+            st_release_gpu_global(&state->compute_group_phase[group_id], phase + 1);
+        } else {
+            while (ld_acquire_global(&state->compute_group_phase[group_id]) == phase)
+                __nanosleep(64);
+        }
+    }
+    __syncthreads();
+}
+
+template <ComputeDType kComputeDType>
+__device__ void compute_worker(
+    int sm_id,
+    int compute_sm_idx,
+    int num_compute_sms,
+    MegaKernelState* state,
+    uint8_t* smem_buffer
+);
+
+template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 __device__ void dispatch_worker_v2(
     int sm_id,
     int dispatch_sm_idx,  // 0-based index among all dispatch SMs
@@ -1039,6 +1121,7 @@ __device__ void dispatch_worker_v2(
     const auto num_sms = state->num_dispatch_sms;
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
     const auto num_channels = state->num_dispatch_channels, channel_id = sm_id / 2;
     constexpr int num_logical_channels_per_physical = kStage;
     const int num_logical_channels = num_channels * num_logical_channels_per_physical;
@@ -1050,21 +1133,21 @@ __device__ void dispatch_worker_v2(
         printf("rank: %d, sm_id: %d, dispatch_sm_idx: %d num_channels: %d num_logical_channels: %d \n", state->rank, sm_id, dispatch_sm_idx, num_channels, num_logical_channels);
     }
 
-    EP_DEVICE_ASSERT(num_warps >= kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
+    constexpr int kDispatchWorkerWarps = kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS;
+    EP_DEVICE_ASSERT(num_warps >= kDispatchWorkerWarps);
 #if MK_ASYNC_PUBLISH
-    EP_DEVICE_ASSERT(num_warps >= kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS * 2);
+    EP_DEVICE_ASSERT(num_warps >= kDispatchWorkerWarps + NUM_MAX_NVL_PEERS);
 
-    if (!is_forwarder && warp_id >= kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS &&
-        warp_id < kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS + NUM_MAX_NVL_PEERS) {
-        const int publisher_slot = warp_id - (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
+    if (!is_forwarder && warp_id >= kDispatchWorkerWarps &&
+        warp_id < kDispatchWorkerWarps + NUM_MAX_NVL_PEERS) {
+        const int publisher_slot = warp_id - kDispatchWorkerWarps;
         const int paired_receiver_warp = kNumDispatchRDMASenderWarps + 1 + publisher_slot;
         const int src_nvl_rank = (paired_receiver_warp + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS;
         publish_worker_v2(dispatch_sm_idx, src_nvl_rank, state);
-        return;
     }
 #endif
-    if (warp_id >= kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS)
-        return;
+    const bool dispatch_thread_active = warp_id < kDispatchWorkerWarps;
+    if (dispatch_thread_active) {
 
     // Warp role assignment (same as DeepEP internode.cu L494-508)
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
@@ -1157,8 +1240,7 @@ __device__ void dispatch_worker_v2(
     auto sync_rdma_sender_smem = []() { asm volatile("barrier.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
 
     // TMA stuffs
-    extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-    auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
+    auto tma_buffer = smem_buffer + target_rank * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
     uint32_t tma_phase = 0;
 #if MK_PERF_TRACE_ARGS
@@ -2179,28 +2261,576 @@ __device__ void dispatch_worker_v2(
 #endif
 
     }
+
+    }
+
+    // Extra dispatch CTA warps can reach this point while the active dispatch warps
+    // are still using named barriers 0/1/2. Use a separate barrier id for the
+    // whole-CTA handoff into compute so the two protocols never share a live barrier.
+    asm volatile("barrier.sync 15, %0;" :: "r"(num_threads));
+
+    // const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
+    // const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
+    // compute_worker<kComputeDType>(sm_id, reused_compute_sm_idx, total_compute_sms_after_dispatch, state, smem_buffer);
+    // return;
+
+// #if 0
+    auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
+
+    // const int thread_id = threadIdx.x;
+    const int local_warp_id = thread_id / 32;
+    const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
+    const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
+    const int group_id = reused_compute_sm_idx / COMPUTE_GROUP_SIZE;
+    const int group_first_sm_idx = group_id * COMPUTE_GROUP_SIZE;
+    const int group_size = min(COMPUTE_GROUP_SIZE, total_compute_sms_after_dispatch - group_first_sm_idx);
+    const int num_compute_groups = state->num_compute_groups;
+    if (group_size <= 0 || group_id >= num_compute_groups)
+        return;
+    const int group_sm_idx = reused_compute_sm_idx - group_first_sm_idx;
+    const int num_warps_per_sm = blockDim.x / 32;
+    const int group_warp_id = group_sm_idx * num_warps_per_sm + local_warp_id;
+    const int group_num_warps = group_size * num_warps_per_sm;
+    const int group_thread_id = group_sm_idx * blockDim.x + thread_id;
+    const int group_num_threads = group_size * blockDim.x;
+    const int num_local_experts = state->num_local_experts;
+    const int max_tpe = state->max_tokens_per_expert;
+    const int hidden = state->hidden_dim;
+    const int intermediate = state->intermediate_dim;
+    const int num_topk = state->num_topk;
+
+    // Per-SM global-memory workspace for batched GEMM intermediates.
+    // Full batches use M=128. Tail batches use the same path with rows [batch_size,128)
+    // zero-filled so WMMA M tiles never read past valid token rows.
+    const int padded_m = COMPUTE_BATCH_SIZE;
+    const int input_stride = padded_m * hidden;
+    const int gu_stride   = padded_m * (2 * intermediate);   // reserved GU scratch [M,2I]
+    const int act_stride  = padded_m * intermediate;         // interleaved SwiGLU epilogue result (down A)
+    const int down_stride = padded_m * hidden;
+    const int gemm_stride = input_stride + gu_stride + act_stride + down_stride;
+    __nv_bfloat16* input_buf = state->gemm_workspace + group_id * gemm_stride;
+    __nv_bfloat16* gu_buf   = input_buf + input_stride;   // reserved GU scratch [M,2I]
+    __nv_bfloat16* up_buf   = gu_buf + gu_stride;         // act = silu(gate)*up*route_w (down-proj A operand)
+    __nv_bfloat16* down_buf = up_buf + act_stride;
+
+    using ComputeUmmaSmemLayout = umma::DgSmemLayout<umma::kDgRunMulticast>;
+    constexpr size_t kComputeUmmaBarrierBytes =
+        (ComputeUmmaSmemLayout::kNumStages * 3 + ComputeUmmaSmemLayout::kNumEpilogueStages * 2 + 1) *
+        sizeof(cutlass::arch::ClusterTransactionBarrier) + sizeof(uint32_t);
+    constexpr size_t kComputeUmmaScratchBytes =
+        ComputeUmmaSmemLayout::SMEM_CD_SIZE +
+        ComputeUmmaSmemLayout::kNumStages *
+            (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
+        kComputeUmmaBarrierBytes;
+    constexpr size_t kComputeWmmaScratchBytes =
+        (kNumCombineForwarderWarps + 1) * 2 * WMMA_M * WMMA_N * sizeof(float);
+    constexpr size_t kComputeScratchBytes =
+        kComputeWmmaScratchBytes > kComputeUmmaScratchBytes ? kComputeWmmaScratchBytes : kComputeUmmaScratchBytes;
+    constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
+
+    constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
+    constexpr size_t kRouteWOffset =
+        (kComputeMetaOffset + kRecvTokenIdxBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
+
+    uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
+    int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
+    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem + kRecvTokenIdxBytes);
+
+    // Per-row route weight, gathered once and consumed inside the fused
+    // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
+    float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
+
+    // TMEM alloc-once flag: first UMMA call allocates, subsequent calls reuse.
+    bool umma_tmem_allocated = false;
+#if MK_PERF_TRACE_ARGS
+    int64_t last_task_end_ns = 0;
+#endif
+
+    // if (group_sm_idx == 0 && thread_id == 0) {
+    //     printf("jinheng debug: enter here blockIdx.x:%d\n", blockIdx.x);
+    // }
+
+    while (true) {
+#if MK_PERF_TRACE_ARGS
+        int64_t pop_start_ns = 0;
+        int64_t pop_done_ns = 0;
+        int pop_attempts = 0;
+        int cas_failures = 0;
+#endif
+        if (group_sm_idx == 0 && thread_id == 0) {
+            int task_idx = -1;
+#if MK_PERF_TRACE_ARGS
+            pop_start_ns = globaltimer_ns();
+#endif
+            while (true) {
+                int head = ld_acquire_global(state->compute_task_head);
+                int tail = ld_acquire_global(state->compute_task_tail);
+                if (head >= tail) {
+                    if (ld_acquire_global(state->compute_enqueue_done))
+                        task_idx = -2;
+                    break;
+                }
+                if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
+                    task_idx = head;
+#if MK_PERF_TRACE_ARGS
+                    pop_done_ns = globaltimer_ns();
+                    if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
+                        state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
+                        state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
+                        state->perf_task_pop_attempts[task_idx] = pop_attempts;
+                        state->perf_task_cas_failures[task_idx] = cas_failures;
+                        state->perf_task_group_id[task_idx] = group_id;
+                    }
+#endif
+                    break;
+                }
+#if MK_PERF_TRACE_ARGS
+                cas_failures += 1;
+#endif
+            }
+            st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
+        }
+        compute_group_sync(state, group_id, group_size);
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v2 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+        int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
+#if MK_PERF_TRACE_ARGS
+        if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
+            state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
+#endif
+        if (task_idx == -2) {
+            // Dealloc TMEM before exiting the persistent loop (if we ever allocated).
+            if (umma_tmem_allocated) {
+                char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+                umma::umma_dealloc(cluster_smem);
+            }
+            break;
+        }
+        if (task_idx < 0) {
+            if (group_sm_idx == 0 && thread_id == 0)
+                __nanosleep(128);
+            compute_group_sync(state, group_id, group_size);
+            continue;
+        }
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v3 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+        ComputeTask task = state->compute_tasks[task_idx];
+        int expert_id = task.expert_id;
+        int start_slot = task.start_slot;
+        int batch_size = task.num_tokens;
+
+        // MK_COMPUTE_KERNEL selects the compute implementation at compile time:
+        //   0 = WMMA gate/up + WMMA down
+        //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
+        //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
+        constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        const bool use_umma_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
+        constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+        constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
+
+        // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
+        // Do the same after task decode so descriptor fetch can overlap input gather.
+        if constexpr (kUseUmmaCompute) {
+            if (use_umma_for_group && state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
+                batch_size <= COMPUTE_BATCH_SIZE) {
+                const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
+                if (local_warp_id == 0) {
+                    cute::prefetch_tma_descriptor(&prefetch_atom.a);
+                    cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
+                    cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
+                    cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                }
+            }
+        }
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v4 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+#if MK_PERF_TRACE_ENABLED
+        const bool perf_leader = (group_sm_idx == 0 && thread_id == 0);
+        int64_t compute_task_start_ns = perf_leader ? globaltimer_ns() : 0;
+        int64_t compute_task_end_ns = 0;
+#endif
+#if MK_PERF_TRACE_ARGS
+        int64_t perf_ph_meta_ns = 0, perf_ph_input_ns = 0, perf_ph_upgemm_ns = 0;
+        int64_t perf_ph_downgemm_ns = 0, perf_ph_output_ns = 0;
+        // Finer breakpoints: GEMM body end (before barrier) and signaling sub-phases.
+        int64_t perf_up_body_ns = 0, perf_down_body_ns = 0, perf_out_body_ns = 0;
+        int64_t perf_sig_donecount_ns = 0, perf_sig_finalize_ns = 0;
+        int64_t perf_sig_fence_ns = 0, perf_sig_publish_ns = 0;
+        if (perf_leader && task_idx >= 0 && task_idx < state->max_compute_tasks) {
+            state->perf_task_start_ts[task_idx] = compute_task_start_ns;
+            state->perf_task_prev_end_ts[task_idx] = last_task_end_ns;
+            state->perf_task_prev_gap_ns[task_idx] = last_task_end_ns == 0 ? 0 : compute_task_start_ns - last_task_end_ns;
+        }
+        // Root-cause diagnostics rendered as args on compute X-events.
+        __shared__ int s_perf_multi_expert_rows;
+        __shared__ int s_perf_task_has_multi;
+        if (perf_leader) {
+            s_perf_multi_expert_rows = 0;
+            s_perf_task_has_multi = 0;
+        }
+        __syncthreads();
+#endif
+
+        for (int i = thread_id; i < batch_size; i += blockDim.x) {
+            int base_offset = expert_id * max_tpe + start_slot + i;
+            int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
+            int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+            int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
+            s_recv_token_idx[i] = recv_token;
+            s_is_single[i] = static_cast<unsigned char>(expected == 1);
+            s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
+// #ifdef MK_TOKEN_TRACE
+//             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
+//                    state->rank, sm_id, expert_id, i, recv_token, topk_slot);
+// #endif
+        }
+        // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
+        // can run at fixed M=256 for tail batches: padded input_buf rows are 0, and
+        // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
+        // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
+        // so padding rows never leave the kernel.
+        for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
+            s_route_w[i] = 0.0f;
+        }
+        __syncthreads();
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     mk_debug_check_float_vector("dispatch-copy-route-w", s_route_w, batch_size,
+        //                                 state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+        //                                 task_idx, expert_id);
+        // }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
+#endif
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v5 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+        const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
+        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
+        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
+        int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
+        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
+            input_buf_i4[idx] = (row < batch_size)
+                ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
+                : make_int4(0, 0, 0, 0);
+        }
+        compute_group_sync(state, group_id, group_size);
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     mk_debug_check_bf16_matrix("dispatch-copy-input", input_buf, COMPUTE_BATCH_SIZE, hidden, hidden,
+        //                                state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+        //                                task_idx, expert_id);
+        // }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_input_ns = globaltimer_ns();
+#endif
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v6 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+        // Expert weight slices
+        const __nv_bfloat16* w_gateup = &state->W_gateup[expert_id * 2 * intermediate * hidden];
+        const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
+
+        // Gate/up compute always consumes pairwise interleaved W_gateup rows
+        // [g0,u0,g1,u1,...]. UMMA folds adjacent gate/up columns in its epilogue;
+        // WMMA fallback reads the same layout with a 2*K B-matrix stride.
+        // umma_accum_iter tracks TMEM accumulator pipeline phase (tmem_full/tmem_empty
+        // barrier ring) across ALL three GEMMs (gate, up, down). Must NOT be reset
+        // between gate/up and down-proj — the barrier ring is initialized once and
+        // must stay in phase. Declared here so it spans both if-blocks below.
+        uint32_t umma_accum_iter = 0;
+
+        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
+        // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
+        // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
+        // reduce/signal all mask by batch_size, so padding never leaves the kernel.
+        // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
+        if (use_umma_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+
+            // Interleaved gate/up fusion: ONE persistent GEMM computes GU with
+            // Wgu rows [g0,u0,g1,u1,...], then the epilogue folds each adjacent
+            // gate/up pair directly from TMEM into act_buf (up_buf). This is the
+            // microkernel path moved into the megakernel for both 1-CTA and 2-CTA.
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_gateup_interleaved_persistent(
+                &in_atom.a,
+                &state->compute_tma->wgateup[expert_id],
+                &in_atom.act_cd,
+                s_route_w,
+                COMPUTE_BATCH_SIZE, intermediate, hidden,
+                cluster_in_group, num_clusters,
+                cluster_smem, umma_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma_tmem_allocated = false;   // freed each task (4a)
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_up_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     mk_debug_check_bf16_matrix("dispatch-copy-up-umma", up_buf, COMPUTE_BATCH_SIZE, intermediate, intermediate,
+            //                                state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+            //                                task_idx, expert_id);
+            // }
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     printf("jinheng debug: enter here v65 blockIdx.x:%d\n", blockIdx.x);
+            // }
+
+
+        } else {
+            device_gemm_swiglu_fused(input_buf, w_gateup, up_buf, s_route_w,
+                                     batch_size, batch_size, hidden, intermediate,
+                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_up_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     mk_debug_check_bf16_matrix("dispatch-copy-up-wmma", up_buf, batch_size, intermediate, intermediate,
+            //                                state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+            //                                task_idx, expert_id);
+            // }
+        }
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v7 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
+#endif
+
+        // GEMM 3: down-proj D = act @ W_down^T.
+        // Same task-level PERSISTENT lifecycle as gate/up: init barriers+TMEM
+        // once, run the persistent down GEMM (tile loop inside the three warp
+        // roles, zero cluster sync between tiles), dealloc once. A fresh accum
+        // counter is used because gate/up already freed TMEM at their dealloc.
+        // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
+        // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
+        // are 0 and are masked off by the batch_size-bounded output/reduce below.
+        if (use_umma_for_group &&
+            state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     printf("jinheng debug: enter here v75 blockIdx.x:%d\n", blockIdx.x);
+            // }
+
+            uint32_t down_accum_iter = 0;
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_down_persistent(
+                &in_atom.act_a,
+                &state->compute_down_tma->wdown[expert_id],
+                &in_atom.down_cd,
+                COMPUTE_BATCH_SIZE, hidden, intermediate,
+                cluster_in_group, num_clusters,
+                cluster_smem, down_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma_tmem_allocated = false;
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_down_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     mk_debug_check_bf16_matrix("dispatch-copy-down-umma", down_buf, COMPUTE_BATCH_SIZE, hidden, hidden,
+            //                                state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+            //                                task_idx, expert_id);
+            // }
+        } else {
+            device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
+                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_down_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+            // if (group_sm_idx == 0 && thread_id == 0) {
+            //     mk_debug_check_bf16_matrix("dispatch-copy-down-wmma", down_buf, batch_size, hidden, hidden,
+            //                                state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+            //                                task_idx, expert_id);
+            // }
+        }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
+#endif
+
+        // Per-slot output (change A): every (recv_token, local-expert-hit) writes its OWN
+        // expert-sorted slot row in compute_output_slot. Slots are unique across tasks, so
+        // no write conflict and no atomic. Same-rank multi-expert reduce is deferred to the
+        // combine sender (change C), which gathers a token's nh slots and fp32-sums them.
+#if MK_PERF_TRACE_ARGS
+        if (thread_id == 0) {
+            int multi_rows = 0;
+            for (int row = 0; row < batch_size; ++row)
+                if (!s_is_single[row]) ++multi_rows;
+            if (perf_leader) s_perf_task_has_multi = (multi_rows != 0);
+        }
+        __syncthreads();
+#endif
+
+        const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
+        int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
+        int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
+        const int slot_base = expert_id * max_tpe + start_slot;
+        for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
+            int slot = slot_base + row;
+            if (s_is_single[row])
+                token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = down_i4[idx];
+            else
+                slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
+        }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_out_body_ns = globaltimer_ns();
+#endif
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v8 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+        // device-scope fence: combine_worker reads compute_output_slot on the same GPU
+        // (different SM, same kernel launch), so device-scope visibility is sufficient.
+        // Each thread fences its own per-slot writes before the group sync lets any SM
+        // publish ready flags.
+        __threadfence();
+        compute_group_sync(state, group_id, group_size);
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_output_ns = globaltimer_ns();
+#endif
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     for (int row = 0; row < batch_size; ++row) {
+        //         const int recv_token = s_recv_token_idx[row];
+        //         const int slot = slot_base + row;
+        //         const __nv_bfloat16* out_ptr = s_is_single[row]
+        //             ? state->combine_input + (int64_t)recv_token * hidden
+        //             : state->compute_output_slot + (int64_t)slot * hidden;
+        //         bool found = mk_debug_check_bf16_matrix(s_is_single[row] ? "dispatch-copy-write-token" : "dispatch-copy-write-slot",
+        //                                                 out_ptr, 1, hidden, hidden,
+        //                                                 state->rank, sm_id, blockIdx.x, group_id, group_sm_idx,
+        //                                                 task_idx, expert_id);
+        //         if (found) {
+        //             printf("[MK-NAN][dispatch-copy-write-meta] rank=%d block=%d sm=%d group=%d task=%d expert=%d row=%d recv_token=%d slot=%d is_single=%d\n",
+        //                    state->rank, blockIdx.x, sm_id, group_id, task_idx, expert_id,
+        //                    row, recv_token, slot, static_cast<int>(s_is_single[row]));
+        //             break;
+        //         }
+        //     }
+        // }
+
+        // ==== Signal: per-token ready publish ====
+        // compute wrote per-slot rows into compute_output_slot. The same-rank multi-expert
+        // reduce is now done by the combine sender / gather worker, which gather a token's nh
+        // slots and fp32-sum them before sending. Compute only advances token_done_count and
+        // publishes nhits==1 tokens directly; nhits>1 tokens are claimed/enqueued by gather
+        // scheduler lanes (tid >= GATHER_SCHED_TID_BEGIN) once all local expert slots are done.
+        {
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) {
+                perf_sig_donecount_ns = globaltimer_ns();
+                perf_sig_finalize_ns = perf_sig_donecount_ns;
+                perf_sig_fence_ns = perf_sig_donecount_ns;
+            }
+            if (perf_leader) {
+                int mr = 0;
+                for (int row = 0; row < batch_size; ++row)
+                    if (!s_is_single[row]) ++mr;
+                s_perf_multi_expert_rows = mr;
+            }
+#endif
+            for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
+                const int recv_token = s_recv_token_idx[row];
+                int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
+                if (s_is_single[row] && done >= 1) {
+                    __threadfence();
+                    atomicExch(&state->combine_token_ready[recv_token], 1);
+                }
+            }
+            compute_group_sync(state, group_id, group_size);
+#if MK_PERF_TRACE_ENABLED
+            if (perf_leader) compute_task_end_ns = globaltimer_ns();
+#endif
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_sig_publish_ns = compute_task_end_ns;
+#endif
+        }
+
+        // if (group_sm_idx == 0 && thread_id == 0) {
+        //     printf("jinheng debug: enter here v9 blockIdx.x:%d\n", blockIdx.x);
+        // }
+
+#if MK_PERF_TRACE_ENABLED
+        if (perf_leader) {
+#if MK_PERF_TRACE_ARGS
+            last_task_end_ns = compute_task_end_ns;
+#endif
+            int slot = task_idx;
+            if (slot >= 0 && slot < state->max_compute_tasks) {
+                int64_t* rec = state->perf_compute_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
+                rec[0] = compute_task_start_ns;
+                rec[1] = compute_task_end_ns;
+                rec[2] = sm_id;
+                rec[3] = group_id;
+                rec[26] = 1;
+#if MK_PERF_TRACE_ARGS
+                rec[4] = expert_id;
+                rec[5] = batch_size;
+                rec[6] = hidden;
+                rec[7] = intermediate;
+                rec[8]  = perf_ph_meta_ns;
+                rec[9]  = perf_ph_input_ns;
+                rec[10] = perf_ph_upgemm_ns;
+                rec[11] = perf_ph_downgemm_ns;
+                rec[12] = perf_ph_output_ns;
+                rec[13] = compute_task_end_ns;
+                rec[14] = perf_up_body_ns;
+                rec[15] = perf_down_body_ns;
+                rec[16] = perf_out_body_ns;
+                rec[17] = perf_sig_donecount_ns;
+                rec[18] = perf_sig_finalize_ns;
+                rec[19] = perf_sig_fence_ns;
+                rec[20] = perf_sig_publish_ns;
+                rec[21] = task_idx;
+                rec[22] = start_slot;
+                rec[23] = start_slot + batch_size;
+                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                rec[25] = task.is_flush;
+                state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
+                state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
+#endif
+            }
+        }
+#endif
+
+    }
+// #endif
+
 }
 
 // ============================================================================
 // Compute Scheduler + Worker: scheduler enqueues expert batches, compute groups run GEMM+SwiGLU
 // ============================================================================
-
-__device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
-    __syncthreads();
-    memory_fence_gpu();
-    if (threadIdx.x == 0) {
-        int phase = ld_acquire_global(&state->compute_group_phase[group_id]);
-        int arrived = atomicAdd(&state->compute_group_barrier[group_id], 1) + 1;
-        if (arrived == group_size) {
-            st_release_gpu_global(&state->compute_group_barrier[group_id], 0);
-            st_release_gpu_global(&state->compute_group_phase[group_id], phase + 1);
-        } else {
-            while (ld_acquire_global(&state->compute_group_phase[group_id]) == phase)
-                __nanosleep(64);
-        }
-    }
-    __syncthreads();
-}
 
 __device__ __forceinline__ bool timeout_log_once(MegaKernelState* state, int site_id) {
     if (site_id < 0 || site_id >= kTimeoutLogCount)
@@ -3020,16 +3650,20 @@ __device__ void compute_worker(
     }
     const int thread_id = threadIdx.x;
     const int local_warp_id = thread_id / 32;
-    const int group_sm_idx = compute_sm_idx % COMPUTE_GROUP_SIZE;
-    const int group_id = compute_sm_idx / COMPUTE_GROUP_SIZE;
-    const int num_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
-    if (num_compute_groups == 0 || group_id >= num_compute_groups)
+    if (num_compute_sms <= 0 || compute_sm_idx < 0 || compute_sm_idx >= num_compute_sms)
         return;
+    const int group_id = compute_sm_idx / COMPUTE_GROUP_SIZE;
+    const int group_first_sm_idx = group_id * COMPUTE_GROUP_SIZE;
+    const int group_size = min(COMPUTE_GROUP_SIZE, num_compute_sms - group_first_sm_idx);
+    const int num_compute_groups = state->num_compute_groups;
+    if (group_size <= 0 || group_id >= num_compute_groups)
+        return;
+    const int group_sm_idx = compute_sm_idx - group_first_sm_idx;
     const int num_warps_per_sm = blockDim.x / 32;
     const int group_warp_id = group_sm_idx * num_warps_per_sm + local_warp_id;
-    const int group_num_warps = COMPUTE_GROUP_SIZE * num_warps_per_sm;
+    const int group_num_warps = group_size * num_warps_per_sm;
     const int group_thread_id = group_sm_idx * blockDim.x + thread_id;
-    const int group_num_threads = COMPUTE_GROUP_SIZE * blockDim.x;
+    const int group_num_threads = group_size * blockDim.x;
     const int num_local_experts = state->num_local_experts;
     const int max_tpe = state->max_tokens_per_expert;
     const int hidden = state->hidden_dim;
@@ -3132,7 +3766,7 @@ __device__ void compute_worker(
             }
             st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
         }
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        compute_group_sync(state, group_id, group_size);
 
         int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
 #if MK_PERF_TRACE_ARGS
@@ -3150,7 +3784,7 @@ __device__ void compute_worker(
         if (task_idx < 0) {
             if (group_sm_idx == 0 && thread_id == 0)
                 __nanosleep(128);
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
             continue;
         }
 
@@ -3164,13 +3798,14 @@ __device__ void compute_worker(
         //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
         //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        const bool use_umma_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
         // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
         // Do the same after task decode so descriptor fetch can overlap input gather.
         if constexpr (kUseUmmaCompute) {
-            if (state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
+            if (use_umma_for_group && state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
                 batch_size <= COMPUTE_BATCH_SIZE) {
                 const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
                 if (local_warp_id == 0) {
@@ -3247,7 +3882,7 @@ __device__ void compute_worker(
                 ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
                 : make_int4(0, 0, 0, 0);
         }
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_input_ns = globaltimer_ns();
 #endif
@@ -3270,7 +3905,7 @@ __device__ void compute_worker(
         // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
         // reduce/signal all mask by batch_size, so padding never leaves the kernel.
         // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
-        if (kUseUmmaCompute && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+        if (use_umma_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
@@ -3294,7 +3929,7 @@ __device__ void compute_worker(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
         } else {
             device_gemm_swiglu_fused(input_buf, w_gateup, up_buf, s_route_w,
                                      batch_size, batch_size, hidden, intermediate,
@@ -3302,7 +3937,7 @@ __device__ void compute_worker(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
@@ -3316,7 +3951,7 @@ __device__ void compute_worker(
         // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
         // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
         // are 0 and are masked off by the batch_size-bounded output/reduce below.
-        if (kUseUmmaCompute &&
+        if (use_umma_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
@@ -3337,14 +3972,14 @@ __device__ void compute_worker(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
         } else {
             device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
                               group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
@@ -3385,7 +4020,7 @@ __device__ void compute_worker(
         // Each thread fences its own per-slot writes before the group sync lets any SM
         // publish ready flags.
         __threadfence();
-        compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+        compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
 #endif
@@ -3418,7 +4053,7 @@ __device__ void compute_worker(
                     atomicExch(&state->combine_token_ready[recv_token], 1);
                 }
             }
-            compute_group_sync(state, group_id, COMPUTE_GROUP_SIZE);
+            compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ENABLED
             if (perf_leader) compute_task_end_ns = globaltimer_ns();
 #endif
@@ -4917,6 +5552,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     const int compute_begin = num_dispatch_sms + num_combine_sms + COMPUTE_SCHEDULER_SMS;
     const int gather_begin = compute_begin + num_compute_sms;
+    const int total_compute_sms_after_dispatch = num_compute_sms + num_dispatch_sms;
     if (sm_id < num_dispatch_sms) {
         role = SmRole::kDispatch;
         role_idx = sm_id;
@@ -4936,7 +5572,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     switch (role) {
         case SmRole::kDispatch:
-            dispatch_worker_v2<kNumRDMARanks, kStage>(sm_id, role_idx, state);
+            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType>(sm_id, role_idx, state);
             break;
 
         case SmRole::kCombine:
@@ -4948,7 +5584,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             break;
 
         case SmRole::kCompute:
-            compute_worker<kComputeDType>(sm_id, role_idx, num_compute_sms, state, smem_buffer);
+            compute_worker<kComputeDType>(sm_id, role_idx, total_compute_sms_after_dispatch, state, smem_buffer);
             break;
 
         case SmRole::kGather:
@@ -5145,7 +5781,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     int lch_tid_base = 0;
     int compute_tid_base = num_logical_channels * 4;
-    const int num_compute_groups = host_state.num_compute_sms / COMPUTE_GROUP_SIZE;
+    const int num_compute_groups = host_state.num_compute_groups;
     for (int group_id = 0; group_id < num_compute_groups; ++group_id) {
         int tid = compute_tid_base + group_id;
         emit_comma();
@@ -5889,7 +6525,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     const int args_lch_tid_base = 0;
     const int args_block_compute_tid_base = num_logical_channels * 4;
-    const int args_block_num_compute_groups = host_state.num_compute_sms / COMPUTE_GROUP_SIZE;
+    const int args_block_num_compute_groups = host_state.num_compute_groups;
     for (int group_id = 0; group_id < args_block_num_compute_groups; ++group_id) {
         int tid = args_block_compute_tid_base + group_id;
         emit_comma();
@@ -6533,7 +7169,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     // Compute task rows: one Perfetto row per compute group, one X-event per task batch.
     int compute_tid_base = num_logical_channels * 5 + 100;
-    int num_compute_groups = host_state.num_compute_sms / COMPUTE_GROUP_SIZE;
+    int num_compute_groups = host_state.num_compute_groups;
     for (int g = 0; g < num_compute_groups; ++g) {
         int tid = compute_tid_base + g;
         emit_comma();
@@ -6862,9 +7498,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&recv_src_meta, total_expert_slots * sizeof(internode::SourceMeta)));
 
     // Compute state
-    int num_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
+    int base_compute_groups = num_compute_sms / COMPUTE_GROUP_SIZE;
+    int total_compute_sms_after_dispatch = num_compute_sms + num_dispatch_sms;
+    int num_compute_groups = (total_compute_sms_after_dispatch + COMPUTE_GROUP_SIZE - 1) / COMPUTE_GROUP_SIZE;
+    EP_HOST_ASSERT(base_compute_groups > 0);
     EP_HOST_ASSERT(num_compute_groups > 0);
-    EP_HOST_ASSERT(num_compute_sms == num_compute_groups * COMPUTE_GROUP_SIZE);
+    EP_HOST_ASSERT(num_compute_sms == base_compute_groups * COMPUTE_GROUP_SIZE);
     CUDA_CHECK(cudaMalloc(&compute_group_barrier, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_barrier, 0, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&compute_group_phase, num_compute_groups * sizeof(int)));
