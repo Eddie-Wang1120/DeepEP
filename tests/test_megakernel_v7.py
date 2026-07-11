@@ -413,7 +413,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
 def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
                             num_experts, buffer, local_rank, rank, stage,
                             hidden_states_scales=None, W_gateup_fp8=None, W_down_fp8=None,
-                            W_gateup_fp8_sf=None, W_down_fp8_sf=None):
+                            W_gateup_fp8_sf=None, W_down_fp8_sf=None, debug=False):
     """
     MegaKernel v7: single persistent kernel (dispatch + compute + combine fused).
     W_gateup is pairwise interleaved as [g0, u0, g1, u1, ...].
@@ -428,7 +428,8 @@ def run_megakernel_pipeline(x, topk_idx, topk_weights, W_gateup, W_down,
     if local_rank == 0:
         print(f'[Rank {rank}] MegaKernel launch: total_sms={total_sms}, dispatch={num_dispatch_sms}, stage={stage}', flush=True)
 
-    result = buffer.megakernel_forward(
+    forward = buffer.megakernel_debug_forward if debug else buffer.megakernel_forward
+    result = forward(
         x, topk_idx, topk_weights,
         W_gateup, W_down,
         num_experts,
@@ -672,18 +673,41 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         W_gateup_fp8_sf=W_gateup_fp8_sf,
         W_down_fp8_sf=W_down_fp8_sf)
 
+    # dist.barrier(group=group)
+    # torch.cuda.synchronize()
+    # if local_rank == 0:
+    #     print(f'[Rank {rank}] Running megakernel_debug_forward...', flush=True)
+    # debug_output = run_megakernel_pipeline(
+    #     mk_x, topk_idx, topk_weights, W_gateup, W_down,
+    #     num_experts, buffer, local_rank, rank, args.stage,
+    #     hidden_states_scales=hidden_states_scales,
+    #     W_gateup_fp8=W_gateup_fp8,
+    #     W_down_fp8=W_down_fp8,
+    #     W_gateup_fp8_sf=W_gateup_fp8_sf,
+    #     W_down_fp8_sf=W_down_fp8_sf,
+    #     debug=True)
+    # torch.cuda.synchronize()
+
     if args.skip_baseline:
         if local_rank == 0:
             print(f'[Rank {rank}] MegaKernel-only check PASSED: output norm={megakernel_output.float().norm().item():.4f}', flush=True)
         return 0.0, 0.0, 1.0
 
-    # --- Compare A vs B ---
+    # --- Compare A vs B/C and B vs C ---
     diff = calc_diff(baseline_output, megakernel_output)
     max_abs_diff = (baseline_output.float() - megakernel_output.float()).abs().max().item()
     cos_sim = F.cosine_similarity(
         baseline_output.float().flatten().unsqueeze(0),
         megakernel_output.float().flatten().unsqueeze(0)
     ).item()
+    # debug_diff = calc_diff(baseline_output, debug_output)
+    # debug_max_abs_diff = (baseline_output.float() - debug_output.float()).abs().max().item()
+    # debug_cos_sim = F.cosine_similarity(
+    #     baseline_output.float().flatten().unsqueeze(0),
+    #     debug_output.float().flatten().unsqueeze(0)
+    # ).item()
+    # forward_debug_max_abs_diff = (
+    #     megakernel_output.float() - debug_output.float()).abs().max().item()
 
     if local_rank == 0:
         print(f'')
@@ -693,8 +717,13 @@ def test_main(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args,
         print(f'  cosine_similarity: {cos_sim:.6f}')
         print(f'  baseline norm: {baseline_output.float().norm().item():.4f}')
         print(f'  megakernel norm: {megakernel_output.float().norm().item():.4f}')
+        # print(f'  debug calc_diff: {debug_diff:.6e}')
+        # print(f'  debug max_abs_diff: {debug_max_abs_diff:.6e}')
+        # print(f'  debug cosine_similarity: {debug_cos_sim:.6f}')
+        # print(f'  forward_debug_max_abs_diff: {forward_debug_max_abs_diff:.6e}')
 
         bitwise_equal = torch.equal(baseline_output, megakernel_output)
+        # debug_bitwise_equal = torch.equal(baseline_output, debug_output)
         print(f'  bitwise_equal: {bitwise_equal}')
 
         if args.no_compute:
@@ -762,9 +791,9 @@ if __name__ == '__main__':
     parser.add_argument('--no-compute', action='store_true', help='Skip expert compute in the baseline path')
     parser.add_argument('--baseline-impl', choices=['torch', 'te'], default='te',
                         help='Expert compute implementation for the baseline path')
-    parser.add_argument('--warmup', type=int, default=20,
+    parser.add_argument('--warmup', type=int, default=5,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
-    parser.add_argument('--stage', type=int, default=2,
+    parser.add_argument('--stage', type=int, default=1,
                         help='Logical channels per physical channel for megakernel')
     parser.add_argument('--compute-dtype', choices=['bf16', 'fp8'], default='bf16',
                         help='Compute dtype path to exercise; fp8 runs the TE FP8 baseline and skips megakernel unless requested')

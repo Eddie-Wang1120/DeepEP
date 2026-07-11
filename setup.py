@@ -37,7 +37,7 @@ if __name__ == '__main__':
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel.cu']
+    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel.cu', 'csrc/kernels/megakernel_forward_backward.cu']
     include_dirs = ['csrc/']
     # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute (S4.4 / MEGAKERNEL_COMPUTE_DESIGN.md I.9.10).
     # Header-only; only adds include paths. cutlass_ref is the cloned NVIDIA/cutlass v4.5.2.

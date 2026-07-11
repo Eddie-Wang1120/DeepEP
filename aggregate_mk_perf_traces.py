@@ -10,17 +10,19 @@ from pathlib import Path
 from typing import Any
 
 
-TRACE_RE = re.compile(r"(mk|deepep)_perf_trace_rank(\d+)(?:_(dispatch|combine))?\.json$")
+TRACE_RE = re.compile(r"(mk|deepep)_perf_trace_rank(\d+)(?:_(dispatch|combine|notify))?(?:_iter(\d+))?\.json$")
 
 
-def parse_trace_name(path: Path) -> tuple[str, int, str]:
+def parse_trace_name(path: Path) -> tuple[str, int, str, int]:
     match = TRACE_RE.search(path.name)
     if not match:
         raise ValueError(f"cannot parse trace name from {path}")
     source = match.group(1)
     rank = int(match.group(2))
     phase = match.group(3) or source
-    return source, rank, phase
+    # iteration index: -1 means "untagged" (legacy single-run files)
+    iteration = int(match.group(4)) if match.group(4) is not None else -1
+    return source, rank, phase, iteration
 
 
 def parse_rank(path: Path) -> int:
@@ -35,11 +37,14 @@ def load_events(path: Path) -> list[dict[str, Any]]:
     return data
 
 
-def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: str = "all") -> tuple[int, int]:
+def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: str = "all",
+              iter_filter: int | None = None) -> tuple[int, int]:
     files = sorted(
         [
             path for path in input_dir.glob("*perf_trace_rank*.json")
-            if TRACE_RE.search(path.name) and (source_filter == "all" or parse_trace_name(path)[0] == source_filter)
+            if TRACE_RE.search(path.name)
+            and (source_filter == "all" or parse_trace_name(path)[0] == source_filter)
+            and (iter_filter is None or parse_trace_name(path)[3] == iter_filter)
         ],
         key=lambda path: parse_trace_name(path),
     )
@@ -52,7 +57,7 @@ def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: 
     file_events: dict[Path, tuple[str, int, str, list[dict[str, Any]]]] = {}
 
     for path in files:
-        source, rank, phase = parse_trace_name(path)
+        source, rank, phase, _iteration = parse_trace_name(path)
         events = load_events(path)
         file_events[path] = (source, rank, phase, events)
         for event in events:
@@ -119,6 +124,25 @@ def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: 
     return len(files), len(all_events)
 
 
+def run_aggregate(input_dir: Path, output: Path, normalize_ts: bool, source: str,
+                  split_sources: bool, iter_filter: int | None) -> None:
+    num_files, num_events = aggregate(input_dir, output, normalize_ts=normalize_ts,
+                                      source_filter=source, iter_filter=iter_filter)
+    print(f"Aggregated {num_events} events from {num_files} files -> {output}")
+
+    if split_sources and source == "all":
+        mk_output = output.with_name(output.stem + "_megakernel_only" + output.suffix)
+        deepep_output = output.with_name(output.stem + "_deepep_only" + output.suffix)
+        for src, source_output in (("mk", mk_output), ("deepep", deepep_output)):
+            try:
+                num_files, num_events = aggregate(input_dir, source_output, normalize_ts=normalize_ts,
+                                                  source_filter=src, iter_filter=iter_filter)
+            except FileNotFoundError as exc:
+                print(f"Skipped {src}: {exc}")
+                continue
+            print(f"Aggregated {src} {num_events} events from {num_files} files -> {source_output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate megakernel and DeepEP perf traces into one Perfetto trace")
     parser.add_argument("--input-dir", type=Path, default=Path.cwd(), help="directory containing *perf_trace_rank*.json")
@@ -131,19 +155,25 @@ def main() -> None:
 
     input_dir = args.input_dir.resolve()
     output = args.output.resolve() if args.output else input_dir / "mk_perf_trace_all.json"
-    num_files, num_events = aggregate(input_dir, output, normalize_ts=not args.no_normalize_ts, source_filter=args.source)
-    print(f"Aggregated {num_events} events from {num_files} files -> {output}")
+    normalize_ts = not args.no_normalize_ts
 
-    if args.split_sources and args.source == "all":
-        mk_output = output.with_name(output.stem + "_megakernel_only" + output.suffix)
-        deepep_output = output.with_name(output.stem + "_deepep_only" + output.suffix)
-        for source, source_output in (("mk", mk_output), ("deepep", deepep_output)):
-            try:
-                num_files, num_events = aggregate(input_dir, source_output, normalize_ts=not args.no_normalize_ts, source_filter=source)
-            except FileNotFoundError as exc:
-                print(f"Skipped {source}: {exc}")
-                continue
-            print(f"Aggregated {source} {num_events} events from {num_files} files -> {source_output}")
+    # Discover iteration indices present in the directory. Files written by a single run
+    # carry `_iter{N}`; legacy untagged files map to iteration -1.
+    iterations = sorted({
+        parse_trace_name(path)[3]
+        for path in input_dir.glob("*perf_trace_rank*.json")
+        if TRACE_RE.search(path.name)
+    })
+    tagged_iters = [i for i in iterations if i >= 0]
+
+    if tagged_iters:
+        # One aggregated output per run: mk_perf_trace_all_iter{N}.json
+        for i in tagged_iters:
+            iter_output = output.with_name(f"{output.stem}_iter{i}{output.suffix}")
+            run_aggregate(input_dir, iter_output, normalize_ts, args.source, args.split_sources, iter_filter=i)
+    else:
+        # Legacy single-run behavior.
+        run_aggregate(input_dir, output, normalize_ts, args.source, args.split_sources, iter_filter=None)
 
 
 if __name__ == "__main__":

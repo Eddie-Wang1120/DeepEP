@@ -9,6 +9,7 @@
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
 
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -50,6 +51,21 @@ private:
 }  // namespace shared_memory
 
 namespace deep_ep {
+
+namespace megakernel_debug {
+struct MegaKernelState;
+}
+
+class MegaKernelAutogradContext {
+public:
+    explicit MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state);
+    ~MegaKernelAutogradContext();
+
+    megakernel_debug::MegaKernelState* state() const;
+
+private:
+    megakernel_debug::MegaKernelState* state_;
+};
 
 struct Buffer {
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
@@ -324,8 +340,69 @@ public:
         const pybind11::object& W_gateup_fp8_sf,
         const pybind11::object& W_down_fp8_sf);
 
+    torch::Tensor megakernel_debug_forward(
+        const torch::Tensor& x,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& W_gateup,
+        const torch::Tensor& W_down,
+        int num_experts,
+        int num_dispatch_sms,
+        int num_combine_sms,
+        int total_sms,
+        int stage,
+        const Config& dispatch_config,
+        const Config& combine_config,
+        const pybind11::object& hidden_states_scales,
+        const pybind11::object& W_gateup_fp8,
+        const pybind11::object& W_down_fp8,
+        const pybind11::object& W_gateup_fp8_sf,
+        const pybind11::object& W_down_fp8_sf);
+
+    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_debug_forward_train(
+        const torch::Tensor& x,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& W_gateup,
+        const torch::Tensor& W_down,
+        int num_experts,
+        int num_dispatch_sms,
+        int num_combine_sms,
+        int total_sms,
+        int stage,
+        const Config& dispatch_config,
+        const Config& combine_config);
+
+    torch::Tensor megakernel_debug_backward(
+        const std::shared_ptr<MegaKernelAutogradContext>& context,
+        const torch::Tensor& grad_output,
+        int total_sms,
+        int stage);
+
+    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_forward_impl(
+        const torch::Tensor& x,
+        const torch::Tensor& topk_idx,
+        const torch::Tensor& topk_weights,
+        const torch::Tensor& W_gateup,
+        const torch::Tensor& W_down,
+        int num_experts,
+        int num_dispatch_sms,
+        int num_combine_sms,
+        int total_sms,
+        int stage,
+        const Config& dispatch_config,
+        const Config& combine_config,
+        const pybind11::object& hidden_states_scales,
+        const pybind11::object& W_gateup_fp8,
+        const pybind11::object& W_down_fp8,
+        const pybind11::object& W_gateup_fp8_sf,
+        const pybind11::object& W_down_fp8_sf,
+        bool debug,
+        bool retain_state);
+
 #if MK_PERF_TRACE_ENABLED
-    // Baseline perf trace state: accumulated across dispatch/combine calls, dumped on request.
+    // Baseline trace events use the same Perfetto JSON format as megakernel traces.
+    float deepep_perf_trace_notify_dispatch_ms_ = 0.0f;
     float deepep_perf_trace_dispatch_ms_ = 0.0f;
     float deepep_perf_trace_combine_ms_ = 0.0f;
     void dump_deepep_perf_trace();

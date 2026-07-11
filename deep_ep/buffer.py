@@ -703,6 +703,30 @@ class Buffer:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
+    class _MegaKernelDebugFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
+                    num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
+                    dispatch_config, combine_config):
+            output, handle = runtime.megakernel_debug_forward_train(
+                x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
+                num_dispatch_sms, num_combine_sms, total_sms, stage,
+                dispatch_config, combine_config)
+            ctx.runtime = runtime
+            ctx.handle = handle
+            ctx.save_for_backward(x, topk_idx, topk_weights, W_gateup, W_down)
+            ctx.total_sms = total_sms
+            ctx.stage = stage
+            return output
+
+        @staticmethod
+        @torch.autograd.function.once_differentiable
+        def backward(ctx, grad_output):
+            grad_x = ctx.runtime.megakernel_debug_backward(
+                ctx.handle, grad_output.contiguous(), ctx.total_sms, ctx.stage)
+            return (None, grad_x, None, None, None, None,
+                    None, None, None, None, None, None, None)
+
     def megakernel_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                            W_gateup: torch.Tensor, W_down: torch.Tensor,
                            num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
@@ -742,7 +766,45 @@ class Buffer:
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
         return self.runtime.megakernel_forward(x, topk_idx, topk_weights, W_gateup, W_down,
-                                              num_experts, num_dispatch_sms, num_combine_sms, total_sms,
-                                              stage, dispatch_config, combine_config,
-                                              hidden_states_scales,
-                                              W_gateup_fp8, W_down_fp8, W_gateup_fp8_sf, W_down_fp8_sf)
+                                               num_experts, num_dispatch_sms, num_combine_sms,
+                                               total_sms, stage, dispatch_config, combine_config,
+                                               hidden_states_scales, W_gateup_fp8, W_down_fp8,
+                                               W_gateup_fp8_sf, W_down_fp8_sf)
+
+    def megakernel_debug_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                                  topk_weights: torch.Tensor, W_gateup: torch.Tensor,
+                                  W_down: torch.Tensor, num_experts: int,
+                                  num_dispatch_sms: int = 24, num_combine_sms: int = 24,
+                                  total_sms: int = 148, stage: int = 1,
+                                  dispatch_config: Optional[Config] = None,
+                                  combine_config: Optional[Config] = None) -> torch.Tensor:
+        """Run the BF16 debug megakernel with an input-gradient-only autograd backward."""
+        if x.dtype != torch.bfloat16:
+            raise ValueError("megakernel debug autograd currently supports BF16 only")
+        dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
+        combine_config = combine_config or self.get_combine_config(self.group_size)
+        return self._MegaKernelDebugFunction.apply(
+            self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
+            num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
+            dispatch_config, combine_config)
+
+    def megakernel_debug_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                                 W_gateup: torch.Tensor, W_down: torch.Tensor,
+                                 num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
+                                 total_sms: int = 148, stage: int = 1,
+                                 dispatch_config: Optional[Config] = None,
+                                 combine_config: Optional[Config] = None,
+                                 hidden_states_scales: Optional[torch.Tensor] = None,
+                                 W_gateup_fp8: Optional[torch.Tensor] = None,
+                                 W_down_fp8: Optional[torch.Tensor] = None,
+                                 W_gateup_fp8_sf: Optional[torch.Tensor] = None,
+                                 W_down_fp8_sf: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run the isolated forward snapshot used for backward development."""
+        dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
+        combine_config = combine_config or self.get_combine_config(self.group_size)
+        return self.runtime.megakernel_debug_forward(
+            x, topk_idx, topk_weights, W_gateup, W_down,
+            num_experts, num_dispatch_sms, num_combine_sms,
+            total_sms, stage, dispatch_config, combine_config,
+            hidden_states_scales, W_gateup_fp8, W_down_fp8,
+            W_gateup_fp8_sf, W_down_fp8_sf)

@@ -1087,6 +1087,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto recv_gbl_rank_prefix_sum = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
 
+#if MK_PERF_TRACE_ENABLED
+    cudaEvent_t notify_start_ev, notify_end_ev;
+    AT_CUDA_CHECK(cudaEventCreate(&notify_start_ev));
+    AT_CUDA_CHECK(cudaEventCreate(&notify_end_ev));
+    AT_CUDA_CHECK(cudaEventRecord(notify_start_ev, comm_stream));
+#endif
+
     // Barrier or send sizes
     if (cached_mode) {
         num_recv_tokens = cached_num_recv_tokens;
@@ -1191,6 +1198,16 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
     }
+
+#if MK_PERF_TRACE_ENABLED
+    AT_CUDA_CHECK(cudaEventRecord(notify_end_ev, comm_stream));
+    AT_CUDA_CHECK(cudaEventSynchronize(notify_end_ev));
+    float notify_ms = 0.0f;
+    AT_CUDA_CHECK(cudaEventElapsedTime(&notify_ms, notify_start_ev, notify_end_ev));
+    deepep_perf_trace_notify_dispatch_ms_ = notify_ms;
+    AT_CUDA_CHECK(cudaEventDestroy(notify_start_ev));
+    AT_CUDA_CHECK(cudaEventDestroy(notify_end_ev));
+#endif
 
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
@@ -1561,25 +1578,32 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 void Buffer::dump_deepep_perf_trace() {
     // Emit a Perfetto-compatible JSON array for this rank's baseline dispatch/combine timing.
     // File naming matches what aggregate_mk_perf_traces.py expects.
+    // Per-process iteration counter so consecutive calls emit distinct files
+    // (deepep_perf_trace_rank{R}_{phase}_iter{N}.json) instead of overwriting.
+    static int deepep_trace_iter = 0;
+    const int trace_iter = deepep_trace_iter++;
     char filename[256];
-    snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_dispatch.json", rank);
+    snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_dispatch_iter%d.json", rank, trace_iter);
     FILE* f = fopen(filename, "w");
     if (f) {
-        // Timestamps: we use 0-based; dispatch spans [0, dispatch_ms], combine spans [dispatch_ms, dispatch_ms+combine_ms]
+        // Timestamps: we use 0-based; notify_dispatch spans [0, notify_us], dispatch spans [notify_us, notify_us+dispatch_us]
+        double notify_us = deepep_perf_trace_notify_dispatch_ms_ * 1000.0;
         double dispatch_us = deepep_perf_trace_dispatch_ms_ * 1000.0;
         double combine_us = deepep_perf_trace_combine_ms_ * 1000.0;
         fprintf(f, "[\n");
         fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
         fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
         fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"dispatch\"}},\n", rank);
-        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
-                dispatch_us, rank);
+        fprintf(f, "{\"name\":\"notify_dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0},\n",
+                notify_us, rank);
+        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
+                notify_us, dispatch_us, rank);
         fprintf(f, "]\n");
         fclose(f);
-        printf("[DEEPEP-PERF] dispatch trace written to %s (%.3f us)\n", filename, dispatch_us);
+        printf("[DEEPEP-PERF] dispatch trace written to %s (notify %.3f us, dispatch %.3f us)\n", filename, notify_us, dispatch_us);
 
         // Combine in a separate file
-        snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine.json", rank);
+        snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine_iter%d.json", rank, trace_iter);
         f = fopen(filename, "w");
         if (f) {
             fprintf(f, "[\n");
@@ -1596,6 +1620,7 @@ void Buffer::dump_deepep_perf_trace() {
         printf("[DEEPEP-PERF] Failed to open %s\n", filename);
     }
     // Reset for next iteration
+    deepep_perf_trace_notify_dispatch_ms_ = 0.0f;
     deepep_perf_trace_dispatch_ms_ = 0.0f;
     deepep_perf_trace_combine_ms_ = 0.0f;
 }
@@ -1947,7 +1972,19 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-torch::Tensor Buffer::megakernel_forward(
+MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state) : state_(state) {}
+
+MegaKernelAutogradContext::~MegaKernelAutogradContext() {
+#ifndef DISABLE_NVSHMEM
+    if (state_ != nullptr) megakernel_debug::free_megakernel_state_v7(state_);
+#endif
+}
+
+megakernel_debug::MegaKernelState* MegaKernelAutogradContext::state() const {
+    return state_;
+}
+
+std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -1964,7 +2001,9 @@ torch::Tensor Buffer::megakernel_forward(
     const pybind11::object& W_gateup_fp8_obj,
     const pybind11::object& W_down_fp8_obj,
     const pybind11::object& W_gateup_fp8_sf_obj,
-    const pybind11::object& W_down_fp8_sf_obj) {
+    const pybind11::object& W_down_fp8_sf_obj,
+    bool debug,
+    bool retain_state) {
 #ifndef DISABLE_NVSHMEM
     auto optional_tensor = [](const pybind11::object& obj) -> torch::Tensor {
         if (obj.is_none()) return torch::Tensor();
@@ -2071,7 +2110,9 @@ torch::Tensor Buffer::megakernel_forward(
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
-    const int num_logical_channels = num_physical_channels * stage;
+    // Keep dispatch communication identical to DeepEP: notify_dispatch and the
+    // worker use the same physical channels. Pipeline stages remain a compute concern.
+    const int num_logical_channels = num_physical_channels;
     const int num_channels = num_logical_channels;  // DeepEP notify sees the expanded logical-channel count.
     const int dispatch_num_max_rdma_chunked_send_tokens = dispatch_config.num_max_rdma_chunked_send_tokens;
     const int dispatch_num_max_rdma_chunked_recv_tokens = dispatch_config.num_max_rdma_chunked_recv_tokens;
@@ -2109,45 +2150,14 @@ torch::Tensor Buffer::megakernel_forward(
     for (int i = 0; i < num_local_experts; ++i)
         moe_recv_expert_counter[i] = -1;
 
-    // Re-entrancy reset: megakernel_forward reuses the same NVSHMEM/IPC symmetric
-    // buffers across calls (they are Buffer-lifetime, not per-call). dispatch/combine
-    // leave stale RDMA/NVL channel head/tail counters and the combine kernel
-    // normalizes send_nvl_head/send_rdma_head in place. A second call would read
-    // those dirty values (observed as negative normalized heads -> combine forwarder
-    // NVL-check timeout). Zero the symmetric data regions and barrier across all
-    // ranks so every peer starts from a clean buffer, mirroring how DeepEP's
-    // dispatch/combine rely on a zero-initialized buffer each iteration.
-    {
-        // RDMA symmetric buffer: alloc is num_rdma_bytes*2 (dispatch + combine halves)
-        // in non-low-latency mode (see Buffer::sync). Clear the full allocation.
-        const int64_t rdma_reset_bytes = low_latency_mode ? num_rdma_bytes : num_rdma_bytes * 2;
-        CUDA_CHECK(cudaMemsetAsync(rdma_buffer_ptr, 0, rdma_reset_bytes, stream));
-
-        // NVL symmetric buffer: per rank layout is [dispatch_half | combine_half],
-        // each half = num_nvl_bytes data + signals/ptrs. Only the data regions hold
-        // channel head/tail counters that must start at 0; zero both data regions.
-        if (num_nvl_bytes > 0) {
-            const int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
-            const int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
-            const int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
-            const int64_t per_half = num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes;
-            auto nvl_base = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]);
-            CUDA_CHECK(cudaMemsetAsync(nvl_base, 0, num_nvl_bytes, stream));                 // dispatch data
-            CUDA_CHECK(cudaMemsetAsync(nvl_base + per_half, 0, num_nvl_bytes, stream));      // combine data
-        }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Cross-rank barrier so no peer races ahead and writes into a buffer another
-        // peer has not yet cleared. NVL (intranode) + RDMA (internode) both needed.
-        if (num_nvl_bytes > 0) {
-            intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, stream);
-            intranode::barrier(combine_barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
-        if (is_available() and num_rdma_bytes > 0) {
-            internode::barrier();
-        }
-    }
+    // DeepEP-aligned buffer cleanup (no host-side full memset + no extra barriers):
+    //   - dispatch region: cleaned in-kernel by notify_dispatch below (its clean_meta range),
+    //     exactly like DeepEP's dispatch.
+    //   - combine region: cleaned in-kernel by internode::cached_notify further below, exactly
+    //     like DeepEP's internode_combine. cached_notify does the clean + a cross-rank barrier
+    //     inside the collective, so no separate intranode/internode barrier is needed.
+    // Both cleans zero only the head/tail metadata (KB), not the MB-scale data payload, and they
+    // run every iteration (including the first), so we no longer memset the whole symmetric buffer.
 
     printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d dispatch_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) combine_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
            rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
@@ -2167,6 +2177,12 @@ torch::Tensor Buffer::megakernel_forward(
     // Keep notify_dispatch's buffer cleanup aligned with the megakernel logical-channel layout.
     // The prefix matrices are regenerated below for logical channels, but the cleanup range must
     // cover every logical-channel RDMA/NVL buffer slice before the megakernel starts using them.
+#if MK_PERF_TRACE_ENABLED
+    cudaEvent_t mk_notify_start_ev, mk_notify_end_ev;
+    AT_CUDA_CHECK(cudaEventCreate(&mk_notify_start_ev));
+    AT_CUDA_CHECK(cudaEventCreate(&mk_notify_end_ev));
+    AT_CUDA_CHECK(cudaEventRecord(mk_notify_start_ev, stream));
+#endif
     internode::notify_dispatch(
         num_tokens_per_rank.data_ptr<int>(),
         moe_recv_counter_mapped,
@@ -2198,6 +2214,9 @@ torch::Tensor Buffer::megakernel_forward(
         num_rdma_bytes,
         num_nvl_bytes,
         low_latency_mode);
+#if MK_PERF_TRACE_ENABLED
+    AT_CUDA_CHECK(cudaEventRecord(mk_notify_end_ev, stream));
+#endif
 
     const int source_meta_bytes = internode::get_source_meta_bytes();
     auto get_num_bytes_per_token = [&](int num_topk_idx, int num_topk_weights) {
@@ -2247,6 +2266,72 @@ torch::Tensor Buffer::megakernel_forward(
         printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
     printf("]\n");
 
+#if MK_PERF_TRACE_ENABLED
+    // Emit the megakernel-path notify_dispatch cost as its own Perfetto track so it can be
+    // compared against the DeepEP baseline notify_dispatch. The per-process iteration counter
+    // stays in lockstep with dump_perf_trace_perfetto (both advance once per megakernel_forward).
+    {
+        AT_CUDA_CHECK(cudaEventSynchronize(mk_notify_end_ev));
+        float mk_notify_ms = 0.0f;
+        AT_CUDA_CHECK(cudaEventElapsedTime(&mk_notify_ms, mk_notify_start_ev, mk_notify_end_ev));
+        AT_CUDA_CHECK(cudaEventDestroy(mk_notify_start_ev));
+        AT_CUDA_CHECK(cudaEventDestroy(mk_notify_end_ev));
+
+        static int mk_notify_trace_iter = 0;
+        const int notify_iter = mk_notify_trace_iter++;
+        char notify_fn[256];
+        snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify_iter%d.json", rank, notify_iter);
+        FILE* nf = fopen(notify_fn, "w");
+        if (nf) {
+            const double notify_us = mk_notify_ms * 1000.0;
+            fprintf(nf, "[\n");
+            fprintf(nf, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
+            fprintf(nf, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
+            fprintf(nf, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":90000,\"args\":{\"name\":\"host_notify_dispatch\"}},\n", rank);
+            fprintf(nf, "{\"name\":\"notify_dispatch\",\"cat\":\"mk_notify\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":90000}\n",
+                    notify_us, rank);
+            fprintf(nf, "]\n");
+            fclose(nf);
+            printf("[MK-PERF] rank=%d notify_dispatch trace -> %s (%.3f us)\n", rank, notify_fn, notify_us);
+        } else {
+            printf("[MK-PERF] rank=%d failed to open %s\n", rank, notify_fn);
+        }
+    }
+#endif
+
+    // Clean the combine region the DeepEP way: a clean-only cached_notify (num_combined_tokens=0,
+    // null heads => no head normalization, just zero the combine head/tail metadata + a cross-rank
+    // barrier inside the collective). This mirrors internode_combine's cached_notify and replaces
+    // the old host-side full-buffer memset + intranode/internode barriers. The combine buffers live
+    // in the second half of the symmetric allocation:
+    //   RDMA  combine half : rdma_buffer_ptr + num_rdma_bytes  (see megakernel.cu combine_rdma_ptr)
+    //   NVL   combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
+    {
+        void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
+        internode::cached_notify(hidden_int4,
+                                 0,          // num_scales (combine payload carries no scales)
+                                 0,          // num_topk_idx
+                                 num_topk,   // num_topk_weights
+                                 num_ranks,
+                                 num_logical_channels,
+                                 0,          // num_combined_tokens => clean + barrier only
+                                 nullptr,    // combined_rdma_head
+                                 nullptr,    // rdma_channel_prefix_matrix
+                                 nullptr,    // rdma_rank_prefix_sum
+                                 nullptr,    // combined_nvl_head
+                                 combine_rdma_ptr,
+                                 combine_num_max_rdma_chunked_recv_tokens,
+                                 combine_buffer_ptrs_gpu,
+                                 combine_num_max_nvl_chunked_recv_tokens,
+                                 combine_barrier_signal_ptrs_gpu,
+                                 rank,
+                                 stream,
+                                 num_rdma_bytes,
+                                 num_nvl_bytes,
+                                 false,      // is_cached_dispatch (matches internode_combine)
+                                 low_latency_mode);
+    }
+
     // Step 3: Allocate and launch megakernel v7
     const int max_total_recv_tokens = *moe_recv_counter;
     // Per-expert budget: evenly distribute received tokens across local experts, with 2x headroom
@@ -2262,7 +2347,8 @@ torch::Tensor Buffer::megakernel_forward(
 
     printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
 
-    auto* state = megakernel::allocate_megakernel_state_v7(
+    auto allocate_state = [&](auto allocator) {
+        return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
         x_scales_ptr,
         reinterpret_cast<const topk_idx_t*>(topk_idx.data_ptr()),
@@ -2311,6 +2397,11 @@ torch::Tensor Buffer::megakernel_forward(
         max_total_recv_tokens > 0 ? max_total_recv_tokens : 1,
         num_rdma_bytes,
         num_nvl_bytes);
+    };
+
+    void* state = debug
+        ? static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7))
+        : static_cast<void*>(allocate_state(megakernel::allocate_megakernel_state_v7));
 
     printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
 
@@ -2321,26 +2412,59 @@ torch::Tensor Buffer::megakernel_forward(
     // Align all ranks after notify/state setup and immediately before the timed megakernel launch.
     // This keeps dispatch fwd_wait_meta / recv_wait_prefix from measuring host-side node launch skew.
     AT_CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef MK_TOKEN_TRACE
+    fprintf(stderr, "[MK-HOST][BARRIER][BEFORE] rank=%d stream=%p\n", rank, stream.stream());
+    fflush(stderr);
+#endif
     nvshmem_barrier_all();
+#ifdef MK_TOKEN_TRACE
+    fprintf(stderr, "[MK-HOST][BARRIER][AFTER] rank=%d stream=%p\n", rank, stream.stream());
+    fflush(stderr);
+#endif
 
 #endif
 
     // Compute shared memory size
     // Match internode.cu dispatch/combine dynamic shared memory requirements.
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
-    printf("[MK-HOST][KERNEL][BEFORE] rank=%d state=%p total_sms=%d smem_size=%d stream=%p\n",
-           rank, state, active_total_sms, smem_size, stream.stream());
-    megakernel::launch_megakernel_v7(
-        state, active_total_sms, smem_size, stage,
-        use_fp8_compute ? megakernel::ComputeDType::kFP8E4M3 : megakernel::ComputeDType::kBF16,
-        stream);
-    printf("[MK-HOST][KERNEL][AFTER] rank=%d state=%p\n", rank, state);
-
+#ifdef MK_TOKEN_TRACE
+    fprintf(stderr, "[MK-HOST][LAUNCH][BEFORE] rank=%d grid=%d stream=%p state=%p smem=%d dispatch_sms=%d forwarder_sms=%d compute_sms=%d combine_sms=%d logical_channels=%d\n",
+            rank, active_total_sms, stream.stream(), state, smem_size, num_dispatch_sms,
+            num_forwarder_sms, num_compute_sms, num_combine_sms, num_logical_channels);
+    fflush(stderr);
+#endif
+    auto compute_dtype = use_fp8_compute
+        ? megakernel::ComputeDType::kFP8E4M3
+        : megakernel::ComputeDType::kBF16;
+    if (debug) {
+        megakernel_debug::launch_megakernel_debug_forward(
+            static_cast<megakernel_debug::MegaKernelState*>(state),
+            active_total_sms, smem_size, stage, compute_dtype, stream);
+    } else {
+        megakernel::launch_megakernel_v7(
+            static_cast<megakernel::MegaKernelState*>(state),
+            active_total_sms, smem_size, stage, compute_dtype, stream);
+    }
     AT_CUDA_CHECK(cudaGetLastError());
+#ifdef MK_TOKEN_TRACE
+    fprintf(stderr, "[MK-HOST][LAUNCH][AFTER_ERROR_CHECK] rank=%d stream=%p state=%p\n",
+            rank, stream.stream(), state);
+    fflush(stderr);
+    fprintf(stderr, "[MK-HOST][SYNC][BEFORE] rank=%d stream=%p\n", rank, stream.stream());
+    fflush(stderr);
+#endif
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+#ifdef MK_TOKEN_TRACE
+    fprintf(stderr, "[MK-HOST][SYNC][AFTER] rank=%d stream=%p\n", rank, stream.stream());
+    fflush(stderr);
+#endif
 
     // Get combined_x directly (bf16, no extra copy/convert)
-    void* combined_x_ptr = megakernel::get_combined_x_ptr(state);
+    void* combined_x_ptr = debug
+        ? megakernel_debug::get_combined_x_ptr(
+              static_cast<megakernel_debug::MegaKernelState*>(state))
+        : megakernel::get_combined_x_ptr(
+              static_cast<megakernel::MegaKernelState*>(state));
     auto combined_x_tensor = torch::from_blob(
         combined_x_ptr,
         {num_tokens, hidden_dim},
@@ -2349,14 +2473,110 @@ torch::Tensor Buffer::megakernel_forward(
     // Clone before freeing state
     auto result = combined_x_tensor.clone();
 
-    megakernel::free_megakernel_state_v7(state);
+    std::shared_ptr<MegaKernelAutogradContext> context;
+    if (retain_state) {
+        EP_HOST_ASSERT(debug && !use_fp8_compute && "training state currently requires debug BF16 mode");
+        context = std::make_shared<MegaKernelAutogradContext>(
+            static_cast<megakernel_debug::MegaKernelState*>(state));
+    } else if (debug) {
+        megakernel_debug::free_megakernel_state_v7(
+            static_cast<megakernel_debug::MegaKernelState*>(state));
+    } else {
+        megakernel::free_megakernel_state_v7(
+            static_cast<megakernel::MegaKernelState*>(state));
+    }
 
-    return result;
+    return {result, context};
 #else
     EP_HOST_ASSERT(false && "megakernel_forward requires NVSHMEM support");
+    return {torch::Tensor(), nullptr};
+#endif
+}
+
+#define MEGAKERNEL_FORWARD_ARGS \
+    x, topk_idx, topk_weights, W_gateup, W_down, num_experts, \
+    num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config, \
+    combine_config, hidden_states_scales_obj, W_gateup_fp8_obj, \
+    W_down_fp8_obj, W_gateup_fp8_sf_obj, W_down_fp8_sf_obj
+
+#define DEFINE_MEGAKERNEL_FORWARD_MEMBER(name, debug_mode) \
+torch::Tensor Buffer::name( \
+    const torch::Tensor& x, \
+    const torch::Tensor& topk_idx, \
+    const torch::Tensor& topk_weights, \
+    const torch::Tensor& W_gateup, \
+    const torch::Tensor& W_down, \
+    int num_experts, \
+    int num_dispatch_sms, \
+    int num_combine_sms, \
+    int total_sms, \
+    int stage, \
+    const Config& dispatch_config, \
+    const Config& combine_config, \
+    const pybind11::object& hidden_states_scales_obj, \
+    const pybind11::object& W_gateup_fp8_obj, \
+    const pybind11::object& W_down_fp8_obj, \
+    const pybind11::object& W_gateup_fp8_sf_obj, \
+    const pybind11::object& W_down_fp8_sf_obj) { \
+    return std::get<0>(megakernel_forward_impl(MEGAKERNEL_FORWARD_ARGS, debug_mode, false)); \
+}
+
+DEFINE_MEGAKERNEL_FORWARD_MEMBER(megakernel_forward, false)
+DEFINE_MEGAKERNEL_FORWARD_MEMBER(megakernel_debug_forward, true)
+
+std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_train(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& W_gateup,
+    const torch::Tensor& W_down,
+    int num_experts,
+    int num_dispatch_sms,
+    int num_combine_sms,
+    int total_sms,
+    int stage,
+    const Config& dispatch_config,
+    const Config& combine_config) {
+    pybind11::object none = pybind11::none();
+    return megakernel_forward_impl(
+        x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
+        num_dispatch_sms, num_combine_sms, total_sms, stage,
+        dispatch_config, combine_config, none, none, none, none, none, true, true);
+}
+
+torch::Tensor Buffer::megakernel_debug_backward(
+    const std::shared_ptr<MegaKernelAutogradContext>& context,
+    const torch::Tensor& grad_output,
+    int total_sms,
+    int stage) {
+#ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(context != nullptr && context->state() != nullptr);
+    EP_HOST_ASSERT(grad_output.dim() == 2 && grad_output.is_contiguous());
+    EP_HOST_ASSERT(grad_output.is_cuda() && grad_output.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(stage >= 1 && stage <= 2);
+
+    pybind11::gil_scoped_release release;
+    auto grad_input = torch::empty_like(grad_output);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
+        context->state(), grad_output.data_ptr(), grad_input.data_ptr(), total_sms, stream);
+    megakernel_debug::prepare_megakernel_communication_replay(
+        context->state(), barrier_signal_ptrs_gpu,
+        combine_barrier_signal_ptrs_gpu, stream);
+    const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
+    megakernel_debug::launch_megakernel_debug_backward(
+        backward_state, total_sms, smem_size, stage,
+        megakernel_debug::ComputeDType::kBF16, stream);
+    megakernel_debug::free_megakernel_backward_state(backward_state);
+    return grad_input;
+#else
+    EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
     return torch::Tensor();
 #endif
 }
+
+#undef DEFINE_MEGAKERNEL_FORWARD_MEMBER
+#undef MEGAKERNEL_FORWARD_ARGS
 
 }  // namespace deep_ep
 
@@ -2377,6 +2597,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+
+    pybind11::class_<deep_ep::MegaKernelAutogradContext,
+                     std::shared_ptr<deep_ep::MegaKernelAutogradContext>>(
+        m, "MegaKernelAutogradContext");
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
@@ -2421,6 +2645,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("W_down_fp8") = py::none(),
              py::arg("W_gateup_fp8_sf") = py::none(),
              py::arg("W_down_fp8_sf") = py::none())
+        .def("megakernel_debug_forward", &deep_ep::Buffer::megakernel_debug_forward,
+             py::arg("x"),
+             py::arg("topk_idx"),
+             py::arg("topk_weights"),
+             py::arg("W_gateup"),
+             py::arg("W_down"),
+             py::arg("num_experts"),
+             py::arg("num_dispatch_sms") = 24,
+             py::arg("num_combine_sms") = 24,
+             py::arg("total_sms") = 148,
+             py::arg("stage") = 1,
+             py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
+             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
+             py::arg("hidden_states_scales") = py::none(),
+             py::arg("W_gateup_fp8") = py::none(),
+             py::arg("W_down_fp8") = py::none(),
+             py::arg("W_gateup_fp8_sf") = py::none(),
+             py::arg("W_down_fp8_sf") = py::none())
+        .def("megakernel_debug_forward_train", &deep_ep::Buffer::megakernel_debug_forward_train,
+             py::arg("x"), py::arg("topk_idx"), py::arg("topk_weights"),
+             py::arg("W_gateup"), py::arg("W_down"), py::arg("num_experts"),
+             py::arg("num_dispatch_sms") = 24, py::arg("num_combine_sms") = 24,
+             py::arg("total_sms") = 148, py::arg("stage") = 1,
+             py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
+             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
+        .def("megakernel_debug_backward", &deep_ep::Buffer::megakernel_debug_backward,
+             py::arg("context"), py::arg("grad_output"),
+             py::arg("total_sms") = 148, py::arg("stage") = 1)
 #if MK_PERF_TRACE_ENABLED
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
 #endif

@@ -1040,7 +1040,7 @@ __device__ void dg_gemm_persistent(
 
 
 // TMEM dealloc (call once after persistent loop). Allocator must match the run path.
-__device__ void umma_dealloc(char* cluster_smem) {
+__device__ inline void umma_dealloc(char* cluster_smem) {
     using Allocator = cute::conditional_t<kDgRunMulticast == 1,
                                           cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
     constexpr uint32_t SMEM_CD_SIZE = kDgStoreBlockM * kDgStoreBlockN * sizeof(cutlass::bfloat16_t) * kDgWsNumTmaStoreStages;
@@ -1061,7 +1061,7 @@ __device__ void umma_dealloc(char* cluster_smem) {
 // DeepGEMM gate/up + SwiGLU for one (m_block,n_block) tile. Mirrors
 // compute_ref/umma_swiglu_ws_dg.cu launch_swiglu_dg_copy: gate GEMM materializes
 // BF16 gate, then up GEMM runs with the SwiGLU-from-gate epilogue.
-__device__ void umma_up_swiglu_tile(
+__device__ inline void umma_up_swiglu_tile(
     const CUtensorMap* desc_a, const CUtensorMap* desc_gate_cd, const CUtensorMap* desc_act_cd,
     const CUtensorMap* desc_wgate, const CUtensorMap* desc_wup,
     int i_tile, __nv_bfloat16* gate_out, const float* route_w,
@@ -1102,7 +1102,7 @@ __device__ void umma_up_swiglu_tile(
 //   cluster_idx  : cluster_in_group (0..num_clusters-1)
 //   num_clusters : COMPUTE_GROUP_SIZE/2 (16) for the 16-cluster sharing
 // ===========================================================================
-__device__ void umma_up_swiglu_persistent(
+__device__ inline void umma_up_swiglu_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_gate_cd, const CUtensorMap* desc_act_cd,
     const CUtensorMap* desc_wgate, const CUtensorMap* desc_wup,
     __nv_bfloat16* gate_out, const float* route_w,
@@ -1131,7 +1131,7 @@ __device__ void umma_up_swiglu_persistent(
 // GU[M,2I] in TMEM, then the epilogue collapses every (gate,up) pair to act[M,I]
 // and stores directly to desc_act_cd. No GU round-trip through GMEM is needed.
 // ===========================================================================
-__device__ void umma_gateup_interleaved_persistent(
+__device__ inline void umma_gateup_interleaved_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_wgateup, const CUtensorMap* desc_act_cd,
     const float* route_w, int M, int I, int d,
     int cluster_idx, int num_clusters,
@@ -1157,7 +1157,7 @@ __device__ void umma_gateup_interleaved_persistent(
 //   K == intermediate (I), N == hidden.
 //   accum_iter starts fresh at 0 (down runs after its own init_barriers_tmem).
 // ===========================================================================
-__device__ void umma_down_persistent(
+__device__ inline void umma_down_persistent(
     const CUtensorMap* desc_act_a, const CUtensorMap* desc_wdown, const CUtensorMap* desc_down_cd,
     int M, int hidden, int intermediate,
     int cluster_idx, int num_clusters,
@@ -1179,7 +1179,7 @@ __device__ void umma_down_persistent(
 //   desc_wdown : W_down[expert] [hidden, I] = [N, K] K-major
 //   desc_down_cd : down_buf [M, hidden] row-major CD (in.down_cd)
 //   d_tile : linear output tile id over [M_tiles, hidden_tiles]
-__device__ void umma_down_proj_tile_dg(
+__device__ inline void umma_down_proj_tile_dg(
     const CUtensorMap* desc_act_a, const CUtensorMap* desc_wdown, const CUtensorMap* desc_down_cd,
     int d_tile, int M, int hidden, int intermediate,
     char* cluster_smem, bool& tmem_allocated, uint32_t& accum_iter) {
