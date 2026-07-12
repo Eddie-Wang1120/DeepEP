@@ -2328,7 +2328,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
                                  stream,
                                  num_rdma_bytes,
                                  num_nvl_bytes,
-                                 false,      // is_cached_dispatch (matches internode_combine)
+                                 true,       // is_cached_dispatch: clean-only. Makes cached_notify's
+                                             // sm_id==1/>=2 head-normalization warps return early
+                                             // (internode.cu:1432/1465), so the null head/prefix
+                                             // pointers are never dereferenced. Only sm_id==0 runs,
+                                             // which does the RDMA/NVL clean + cross-rank barrier.
+                                             // get_nvl_clean_meta ignores this flag, so the combine
+                                             // clean range is unchanged. MK does its own head
+                                             // normalization inside the combine worker.
                                  low_latency_mode);
     }
 
@@ -2560,8 +2567,8 @@ torch::Tensor Buffer::megakernel_debug_backward(
     auto stream = at::cuda::getCurrentCUDAStream();
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(), total_sms, stream);
-    megakernel_debug::prepare_megakernel_communication_replay(
-        context->state(), barrier_signal_ptrs_gpu,
+    megakernel_debug::prepare_megakernel_backward_communication_replay(
+        backward_state, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     megakernel_debug::launch_megakernel_debug_backward(

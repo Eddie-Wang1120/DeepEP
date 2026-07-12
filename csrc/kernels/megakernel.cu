@@ -37,6 +37,8 @@
 #include <mma.h>
 #include <limits>
 #include <vector>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #if MK_PERF_TRACE_ENABLED
 #include <cstdio>
 #endif
@@ -337,6 +339,9 @@ struct MegaKernelState {
     int* publish_done_count;          // atomic: how many publisher warps have drained
     int* publish_all_done;            // flag: 1 once all publishers drained (scheduler/gather use)
     int num_pub_warps_total;          // = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS
+
+    // Backing store for the fused buffer-init descriptors (see fused_fill_kernel). Freed with the state.
+    void* fused_fill_desc_buf;
 
 #if MK_PERF_TRACE_ENABLED
     // Per-logical-channel timing. Each logical channel has sender and forwarder rows
@@ -2609,7 +2614,7 @@ __device__ void dispatch_worker_v2(
 
     // Dispatch-only profiling: the scheduler role is intentionally disabled, so
     // entering the reused compute loop would wait forever on compute_enqueue_done.
-    return;
+    // return;
 
     // const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
     // const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
@@ -6431,9 +6436,9 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     // Dispatch-only profiling experiment. Disabled roles leave before trace
     // alignment or worker entry so none of their polling loops remain active.
-    if (role == SmRole::kCombine || role == SmRole::kScheduler ||
-        role == SmRole::kCompute || role == SmRole::kGather)
-        return;
+    // if (role == SmRole::kCombine || role == SmRole::kScheduler ||
+    //     role == SmRole::kCompute || role == SmRole::kGather)
+    //     return;
 
     // notify_dispatch already drains the communication QPs and synchronizes ranks
     // on this CUDA stream. Preserve DeepEP's kernel-boundary ordering instead of
@@ -8511,6 +8516,51 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 }
 #endif
 
+// Route megakernel-state device buffers through PyTorch's CUDA caching allocator — the
+// exact same allocator torch::empty uses, and the mechanism original DeepEP relies on to
+// avoid per-call allocation overhead. After warmup, freed blocks are cached and reused, so
+// repeated allocate/free of the same sizes issue no cudaMalloc/cudaFree syscalls (which are
+// synchronous and were the source of the ~18ms inter-call gap). Within allocate_megakernel_state_v7
+// and free_megakernel_state_v7 the cudaMalloc/cudaFree tokens are redirected here.
+static inline cudaError_t mk_caching_alloc(void** pp, size_t nbytes) {
+    *pp = (nbytes == 0) ? nullptr : c10::cuda::CUDACachingAllocator::raw_alloc(nbytes);
+    return (*pp != nullptr || nbytes == 0) ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+static inline cudaError_t mk_caching_free(void* ptr) {
+    if (ptr != nullptr)
+        c10::cuda::CUDACachingAllocator::raw_delete(ptr);
+    return cudaSuccess;
+}
+
+// Fused device-side buffer initializer. All per-call buffer inits in allocate_megakernel_state_v7
+// are recorded as (ptr, bytes, word) descriptors and applied by ONE async kernel launched on the
+// megakernel's stream — replacing the pile of synchronous cudaMemset calls. `word` is the byte
+// value broadcast to 32 bits (0 -> 0x00000000, 0xff -> 0xffffffff = -1). Buffers are >= 4-byte
+// sized; a byte tail is still handled for safety.
+struct FusedFillDesc {
+    void* ptr;
+    size_t bytes;
+    uint32_t word;
+};
+
+__global__ void fused_fill_kernel(const FusedFillDesc* __restrict__ descs, int num_descs) {
+    const int d = blockIdx.y;
+    if (d >= num_descs)
+        return;
+    FusedFillDesc desc = descs[d];
+    const size_t num_words = desc.bytes / sizeof(uint32_t);
+    uint32_t* wp = reinterpret_cast<uint32_t*>(desc.ptr);
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < num_words;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        wp[i] = desc.word;
+    if (blockIdx.x == 0) {
+        const size_t tail_start = num_words * sizeof(uint32_t);
+        const uint8_t bval = static_cast<uint8_t>(desc.word & 0xffu);
+        for (size_t b = tail_start + threadIdx.x; b < desc.bytes; b += blockDim.x)
+            reinterpret_cast<uint8_t*>(desc.ptr)[b] = bval;
+    }
+}
+
 MegaKernelState* allocate_megakernel_state_v7(
     // --- Dispatch input data (from PyTorch tensors) ---
     const int4* x,
@@ -8570,6 +8620,25 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t num_rdma_bytes,
     int64_t num_nvl_bytes
 ) {
+    // Redirect all state-buffer allocation to PyTorch's caching allocator (see mk_caching_alloc).
+#define cudaMalloc(pp, n) mk_caching_alloc((void**)(pp), (n))
+
+    // Record every cudaMemset below instead of executing it; all recorded inits are then applied
+    // by ONE async fused_fill_kernel on the megakernel's stream (see flush before return).
+    struct MkFillRec {
+        void* ptr;
+        int byte_value;
+        size_t bytes;
+    };
+    std::vector<MkFillRec> mk_fill_recs;
+    mk_fill_recs.reserve(64);
+    auto mk_record_fill = [&](void* p, int v, size_t n) -> cudaError_t {
+        if (p != nullptr && n > 0)
+            mk_fill_recs.push_back(MkFillRec{p, v, n});
+        return cudaSuccess;
+    };
+#define cudaMemset(p, v, n) mk_record_fill((p), (v), (n))
+
     // Allocate workspace buffers on device
     int* expert_recv_count;
     int* dispatch_done;
@@ -9709,11 +9778,39 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(combined_topk_weights, 0, num_tokens * num_topk * sizeof(float)));
     host_state.combined_topk_weights = combined_topk_weights;
 
+#undef cudaMemset
+    // Build fused-init descriptors from every recorded cudaMemset above.
+    const int mk_num_fills = static_cast<int>(mk_fill_recs.size());
+    void* fill_desc_buf = nullptr;
+    if (mk_num_fills > 0) {
+        std::vector<FusedFillDesc> host_descs(mk_num_fills);
+        for (int i = 0; i < mk_num_fills; ++i) {
+            const uint32_t bval = static_cast<uint32_t>(mk_fill_recs[i].byte_value & 0xff);
+            host_descs[i] = FusedFillDesc{mk_fill_recs[i].ptr, mk_fill_recs[i].bytes, bval * 0x01010101u};
+        }
+        CUDA_CHECK(cudaMalloc(&fill_desc_buf, static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc)));
+        CUDA_CHECK(cudaMemcpy(fill_desc_buf, host_descs.data(),
+                              static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc), cudaMemcpyHostToDevice));
+    }
+    host_state.fused_fill_desc_buf = fill_desc_buf;
+
     // Copy to device
     MegaKernelState* device_state;
     CUDA_CHECK(cudaMalloc(&device_state, sizeof(MegaKernelState)));
     CUDA_CHECK(cudaMemcpy(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
 
+    // Apply all buffer inits with ONE async kernel on the megakernel's stream. No host-side
+    // sync and no per-buffer cudaMemset: the fill kernel is ordered before the megakernel
+    // (same stream), so the buffers are initialized by the time the megakernel reads them.
+    if (mk_num_fills > 0) {
+        cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
+        dim3 fill_grid(256, static_cast<unsigned>(mk_num_fills));
+        fused_fill_kernel<<<fill_grid, 256, 0, init_stream>>>(
+            reinterpret_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_fills);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+#undef cudaMalloc
     return device_state;
 }
 
@@ -9721,6 +9818,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     // Copy back to read pointers for freeing
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+
+    // Return all state buffers to PyTorch's caching allocator (see mk_caching_free).
+#define cudaFree(p) mk_caching_free(p)
 
     CUDA_CHECK(cudaFree(host_state.expert_recv_count));
     CUDA_CHECK(cudaFree(host_state.expert_slot_ready));
@@ -10001,7 +10101,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_task_cas_failures));
     CUDA_CHECK(cudaFree(host_state.perf_task_group_id));
 #endif
+    CUDA_CHECK(cudaFree(host_state.fused_fill_desc_buf));
     CUDA_CHECK(cudaFree(device_state));
+#undef cudaFree
 }
 
 float* get_output_accum_ptr(MegaKernelState* device_state) {

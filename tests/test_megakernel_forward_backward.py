@@ -124,12 +124,12 @@ def compare_tensor(name, baseline, actual, rank, max_abs_tol, calc_diff_tol, cos
     passed = max_abs_diff <= max_abs_tol and diff <= calc_diff_tol and cos_sim >= cos_tol
 
     if rank == 0:
-        print(f'  {name}:', flush=True)
-        print(f'    calc_diff={diff:.6e} (tol={calc_diff_tol:.1e})', flush=True)
-        print(f'    max_abs_diff={max_abs_diff:.6e} (tol={max_abs_tol:.1e})', flush=True)
-        print(f'    cosine_similarity={cos_sim:.6f} (tol={cos_tol:.6f})', flush=True)
-        print(f'    baseline_norm={baseline.float().norm().item():.6e}', flush=True)
-        print(f'    megakernel_norm={actual.float().norm().item():.6e}', flush=True)
+        print(f'[Rank {rank}] === Megakernel {name} vs Baseline Precision Alignment ===', flush=True)
+        print(f'  calc_diff (lower=better): {diff:.6e} (tol={calc_diff_tol:.1e})', flush=True)
+        print(f'  max_abs_diff: {max_abs_diff:.6e} (tol={max_abs_tol:.1e})', flush=True)
+        print(f'  cosine_similarity: {cos_sim:.6f} (tol={cos_tol:.6f})', flush=True)
+        print(f'  baseline norm: {baseline.float().norm().item():.6e}', flush=True)
+        print(f'  megakernel norm: {actual.float().norm().item():.6e}', flush=True)
 
     if not passed:
         raise AssertionError(
@@ -233,12 +233,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         args.forward_max_abs_tol, args.forward_calc_diff_tol, args.forward_cos_tol,
     )
     compare_tensor(
-        'dX', baseline_grad_x, megakernel_grad_x, rank,
-        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
-    )
-
-    compare_tensor(
-        'grad_x', baseline_grad_x, megakernel_grad_x, rank,
+        'Backward dX', baseline_grad_x, megakernel_grad_x, rank,
         args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
     )
 

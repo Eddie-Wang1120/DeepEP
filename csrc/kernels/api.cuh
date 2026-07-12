@@ -503,6 +503,11 @@ void prepare_megakernel_communication_replay(
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
+void prepare_megakernel_backward_communication_replay(
+    MegaKernelBackwardState* backward_state,
+    int** dispatch_barrier_signal_ptrs,
+    int** combine_barrier_signal_ptrs,
+    cudaStream_t stream);
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
     int total_sms,

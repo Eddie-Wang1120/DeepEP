@@ -5015,6 +5015,22 @@ __device__ void combine_worker_v2(
                         const int4* token_out_i4 = reinterpret_cast<const int4*>(state->combine_input);
                         // No per-slot wait here. combine_token_ready is the only readiness signal.
                         __syncwarp();
+                        if (state->rank == 0 && token_idx == 0 && lane_id == 0) {
+                            const __nv_bfloat16* combine_values =
+                                state->combine_input + (int64_t)token_idx * hidden;
+                            float sum_abs = 0.0f;
+                            float max_abs = 0.0f;
+                            int nonzero = 0;
+                            const int sample = min(hidden, 256);
+                            for (int i = 0; i < sample; ++i) {
+                                float value = fabsf(__bfloat162float(combine_values[i]));
+                                sum_abs += value;
+                                max_abs = max(max_abs, value);
+                                nonzero += value != 0.0f;
+                            }
+                            printf("[MK-BWD-TRACE][COMBINE-READ] token=%lld sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+                                   (long long)token_idx, sample, sum_abs, max_abs, nonzero);
+                        }
 #if MK_PERF_TRACE_ARGS
                         if (lane_id == 0) {
                             int64_t now = globaltimer_ns();
@@ -5880,6 +5896,22 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         __syncthreads();
         __threadfence();
         __syncthreads();
+        if (state->rank == 0 && gather_sm_idx == 0 && tid == 0 && batch_count > 0) {
+            const int token_idx = state->gather_ready_queue[token_base];
+            const __nv_bfloat16* gathered = state->combine_input + (int64_t)token_idx * hidden;
+            float sum_abs = 0.0f;
+            float max_abs = 0.0f;
+            int nonzero = 0;
+            const int sample = min(hidden, 256);
+            for (int i = 0; i < sample; ++i) {
+                float value = fabsf(__bfloat162float(gathered[i]));
+                sum_abs += value;
+                max_abs = max(max_abs, value);
+                nonzero += value != 0.0f;
+            }
+            printf("[MK-BWD-TRACE][GATHER-OUT] token=%d nhits=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+                   token_idx, state->token_nhits[token_idx], sample, sum_abs, max_abs, nonzero);
+        }
         for (int batch_idx = tid; batch_idx < batch_count; batch_idx += blockDim.x) {
             const int token_idx = state->gather_ready_queue[token_base + batch_idx];
             atomicExch(&state->combine_token_ready[token_idx], 1);
@@ -10238,10 +10270,55 @@ struct MegaKernelBackwardState {
 
     const __nv_bfloat16* grad_output;     // [num_combined_tokens, hidden] dY (== bwd_device_state->x)
     __nv_bfloat16* grad_input;            // [num_combined_tokens, hidden] dX (== bwd_device_state->combined_x)
+    int4* owned_combined_x;               // allocator-owned output restored before freeing bwd_device_state
 };
 
-// One block per expert: transpose W_gateup[e] [2I,hidden] -> [hidden,2I]
-// and W_down[e] [hidden,I] -> [I,hidden].
+__device__ __forceinline__ void trace_backward_values(
+    const char* stage,
+    const __nv_bfloat16* values,
+    int num_values,
+    int rank,
+    int task_idx,
+    int expert_id,
+    int batch_size
+) {
+    if (rank != 0 || task_idx != 0 || threadIdx.x != 0)
+        return;
+    const int sample = min(num_values, 256);
+    float sum_abs = 0.0f;
+    float max_abs = 0.0f;
+    int nonzero = 0;
+    for (int i = 0; i < sample; ++i) {
+        float value = fabsf(__bfloat162float(values[i]));
+        sum_abs += value;
+        max_abs = max(max_abs, value);
+        nonzero += value != 0.0f;
+    }
+    printf("[MK-BWD-TRACE][%s] task=%d expert=%d batch=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+           stage, task_idx, expert_id, batch_size, sample, sum_abs, max_abs, nonzero);
+}
+
+__global__ void trace_backward_boundary_kernel(
+    const MegaKernelBackwardState* bs,
+    int phase
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const MegaKernelState* state = bs->bwd_device_state;
+    if (state == nullptr || state->rank != 0)
+        return;
+    const __nv_bfloat16* values = phase == 0 ? bs->grad_output : bs->grad_input;
+    trace_backward_values(
+        phase == 0 ? "GRAD-OUTPUT" : "GRAD-INPUT", values,
+        state->num_tokens * state->hidden_dim, state->rank, 0, -1, state->num_tokens);
+    printf("[MK-BWD-TRACE][STATE-%s] task_head=%d task_tail=%d enqueue_done=%d "
+           "gather_head=%d gather_tail=%d dispatch_done=%d combine_done=%d\n",
+           phase == 0 ? "BEFORE" : "AFTER",
+           *state->compute_task_head, *state->compute_task_tail, *state->compute_enqueue_done,
+           *state->gather_ready_head, *state->gather_ready_tail,
+           *state->dispatch_done, *state->combine_all_done);
+}
+
 __global__ void bwd_transpose_weights_kernel(
     const __nv_bfloat16* __restrict__ Wgu,   // [E, 2I, hidden]
     const __nv_bfloat16* __restrict__ Wd,    // [E, hidden, I]
@@ -10402,6 +10479,12 @@ __device__ void compute_backward_worker(
             }
         }
         compute_group_sync(state, group_id, group_size);
+        if (group_sm_idx == 0) {
+            trace_backward_values("GRAD-DOWN", input_buf, batch_size * hidden,
+                                  state->rank, task_idx, expert_id, batch_size);
+            trace_backward_values("ACTIVATION", down_buf, batch_size * hidden,
+                                  state->rank, task_idx, expert_id, batch_size);
+        }
 
         const __nv_bfloat16* Wgu_e  = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
         const __nv_bfloat16* WguT_e = &bs->W_gateup_T[(size_t)expert_id * hidden * twoI];        // [hidden,2I]
@@ -10416,6 +10499,10 @@ __device__ void compute_backward_worker(
         device_gemm_bf16(input_buf, WdT_e, up_buf, batch_size, hidden, intermediate,
                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
         compute_group_sync(state, group_id, group_size);
+        if (group_sm_idx == 0) {
+            trace_backward_values("GRAD-ACT", up_buf, batch_size * intermediate,
+                                  state->rank, task_idx, expert_id, batch_size);
+        }
 
         // SwiGLU backward: gu_buf(GU) + up_buf(grad_act) -> gu_buf(grad_gu), interleaved.
         for (int idx = group_thread_id; idx < batch_size * intermediate; idx += group_num_threads) {
@@ -10435,11 +10522,19 @@ __device__ void compute_backward_worker(
             gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
         }
         compute_group_sync(state, group_id, group_size);
+        if (group_sm_idx == 0) {
+            trace_backward_values("GRAD-GU", gu_buf, batch_size * twoI,
+                                  state->rank, task_idx, expert_id, batch_size);
+        }
 
         // grad_xperm = grad_gu @ W_gateup -> down_buf [M,hidden] (device_gemm computes grad_gu @ W_gateup_T^T)
         device_gemm_bf16(gu_buf, WguT_e, down_buf, batch_size, twoI, hidden,
                          group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
         compute_group_sync(state, group_id, group_size);
+        if (group_sm_idx == 0) {
+            trace_backward_values("GRAD-XPERM", down_buf, batch_size * hidden,
+                                  state->rank, task_idx, expert_id, batch_size);
+        }
 
         // ---- per-slot output scatter (identical to forward down output) ----
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
@@ -10457,6 +10552,15 @@ __device__ void compute_backward_worker(
         }
         __threadfence();
         compute_group_sync(state, group_id, group_size);
+        if (group_sm_idx == 0 && batch_size > 0) {
+            const int recv_token = s_recv_token_idx[0];
+            const __nv_bfloat16* scatter_values = s_is_single[0]
+                ? state->combine_input + (int64_t)recv_token * hidden
+                : state->compute_output_slot + (int64_t)slot_base * hidden;
+            trace_backward_values(
+                s_is_single[0] ? "SCATTER-SINGLE" : "SCATTER-SLOT",
+                scatter_values, hidden, state->rank, task_idx, expert_id, batch_size);
+        }
 
         // ---- signal per-token completion (identical to forward) ----
         for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
@@ -10590,6 +10694,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     if (rebuilt.owns_bwd_fc1_input) CUDA_CHECK(cudaFree(rebuilt.bwd_fc1_input));
     rebuilt.bwd_fc1_input = fs.bwd_fc1_input;
     rebuilt.owns_bwd_fc1_input = false;
+    int4* owned_combined_x = rebuilt.combined_x;
+    rebuilt.combined_x = reinterpret_cast<int4*>(grad_input);
     CUDA_CHECK(cudaMemcpyAsync(bwd_device_state, &rebuilt, sizeof(MegaKernelState),
                                cudaMemcpyHostToDevice, stream));
 
@@ -10601,6 +10707,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.W_down_T = Wd_T;
     hs.grad_output = reinterpret_cast<const __nv_bfloat16*>(grad_output);
     hs.grad_input = reinterpret_cast<__nv_bfloat16*>(grad_input);
+    hs.owned_combined_x = owned_combined_x;
 
     MegaKernelBackwardState* device_bs;
     CUDA_CHECK(cudaMalloc(&device_bs, sizeof(MegaKernelBackwardState)));
@@ -10617,8 +10724,14 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     EP_HOST_ASSERT(device_bs != nullptr);
     MegaKernelBackwardState hs;
     CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
-   CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_gateup_T)));
+    CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_gateup_T)));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_down_T)));
+    MegaKernelState bwd_state;
+    CUDA_CHECK(cudaMemcpy(
+        &bwd_state, hs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    bwd_state.combined_x = hs.owned_combined_x;
+    CUDA_CHECK(cudaMemcpy(
+        hs.bwd_device_state, &bwd_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
     free_megakernel_state_v7(hs.bwd_device_state);
     CUDA_CHECK(cudaFree(device_bs));
 }
@@ -10776,6 +10889,22 @@ static void launch_megakernel_v7_backward_case(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+void prepare_megakernel_backward_communication_replay(
+    MegaKernelBackwardState* backward_state,
+    int** dispatch_barrier_signal_ptrs,
+    int** combine_barrier_signal_ptrs,
+    cudaStream_t stream
+) {
+    EP_HOST_ASSERT(backward_state != nullptr);
+    MegaKernelBackwardState hs;
+    CUDA_CHECK(cudaMemcpy(
+        &hs, backward_state, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    EP_HOST_ASSERT(hs.bwd_device_state != nullptr);
+    prepare_megakernel_communication_replay(
+        hs.bwd_device_state, dispatch_barrier_signal_ptrs,
+        combine_barrier_signal_ptrs, stream);
+}
+
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
     int total_sms,
@@ -10799,6 +10928,8 @@ void launch_megakernel_debug_backward(
     initialize_megakernel_launch_state(hstate, stream);
     CUDA_CHECK(cudaMemsetAsync(hbs.grad_input, 0,
                                (size_t)hstate.num_tokens * hstate.hidden_dim * sizeof(__nv_bfloat16), stream));
+    trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 0);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int num_ranks = hstate.num_ranks;
@@ -10828,6 +10959,10 @@ void launch_megakernel_debug_backward(
     MEGAKERNEL_BWD_CASE_WITH_DTYPE(kNumRDMARanks, ComputeDType::kBF16)
 
     SWITCH_RDMA_RANKS(MEGAKERNEL_BWD_CASE);
+
+    trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 1);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
 #undef MEGAKERNEL_BWD_CASE
 #undef MEGAKERNEL_BWD_CASE_WITH_DTYPE
