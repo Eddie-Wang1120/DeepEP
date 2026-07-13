@@ -722,9 +722,9 @@ class Buffer:
         @staticmethod
         @torch.autograd.function.once_differentiable
         def backward(ctx, grad_output):
-            grad_x = ctx.runtime.megakernel_debug_backward(
+            grad_x, grad_w_gateup, grad_w_down, grad_topk_weights = ctx.runtime.megakernel_debug_backward(
                 ctx.handle, grad_output.contiguous(), ctx.total_sms, ctx.stage)
-            return (None, grad_x, None, None, None, None,
+            return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
                     None, None, None, None, None, None, None)
 
     def megakernel_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,

@@ -33,7 +33,9 @@
 #include "megakernel_compute_umma.cuh"
 #include "megakernel_compute_umma_fp8.cuh"
 
+#include <ATen/cuda/CUDABlas.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <mma.h>
 #include <limits>
 #include <vector>
@@ -1802,6 +1804,16 @@ __device__ void dispatch_worker_v2(
                     // rank prefix + cumulative channel prefix, with the outer allocation already sliced by logical_channel_id.
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
+#ifdef MK_TOKEN_TRACE
+                    // Producer side: what this forwarder announces to the NVL receiver
+                    // (nvl_prefix_cnt = end_sum-start_sum, per (src_rdma=lane, dst_nvl)) vs what it
+                    // will actually forward from RDMA (num_tokens_to_recv_from_rdma, per src_rdma).
+                    // If they disagree the receiver waits forever -> dispatch NVL data timeout.
+                    printf("[MK-DISPATCH][XCHECK-FWD-META] rank=%d cta=%d channel=%d logical_ch=%d dst_nvl=%d src_rdma=%d meta=(%d,%d,%d,%d) start_sum=%d end_sum=%d nvl_prefix_cnt=%d num_tokens_to_recv_from_rdma=%d\n",
+                           state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
+                           dst_nvl_rank, lane_id, meta_0, meta_1, meta_2, meta_3,
+                           start_sum, end_sum, end_sum - start_sum, num_tokens_to_recv_from_rdma);
+#endif
                     break;
                 }
 
@@ -2092,6 +2104,15 @@ __device__ void dispatch_worker_v2(
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+#ifdef MK_TOKEN_TRACE
+        // Consumer side: how many NVL tokens this receiver expects on (src_nvl, channel).
+        // Per-lane lane_cnt (end-start) must match the producer's nvl_prefix_cnt above for the
+        // same (dst_nvl==this rank's src_nvl, src_rdma==lane). total is what receiver will wait for.
+        if (lane_id < kNumRDMARanks)
+            printf("[MK-DISPATCH][XCHECK-RECV-CNT] rank=%d cta=%d channel=%d logical_ch=%d src_nvl=%d src_rdma=%d start=%d end=%d lane_cnt=%d total_num_tokens_to_recv=%d\n",
+                   state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
+                   src_nvl_rank, lane_id, start_offset, end_offset, end_offset - start_offset, num_tokens_to_recv);
+#endif
 #if MK_PERF_TRACE_ARGS
         int64_t prefix_slowest_wait_ns = recv_prefix_lane_wait_ns;
         int64_t prefix_slowest_start_ts = recv_prefix_lane_start_ns;
@@ -4231,10 +4252,10 @@ __device__ void compute_worker(
             s_recv_token_idx[i] = recv_token;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
-#ifdef MK_TOKEN_TRACE
-            printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
-                   state->rank, sm_id, expert_id, i, recv_token, topk_slot);
-#endif
+// #ifdef MK_TOKEN_TRACE
+//             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
+//                    state->rank, sm_id, expert_id, i, recv_token, topk_slot);
+// #endif
         }
         // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
         // can run at fixed M=256 for tail batches: padded input_buf rows are 0, and
@@ -5028,8 +5049,8 @@ __device__ void combine_worker_v2(
                                 max_abs = max(max_abs, value);
                                 nonzero += value != 0.0f;
                             }
-                            printf("[MK-BWD-TRACE][COMBINE-READ] token=%lld sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
-                                   (long long)token_idx, sample, sum_abs, max_abs, nonzero);
+                            // printf("[MK-BWD-TRACE][COMBINE-READ] token=%lld sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+                            //        (long long)token_idx, sample, sum_abs, max_abs, nonzero);
                         }
 #if MK_PERF_TRACE_ARGS
                         if (lane_id == 0) {
@@ -5909,8 +5930,8 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
                 max_abs = max(max_abs, value);
                 nonzero += value != 0.0f;
             }
-            printf("[MK-BWD-TRACE][GATHER-OUT] token=%d nhits=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
-                   token_idx, state->token_nhits[token_idx], sample, sum_abs, max_abs, nonzero);
+            // printf("[MK-BWD-TRACE][GATHER-OUT] token=%d nhits=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+            //        token_idx, state->token_nhits[token_idx], sample, sum_abs, max_abs, nonzero);
         }
         for (int batch_idx = tid; batch_idx < batch_count; batch_idx += blockDim.x) {
             const int token_idx = state->gather_ready_queue[token_base + batch_idx];
@@ -10201,6 +10222,23 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(device_state));
 }
 
+void get_megakernel_backward_dimensions(
+    MegaKernelState* device_state,
+    int* num_tokens,
+    int* hidden,
+    int* intermediate,
+    int* num_topk,
+    int* num_local_experts
+) {
+    MegaKernelState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    *num_tokens = host_state.num_tokens;
+    *hidden = host_state.hidden_dim;
+    *intermediate = host_state.intermediate_dim;
+    *num_topk = host_state.num_topk;
+    *num_local_experts = host_state.num_local_experts;
+}
+
 float* get_output_accum_ptr(MegaKernelState* device_state) {
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
@@ -10270,7 +10308,15 @@ struct MegaKernelBackwardState {
 
     const __nv_bfloat16* grad_output;     // [num_combined_tokens, hidden] dY (== bwd_device_state->x)
     __nv_bfloat16* grad_input;            // [num_combined_tokens, hidden] dX (== bwd_device_state->combined_x)
-    int4* owned_combined_x;               // allocator-owned output restored before freeing bwd_device_state
+    __nv_bfloat16* grad_w_gateup;         // [num_local_experts, 2 * intermediate, hidden]
+    __nv_bfloat16* grad_w_down;           // [num_local_experts, hidden, intermediate]
+    float* grad_topk_weights;             // [num_tokens, num_topk]
+    __nv_bfloat16* wgrad_x_slot;           // [expert_slots, hidden]
+    __nv_bfloat16* wgrad_act_slot;         // [expert_slots, intermediate], route-weighted
+    __nv_bfloat16* wgrad_dz_slot;          // [expert_slots, hidden]
+    __nv_bfloat16* wgrad_dgu_slot;         // [expert_slots, 2 * intermediate]
+    int4* owned_combined_x;
+    float* owned_combined_topk_weights;               // allocator-owned output restored before freeing bwd_device_state
 };
 
 __device__ __forceinline__ void trace_backward_values(
@@ -10294,8 +10340,8 @@ __device__ __forceinline__ void trace_backward_values(
         max_abs = max(max_abs, value);
         nonzero += value != 0.0f;
     }
-    printf("[MK-BWD-TRACE][%s] task=%d expert=%d batch=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
-           stage, task_idx, expert_id, batch_size, sample, sum_abs, max_abs, nonzero);
+    // printf("[MK-BWD-TRACE][%s] task=%d expert=%d batch=%d sample=%d sum_abs=%e max_abs=%e nonzero=%d\n",
+    //        stage, task_idx, expert_id, batch_size, sample, sum_abs, max_abs, nonzero);
 }
 
 __global__ void trace_backward_boundary_kernel(
@@ -10311,12 +10357,12 @@ __global__ void trace_backward_boundary_kernel(
     trace_backward_values(
         phase == 0 ? "GRAD-OUTPUT" : "GRAD-INPUT", values,
         state->num_tokens * state->hidden_dim, state->rank, 0, -1, state->num_tokens);
-    printf("[MK-BWD-TRACE][STATE-%s] task_head=%d task_tail=%d enqueue_done=%d "
-           "gather_head=%d gather_tail=%d dispatch_done=%d combine_done=%d\n",
-           phase == 0 ? "BEFORE" : "AFTER",
-           *state->compute_task_head, *state->compute_task_tail, *state->compute_enqueue_done,
-           *state->gather_ready_head, *state->gather_ready_tail,
-           *state->dispatch_done, *state->combine_all_done);
+    // printf("[MK-BWD-TRACE][STATE-%s] task_head=%d task_tail=%d enqueue_done=%d "
+    //        "gather_head=%d gather_tail=%d dispatch_done=%d combine_done=%d\n",
+    //        phase == 0 ? "BEFORE" : "AFTER",
+    //        *state->compute_task_head, *state->compute_task_tail, *state->compute_enqueue_done,
+    //        *state->gather_ready_head, *state->gather_ready_tail,
+    //        *state->dispatch_done, *state->combine_all_done);
 }
 
 __global__ void bwd_transpose_weights_kernel(
@@ -10471,8 +10517,13 @@ __device__ void compute_backward_worker(
             int v = idx - row * hidden_int4;
             if (row < batch_size) {
                 int rt = s_recv_token_idx[row];
-                grad_down_i4[idx] = combine_input_i4[(int64_t)rt * hidden_int4 + v];
-                x_i4[idx] = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
+                const int slot = expert_id * max_tpe + start_slot + row;
+                const int4 grad_vec = combine_input_i4[(int64_t)rt * hidden_int4 + v];
+                const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
+                grad_down_i4[idx] = grad_vec;
+                x_i4[idx] = x_vec;
+                reinterpret_cast<int4*>(bs->wgrad_dz_slot)[(int64_t)slot * hidden_int4 + v] = grad_vec;
+                reinterpret_cast<int4*>(bs->wgrad_x_slot)[(int64_t)slot * hidden_int4 + v] = x_vec;
             } else {
                 grad_down_i4[idx] = make_int4(0, 0, 0, 0);
                 x_i4[idx] = make_int4(0, 0, 0, 0);
@@ -10504,22 +10555,42 @@ __device__ void compute_backward_worker(
                                   state->rank, task_idx, expert_id, batch_size);
         }
 
-        // SwiGLU backward: gu_buf(GU) + up_buf(grad_act) -> gu_buf(grad_gu), interleaved.
-        for (int idx = group_thread_id; idx < batch_size * intermediate; idx += group_num_threads) {
-            int m = idx / intermediate;
-            int i = idx - m * intermediate;
-            float gate = __bfloat162float(gu_buf[m * twoI + 2 * i]);
-            float up   = __bfloat162float(gu_buf[m * twoI + 2 * i + 1]);
-            float route = s_route_w[m];
-            float ga = __bfloat162float(up_buf[m * intermediate + i]);
-            float sig = 1.0f / (1.0f + __expf(-gate));
-            float silu = gate * sig;
-            float g_pre = ga * route;
-            float g_up = g_pre * silu;
-            float dsilu = sig * (1.0f + gate * (1.0f - sig));
-            float g_gate = g_pre * up * dsilu;
-            gu_buf[m * twoI + 2 * i]     = __float2bfloat16(g_gate);
-            gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+        // SwiGLU backward and route-probability gradient. One warp owns each route row,
+        // so dTopKWeight needs only a warp reduction and one scalar store (no atomics).
+        const int lane_id = get_lane_id();
+        for (int m = group_warp_id; m < batch_size; m += group_num_warps) {
+            const float route = s_route_w[m];
+            const int slot = expert_id * max_tpe + start_slot + m;
+            float route_grad = 0.0f;
+            for (int i = lane_id; i < intermediate; i += 32) {
+                float gate = __bfloat162float(gu_buf[m * twoI + 2 * i]);
+                float up = __bfloat162float(gu_buf[m * twoI + 2 * i + 1]);
+                float ga = __bfloat162float(up_buf[m * intermediate + i]);
+                float sig = 1.0f / (1.0f + __expf(-gate));
+                float silu = gate * sig;
+                float activation = silu * up;
+                float g_pre = ga * route;
+                float g_up = g_pre * silu;
+                float dsilu = sig * (1.0f + gate * (1.0f - sig));
+                float g_gate = g_pre * up * dsilu;
+                route_grad += ga * activation;
+                bs->wgrad_act_slot[(int64_t)slot * intermediate + i] =
+                    __float2bfloat16(route * activation);
+                bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i] = __float2bfloat16(g_gate);
+                bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+                gu_buf[m * twoI + 2 * i] = __float2bfloat16(g_gate);
+                gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                route_grad += __shfl_down_sync(0xffffffff, route_grad, offset);
+            if (lane_id == 0) {
+                const int recv_token = s_recv_token_idx[m];
+                const int source_offset = expert_id * max_tpe + start_slot + m;
+                const int topk_slot = ld_acquire_global(
+                    &state->recv_token_source_info[source_offset * 2 + 1]);
+                state->combine_input_topk_weights[recv_token * num_topk + topk_slot] = route_grad;
+            }
         }
         compute_group_sync(state, group_id, group_size);
         if (group_sm_idx == 0) {
@@ -10644,6 +10715,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     MegaKernelState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
+    void* grad_w_gateup,
+    void* grad_w_down,
+    void* grad_topk_weights,
     int total_sms,
     cudaStream_t stream
 ) {
@@ -10695,7 +10769,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     rebuilt.bwd_fc1_input = fs.bwd_fc1_input;
     rebuilt.owns_bwd_fc1_input = false;
     int4* owned_combined_x = rebuilt.combined_x;
+    float* owned_combined_topk_weights = rebuilt.combined_topk_weights;
     rebuilt.combined_x = reinterpret_cast<int4*>(grad_input);
+    rebuilt.combined_topk_weights = reinterpret_cast<float*>(grad_topk_weights);
     CUDA_CHECK(cudaMemcpyAsync(bwd_device_state, &rebuilt, sizeof(MegaKernelState),
                                cudaMemcpyHostToDevice, stream));
 
@@ -10707,7 +10783,21 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.W_down_T = Wd_T;
     hs.grad_output = reinterpret_cast<const __nv_bfloat16*>(grad_output);
     hs.grad_input = reinterpret_cast<__nv_bfloat16*>(grad_input);
+    hs.grad_w_gateup = reinterpret_cast<__nv_bfloat16*>(grad_w_gateup);
+    hs.grad_w_down = reinterpret_cast<__nv_bfloat16*>(grad_w_down);
+    hs.grad_topk_weights = reinterpret_cast<float*>(grad_topk_weights);
+    const size_t num_expert_slots =
+        (size_t)fs.num_local_experts * fs.max_tokens_per_expert;
+    CUDA_CHECK(cudaMalloc(&hs.wgrad_x_slot,
+                          num_expert_slots * hidden * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&hs.wgrad_act_slot,
+                          num_expert_slots * intermediate * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&hs.wgrad_dz_slot,
+                          num_expert_slots * hidden * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&hs.wgrad_dgu_slot,
+                          num_expert_slots * twoI * sizeof(__nv_bfloat16)));
     hs.owned_combined_x = owned_combined_x;
+    hs.owned_combined_topk_weights = owned_combined_topk_weights;
 
     MegaKernelBackwardState* device_bs;
     CUDA_CHECK(cudaMalloc(&device_bs, sizeof(MegaKernelBackwardState)));
@@ -10726,10 +10816,15 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_gateup_T)));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_down_T)));
+    CUDA_CHECK(cudaFree(hs.wgrad_x_slot));
+    CUDA_CHECK(cudaFree(hs.wgrad_act_slot));
+    CUDA_CHECK(cudaFree(hs.wgrad_dz_slot));
+    CUDA_CHECK(cudaFree(hs.wgrad_dgu_slot));
     MegaKernelState bwd_state;
     CUDA_CHECK(cudaMemcpy(
         &bwd_state, hs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     bwd_state.combined_x = hs.owned_combined_x;
+    bwd_state.combined_topk_weights = hs.owned_combined_topk_weights;
     CUDA_CHECK(cudaMemcpy(
         hs.bwd_device_state, &bwd_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
     free_megakernel_state_v7(hs.bwd_device_state);
@@ -10905,6 +11000,35 @@ void prepare_megakernel_backward_communication_replay(
         combine_barrier_signal_ptrs, stream);
 }
 
+static void launch_backward_wgrad_gemm(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* d,
+    __nv_bfloat16* dw,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream
+) {
+    if (m <= 0)
+        return;
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    EP_HOST_ASSERT(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    // Column-major view computes X^T[K,M] @ D[M,N] -> C[K,N]. C has the
+    // same memory layout as the requested row-major dW[N,K].
+    EP_HOST_ASSERT(cublasGemmEx(
+        handle, CUBLAS_OP_N, CUBLAS_OP_T,
+        k, n, m,
+        &alpha,
+        x, CUDA_R_16BF, k,
+        d, CUDA_R_16BF, n,
+        &beta,
+        dw, CUDA_R_16BF, k,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS);
+}
+
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
     int total_sms,
@@ -10928,7 +11052,7 @@ void launch_megakernel_debug_backward(
     initialize_megakernel_launch_state(hstate, stream);
     CUDA_CHECK(cudaMemsetAsync(hbs.grad_input, 0,
                                (size_t)hstate.num_tokens * hstate.hidden_dim * sizeof(__nv_bfloat16), stream));
-    trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 0);
+    // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 0);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -10960,8 +11084,34 @@ void launch_megakernel_debug_backward(
 
     SWITCH_RDMA_RANKS(MEGAKERNEL_BWD_CASE);
 
-    trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 1);
+    // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 1);
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int> expert_token_counts(hstate.num_local_experts);
+    CUDA_CHECK(cudaMemcpy(
+        expert_token_counts.data(), hstate.expert_token_offsets,
+        (size_t)hstate.num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
+    const int max_tpe = hstate.max_tokens_per_expert;
+    const int hidden = hstate.hidden_dim;
+    const int intermediate = hstate.intermediate_dim;
+    const int two_i = 2 * intermediate;
+    for (int expert = 0; expert < hstate.num_local_experts; ++expert) {
+        const int tokens = expert_token_counts[expert];
+        if (tokens <= 0)
+            continue;
+        const int64_t slot_base = (int64_t)expert * max_tpe;
+        launch_backward_wgrad_gemm(
+            hbs.wgrad_x_slot + slot_base * hidden,
+            hbs.wgrad_dgu_slot + slot_base * two_i,
+            hbs.grad_w_gateup + (int64_t)expert * two_i * hidden,
+            tokens, two_i, hidden, stream);
+        launch_backward_wgrad_gemm(
+            hbs.wgrad_act_slot + slot_base * intermediate,
+            hbs.wgrad_dz_slot + slot_base * hidden,
+            hbs.grad_w_down + (int64_t)expert * hidden * intermediate,
+            tokens, hidden, intermediate, stream);
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
 #undef MEGAKERNEL_BWD_CASE

@@ -482,6 +482,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t num_nvl_bytes);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
+void get_megakernel_backward_dimensions(
+    MegaKernelState* device_state,
+    int* num_tokens,
+    int* hidden,
+    int* intermediate,
+    int* num_topk,
+    int* num_local_experts);
 float* get_output_accum_ptr(MegaKernelState* device_state);
 void* get_combined_x_ptr(MegaKernelState* device_state);
 void launch_megakernel_debug_forward(
@@ -495,6 +502,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     MegaKernelState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
+    void* grad_w_gateup,
+    void* grad_w_down,
+    void* grad_topk_weights,
     int total_sms,
     cudaStream_t stream);
 void free_megakernel_backward_state(MegaKernelBackwardState* backward_state);

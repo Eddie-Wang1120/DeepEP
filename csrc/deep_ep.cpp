@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <pybind11/functional.h>
 #include <torch/python.h>
@@ -1984,6 +1985,10 @@ megakernel_debug::MegaKernelState* MegaKernelAutogradContext::state() const {
     return state_;
 }
 
+void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
+    retained_layout_tensors_ = std::move(tensors);
+}
+
 std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
@@ -2341,9 +2346,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     // Step 3: Allocate and launch megakernel v7
     const int max_total_recv_tokens = *moe_recv_counter;
-    // Per-expert budget: evenly distribute received tokens across local experts, with 2x headroom
-    // Worst case: all tokens route to one expert (each token can appear num_topk times)
-    const int max_tokens_per_expert = std::max(1, max_total_recv_tokens * num_topk);
+    // Per-expert slot budget. A recv token's topk experts are distinct, so a token hits any
+    // given local expert AT MOST ONCE. Hence expert_token_offsets[e] (incremented once per
+    // (token, expert) hit) is bounded by the number of distinct recv tokens = max_total_recv_tokens.
+    // Worst case: all recv tokens route to the same expert -> cap = max_total_recv_tokens.
+    // (The previous *num_topk was an over-allocation assuming a token could occupy num_topk slots
+    //  on the same expert, which cannot happen.) The in-kernel overflow check `slot >= cap` -> trap()
+    // remains as a safety net.
+    const int max_tokens_per_expert = std::max(1, max_total_recv_tokens);
 
     printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d scheduler_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
            rank, max_total_recv_tokens, max_tokens_per_expert,
@@ -2477,6 +2487,30 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         {num_tokens, hidden_dim},
         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
 
+    // torch::Tensor result;
+    // if (debug) {
+    //     void* combined_x_ptr = megakernel_debug::get_combined_x_ptr(
+    //         static_cast<megakernel_debug::MegaKernelState*>(state));
+    //     auto combined_x_tensor = torch::from_blob(
+    //         combined_x_ptr,
+    //         {num_tokens, hidden_dim},
+    //         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    //     // Debug state owns combined_x (plain cudaMalloc, freed by its free()); clone before free.
+    //     result = combined_x_tensor.clone();
+    // } else {
+    //     void* combined_x_ptr = megakernel::get_combined_x_ptr(
+    //         static_cast<megakernel::MegaKernelState*>(state));
+    //     // Transfer ownership of combined_x to the returned tensor — no D2D clone. The buffer was
+    //     // allocated from PyTorch's caching allocator, so it is released via raw_delete when the
+    //     // tensor is destroyed. megakernel::free_megakernel_state_v7 no longer frees combined_x.
+    //     result = torch::from_blob(
+    //         combined_x_ptr,
+    //         {num_tokens, hidden_dim},
+    //         [](void* p) { c10::cuda::CUDACachingAllocator::raw_delete(p); },
+    //         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
+    // }
+
+
     // Clone before freeing state
     auto result = combined_x_tensor.clone();
 
@@ -2485,6 +2519,19 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         EP_HOST_ASSERT(debug && !use_fp8_compute && "training state currently requires debug BF16 mode");
         context = std::make_shared<MegaKernelAutogradContext>(
             static_cast<megakernel_debug::MegaKernelState*>(state));
+        // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
+        // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
+        // they outlive this forward call (otherwise the backward reads dangling/zeroed memory —
+        // notably rdma_channel_prefix_matrix, which stalls the backward NVL dispatch).
+        context->retain_layout_tensors({
+            is_token_in_rank,
+            rdma_channel_prefix_matrix,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            topk_idx,
+            topk_weights,
+        });
     } else if (debug) {
         megakernel_debug::free_megakernel_state_v7(
             static_cast<megakernel_debug::MegaKernelState*>(state));
@@ -2551,7 +2598,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         dispatch_config, combine_config, none, none, none, none, none, true, true);
 }
 
-torch::Tensor Buffer::megakernel_debug_backward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Buffer::megakernel_debug_backward(
     const std::shared_ptr<MegaKernelAutogradContext>& context,
     const torch::Tensor& grad_output,
     int total_sms,
@@ -2563,10 +2610,22 @@ torch::Tensor Buffer::megakernel_debug_backward(
     EP_HOST_ASSERT(stage >= 1 && stage <= 2);
 
     pybind11::gil_scoped_release release;
+    int num_tokens, hidden, intermediate, num_topk, num_local_experts;
+    megakernel_debug::get_megakernel_backward_dimensions(
+        context->state(), &num_tokens, &hidden, &intermediate, &num_topk, &num_local_experts);
     auto grad_input = torch::empty_like(grad_output);
+    auto bf16_options = grad_output.options();
+    auto fp32_options = grad_output.options().dtype(torch::kFloat32);
+    auto grad_w_gateup = torch::zeros(
+        {num_local_experts, 2 * intermediate, hidden}, bf16_options);
+    auto grad_w_down = torch::zeros(
+        {num_local_experts, hidden, intermediate}, bf16_options);
+    auto grad_topk_weights = torch::zeros({num_tokens, num_topk}, fp32_options);
     auto stream = at::cuda::getCurrentCUDAStream();
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
-        context->state(), grad_output.data_ptr(), grad_input.data_ptr(), total_sms, stream);
+        context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
+        grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
+        total_sms, stream);
     megakernel_debug::prepare_megakernel_backward_communication_replay(
         backward_state, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
@@ -2575,10 +2634,10 @@ torch::Tensor Buffer::megakernel_debug_backward(
         backward_state, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);
     megakernel_debug::free_megakernel_backward_state(backward_state);
-    return grad_input;
+    return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights};
 #else
     EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
-    return torch::Tensor();
+    return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
 #endif
 }
 

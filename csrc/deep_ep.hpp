@@ -63,8 +63,17 @@ public:
 
     megakernel_debug::MegaKernelState* state() const;
 
+    // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
+    // training state. The MegaKernelState stores only raw data_ptr()s into these tensors, and
+    // the backward re-runs dispatch/combine off the same state. Without retaining them here they
+    // are freed when the forward returns; the caching allocator may then hand their blocks to the
+    // backward's own allocations (e.g. torch::zeros for grad_w_*), zeroing rdma_channel_prefix_matrix
+    // and stalling the backward NVL dispatch. See megakernel_debug_backward reuse of fs.*_matrix.
+    void retain_layout_tensors(std::vector<torch::Tensor> tensors);
+
 private:
     megakernel_debug::MegaKernelState* state_;
+    std::vector<torch::Tensor> retained_layout_tensors_;
 };
 
 struct Buffer {
@@ -373,7 +382,7 @@ public:
         const Config& dispatch_config,
         const Config& combine_config);
 
-    torch::Tensor megakernel_debug_backward(
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
         const std::shared_ptr<MegaKernelAutogradContext>& context,
         const torch::Tensor& grad_output,
         int total_sms,

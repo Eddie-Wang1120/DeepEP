@@ -53,7 +53,7 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=4096, hidden=2048, intermediate=4096, experts_per_rank=8, num_topk=4),
-    test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6),
     # Add more cases here, for example:
@@ -82,9 +82,12 @@ class MegatronFusedDispatch(torch.autograd.Function):
         return recv_x, recv_indices, recv_probs, torch.tensor(tokens_per_expert), handle
 
     @staticmethod
-    def backward(ctx, grad_x, _grad_indices, _grad_probs, _grad_tokens_per_expert, _grad_handle):
-        combined_x, _, _ = ctx.buffer.combine(grad_x.contiguous(), ctx.handle)
-        return combined_x, None, None, None, None
+    def backward(ctx, grad_x, _grad_indices, grad_probs, _grad_tokens_per_expert, _grad_handle):
+        combined_x, combined_probs, _ = ctx.buffer.combine(
+            grad_x.contiguous(), ctx.handle,
+            topk_weights=None if grad_probs is None else grad_probs.float(),
+        )
+        return combined_x, None, combined_probs, None, None
 
 
 class MegatronFusedCombine(torch.autograd.Function):
@@ -181,7 +184,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     te_experts = build_te_grouped_experts(
         W_gate.detach(), W_up.detach(), W_down.detach(), case.experts_per_rank)
     for parameter in te_experts.parameters():
-        parameter.requires_grad_(False)
+        parameter.requires_grad_(True)
     buffer.set_num_sms(args.baseline_sms)
 
     if rank == 0:
@@ -193,11 +196,12 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             flush=True,
         )
 
-    # Megatron high-performance baseline. Only x requires grad so TE computes dgrad
-    # without retaining parameter gradients that the current megakernel cannot return.
+    # Megatron high-performance baseline with the complete training gradients used by
+    # the real fused MoE path: dX, expert weight gradients, and route-prob gradients.
     baseline_x = x.detach().clone().requires_grad_(True)
+    baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
     baseline_output = run_megatron_fused_baseline(
-        baseline_x, topk_idx, topk_weights.detach(), num_experts,
+        baseline_x, topk_idx, baseline_topk_weights, num_experts,
         case.experts_per_rank, buffer, te_experts,
     )
     if not baseline_output.requires_grad:
@@ -206,13 +210,52 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     torch.manual_seed(2000 + rank + case_idx * 1000003)
     grad_output = torch.randn_like(baseline_output)
     baseline_output.backward(grad_output)
-    baseline_grad_x = baseline_x.grad.detach().clone()
+    baseline_grad_x = baseline_x.grad.detach()
+    baseline_grad_topk_weights = baseline_topk_weights.grad.detach()
+
+    expert_weight_grads = [
+        parameter.grad.detach()
+        for parameter in te_experts.parameters()
+        if parameter.grad is not None
+    ]
+    if len(expert_weight_grads) != 2:
+        raise AssertionError(
+            f'Expected TE FC1/FC2 weight gradients, got {len(expert_weight_grads)} tensors')
+    baseline_fc1_grad, baseline_grad_w_down = expert_weight_grads
+    expected_fc1_shape = (case.experts_per_rank, 2 * case.intermediate, case.hidden)
+    expected_fc2_shape = (case.experts_per_rank, case.hidden, case.intermediate)
+    if tuple(baseline_fc1_grad.shape) != expected_fc1_shape:
+        raise AssertionError(
+            f'Unexpected TE FC1 grad shape {tuple(baseline_fc1_grad.shape)}, '
+            f'expected {expected_fc1_shape}')
+    if tuple(baseline_grad_w_down.shape) != expected_fc2_shape:
+        raise AssertionError(
+            f'Unexpected TE FC2 grad shape {tuple(baseline_grad_w_down.shape)}, '
+            f'expected {expected_fc2_shape}')
+
+    baseline_grad_w_gate = torch.empty_like(W_gate)
+    baseline_grad_w_up = torch.empty_like(W_up)
+    chunk_base = 0
+    for start in range(0, case.intermediate, 32):
+        rows = min(32, case.intermediate - start)
+        baseline_grad_w_gate[:, start:start + rows, :] = baseline_fc1_grad[
+            :, chunk_base:chunk_base + rows, :]
+        baseline_grad_w_up[:, start:start + rows, :] = baseline_fc1_grad[
+            :, chunk_base + rows:chunk_base + 2 * rows, :]
+        chunk_base += 2 * rows
+    baseline_grad_w_gateup = torch.empty_like(W_gateup)
+    baseline_grad_w_gateup[:, 0::2, :] = baseline_grad_w_gate
+    baseline_grad_w_gateup[:, 1::2, :] = baseline_grad_w_up
+    baseline_grad_w_gateup = baseline_grad_w_gateup.contiguous()
 
     # Fused debug megakernel path connected through torch.autograd.Function.
     megakernel_x = x.detach().clone().requires_grad_(True)
+    megakernel_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+    megakernel_w_gateup = W_gateup.detach().clone().requires_grad_(True)
+    megakernel_w_down = W_down.detach().clone().requires_grad_(True)
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     megakernel_output = buffer.megakernel_debug_autograd(
-        megakernel_x, topk_idx, topk_weights.detach(), W_gateup.detach(), W_down.detach(),
+        megakernel_x, topk_idx, megakernel_topk_weights, megakernel_w_gateup, megakernel_w_down,
         num_experts,
         num_dispatch_sms=args.megakernel_comm_sms,
         num_combine_sms=args.megakernel_comm_sms,
@@ -227,6 +270,10 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     print("Megakernel backward complete.")
 
     megakernel_grad_x = megakernel_x.grad.detach()
+    if megakernel_w_gateup.grad is None or megakernel_w_down.grad is None:
+        raise AssertionError('Megakernel backward did not return expert weight gradients')
+    if megakernel_topk_weights.grad is None:
+        raise AssertionError('Megakernel backward did not return dTopKWeights')
 
     compare_tensor(
         'forward', baseline_output.detach(), megakernel_output.detach(), rank,
@@ -236,9 +283,19 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         'Backward dX', baseline_grad_x, megakernel_grad_x, rank,
         args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
     )
-
-    if topk_weights.grad is not None or W_gateup.grad is not None or W_down.grad is not None:
-        raise AssertionError('Current megakernel autograd contract must only produce dX')
+    compare_tensor(
+        'Backward dW_gateup', baseline_grad_w_gateup, megakernel_w_gateup.grad.detach(), rank,
+        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+    )
+    compare_tensor(
+        'Backward dW_down', baseline_grad_w_down, megakernel_w_down.grad.detach(), rank,
+        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+    )
+    compare_tensor(
+        'Backward dTopKWeights', baseline_grad_topk_weights,
+        megakernel_topk_weights.grad.detach(), rank,
+        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+    )
 
     dist.barrier(group=group)
     torch.cuda.synchronize()

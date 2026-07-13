@@ -791,7 +791,7 @@ if __name__ == '__main__':
     parser.add_argument('--no-compute', action='store_true', help='Skip expert compute in the baseline path')
     parser.add_argument('--baseline-impl', choices=['torch', 'te'], default='te',
                         help='Expert compute implementation for the baseline path')
-    parser.add_argument('--warmup', type=int, default=5,
+    parser.add_argument('--warmup', type=int, default=20,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--stage', type=int, default=1,
                         help='Logical channels per physical channel for megakernel')

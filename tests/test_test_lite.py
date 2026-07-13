@@ -348,7 +348,7 @@ def run_baseline_pipeline(x, topk_idx, topk_weights, W_gate, W_up, W_down,
     num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
-    buffer.set_num_sms(64)
+    buffer.set_num_sms(40)
 
     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = \
         buffer.dispatch(
