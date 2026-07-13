@@ -39,6 +39,8 @@
 #include <mma.h>
 #include <limits>
 #include <vector>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #if MK_PERF_TRACE_ENABLED
 #include <cstdio>
 #endif
@@ -366,6 +368,9 @@ struct MegaKernelState {
     int* publish_done_count;          // atomic: how many publisher warps have drained
     int* publish_all_done;            // flag: 1 once all publishers drained (scheduler/gather use)
     int num_pub_warps_total;          // = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS
+
+    // Backing store for the fused buffer-init descriptors (see fused_fill_kernel). Freed with the state.
+    void* fused_fill_desc_buf;
 
 #if MK_PERF_TRACE_ENABLED
     // Per-logical-channel timing. Each logical channel has sender and forwarder rows
@@ -8794,6 +8799,43 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 }
 #endif
 
+// Step 1 optimization from .v0: use PyTorch's CUDA caching allocator for long-lived
+// megakernel state buffers, and batch host-side memset initialization into one
+// stream-ordered kernel. This should not change math or kernel scheduling.
+static inline cudaError_t mk_caching_alloc(void** pp, size_t nbytes) {
+    *pp = (nbytes == 0) ? nullptr : c10::cuda::CUDACachingAllocator::raw_alloc(nbytes);
+    return cudaSuccess;
+}
+
+static inline cudaError_t mk_caching_free(void* ptr) {
+    if (ptr != nullptr)
+        c10::cuda::CUDACachingAllocator::raw_delete(ptr);
+    return cudaSuccess;
+}
+
+struct FusedFillDesc {
+    void* ptr;
+    size_t bytes;
+    uint32_t word;
+};
+
+__global__ void fused_fill_kernel(const FusedFillDesc* descs, int ndescs) {
+    const int desc_idx = blockIdx.x;
+    if (desc_idx >= ndescs)
+        return;
+    const FusedFillDesc desc = descs[desc_idx];
+    auto* words = reinterpret_cast<uint32_t*>(desc.ptr);
+    const size_t nwords = desc.bytes / sizeof(uint32_t);
+    for (size_t i = threadIdx.x; i < nwords; i += blockDim.x)
+        words[i] = desc.word;
+    const size_t tail_start = nwords * sizeof(uint32_t);
+    if (tail_start < desc.bytes) {
+        const uint8_t bval = static_cast<uint8_t>(desc.word & 0xffu);
+        for (size_t i = tail_start + threadIdx.x; i < desc.bytes; i += blockDim.x)
+            reinterpret_cast<uint8_t*>(desc.ptr)[i] = bval;
+    }
+}
+
 static void initialize_megakernel_launch_state(const MegaKernelState& state, cudaStream_t stream);
 
 MegaKernelState* allocate_megakernel_state_v7(
@@ -8855,6 +8897,16 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t num_rdma_bytes,
     int64_t num_nvl_bytes
 ) {
+#define cudaMalloc(pp, n) mk_caching_alloc(reinterpret_cast<void**>(pp), (n))
+    struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
+    std::vector<MkFillRec> mk_fill_recs;
+    auto mk_record_fill = [&](void* ptr, int byte_value, size_t bytes) -> cudaError_t {
+        if (bytes != 0)
+            mk_fill_recs.push_back({ptr, byte_value, bytes});
+        return cudaSuccess;
+    };
+#define cudaMemset(p, v, n) mk_record_fill((p), (v), (n))
+
     // Allocate workspace buffers on device
     int* expert_recv_count;
     int* dispatch_done;
@@ -9949,17 +10001,40 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(combined_topk_weights, 0, num_tokens * num_topk * sizeof(float)));
     host_state.combined_topk_weights = combined_topk_weights;
 
+    const int mk_num_fills = static_cast<int>(mk_fill_recs.size());
+    void* fill_desc_buf = nullptr;
+    if (mk_num_fills > 0) {
+        std::vector<FusedFillDesc> host_descs(mk_num_fills);
+        for (int i = 0; i < mk_num_fills; ++i) {
+            const uint32_t bval = static_cast<uint32_t>(mk_fill_recs[i].byte_value & 0xff);
+            host_descs[i] = FusedFillDesc{mk_fill_recs[i].ptr, mk_fill_recs[i].bytes,
+                                          bval * 0x01010101u};
+        }
+        CUDA_CHECK(cudaMalloc(&fill_desc_buf, static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc)));
+        CUDA_CHECK(cudaMemcpy(fill_desc_buf, host_descs.data(),
+                              static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc),
+                              cudaMemcpyHostToDevice));
+    }
+    host_state.fused_fill_desc_buf = fill_desc_buf;
+
     // Copy to device
     MegaKernelState* device_state;
     CUDA_CHECK(cudaMalloc(&device_state, sizeof(MegaKernelState)));
     CUDA_CHECK(cudaMemcpy(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
-    initialize_megakernel_launch_state(host_state, 0);
-    CUDA_CHECK(cudaStreamSynchronize(0));
+    if (mk_num_fills > 0) {
+        cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
+        fused_fill_kernel<<<mk_num_fills, 256, 0, init_stream>>>(
+            static_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_fills);
+        CUDA_CHECK(cudaGetLastError());
+    }
+#undef cudaMemset
+#undef cudaMalloc
 
     return device_state;
 }
 
 void free_megakernel_state_v7(MegaKernelState* device_state) {
+#define cudaFree(p) mk_caching_free(p)
     // Copy back to read pointers for freeing
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
@@ -10053,6 +10128,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.dispatch_channel_barrier));
     CUDA_CHECK(cudaFree(host_state.dispatch_round_barrier));
     CUDA_CHECK(cudaFree(host_state.combine_channel_barrier));
+    CUDA_CHECK(cudaFree(host_state.fused_fill_desc_buf));
 #if MK_PERF_TRACE_ENABLED
     CUDA_CHECK(cudaFree(host_state.perf_dispatch_lch_ts));
     CUDA_CHECK(cudaFree(host_state.perf_combine_lch_ts));
@@ -10220,6 +10296,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_task_group_id));
 #endif
     CUDA_CHECK(cudaFree(device_state));
+#undef cudaFree
 }
 
 void get_megakernel_backward_dimensions(
@@ -10765,7 +10842,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
 
     MegaKernelState rebuilt;
     CUDA_CHECK(cudaMemcpy(&rebuilt, bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
-    if (rebuilt.owns_bwd_fc1_input) CUDA_CHECK(cudaFree(rebuilt.bwd_fc1_input));
+    if (rebuilt.owns_bwd_fc1_input)
+        CUDA_CHECK(mk_caching_free(rebuilt.bwd_fc1_input));
     rebuilt.bwd_fc1_input = fs.bwd_fc1_input;
     rebuilt.owns_bwd_fc1_input = false;
     int4* owned_combined_x = rebuilt.combined_x;
