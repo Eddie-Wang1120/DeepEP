@@ -1151,7 +1151,7 @@ __device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int g
 }
 
 template <ComputeDType kComputeDType>
-__device__ void compute_worker(
+__device__ __forceinline__ void compute_worker(
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
@@ -1160,18 +1160,33 @@ __device__ void compute_worker(
 );
 
 template <ComputeDType kComputeDType>
-__device__ void compute_backward_worker(
+__device__ __forceinline__ void compute_backward_worker(
     MegaKernelBackwardState* bs,
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
     uint8_t* smem_buffer);
 
-template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
+#define MK_FORWARD_COMPUTE_WORKER(COMPUTE_DTYPE, SM_ID, COMPUTE_SM_IDX, NUM_COMPUTE_SMS, STATE, SMEM_BUFFER) \
+    compute_worker<COMPUTE_DTYPE>((SM_ID), (COMPUTE_SM_IDX), (NUM_COMPUTE_SMS), (STATE), (SMEM_BUFFER))
+
+#define MK_BACKWARD_COMPUTE_WORKER(COMPUTE_DTYPE, BS, SM_ID, COMPUTE_SM_IDX, NUM_COMPUTE_SMS, SMEM_BUFFER) \
+    compute_backward_worker<COMPUTE_DTYPE>((BS), (SM_ID), (COMPUTE_SM_IDX), (NUM_COMPUTE_SMS), (SMEM_BUFFER))
+
+#define MK_DISPATCH_REUSED_COMPUTE(IS_BACKWARD, COMPUTE_DTYPE, BS, SM_ID, COMPUTE_SM_IDX, NUM_COMPUTE_SMS, STATE, SMEM_BUFFER) \
+    if constexpr (IS_BACKWARD) { \
+        EP_DEVICE_ASSERT((BS) != nullptr); \
+        MK_BACKWARD_COMPUTE_WORKER(COMPUTE_DTYPE, (BS), (SM_ID), (COMPUTE_SM_IDX), (NUM_COMPUTE_SMS), (SMEM_BUFFER)); \
+    } else { \
+        MK_FORWARD_COMPUTE_WORKER(COMPUTE_DTYPE, (SM_ID), (COMPUTE_SM_IDX), (NUM_COMPUTE_SMS), (STATE), (SMEM_BUFFER)); \
+    }
+
+template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType, bool kDispatchBackwardCompute = false>
 __device__ void dispatch_worker_v2(
     int sm_id,
     int dispatch_sm_idx,  // 0-based index among all dispatch SMs
-    MegaKernelState* state
+    MegaKernelState* state,
+    MegaKernelBackwardState* backward_state = nullptr
 ) {
     using namespace internode;
     constexpr int kNumTopkRDMARanks = internode::get_num_topk_rdma_ranks(kNumRDMARanks);
@@ -2634,16 +2649,15 @@ __device__ void dispatch_worker_v2(
                state->rank, static_cast<int>(blockIdx.x), dispatch_sm_idx);
 #endif
 
-    // Dispatch-only profiling: the scheduler role is intentionally disabled, so
-    // entering the reused compute loop would wait forever on compute_enqueue_done.
+    const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
+    const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
+    MK_DISPATCH_REUSED_COMPUTE(
+        kDispatchBackwardCompute, kComputeDType, backward_state, sm_id,
+        reused_compute_sm_idx, total_compute_sms_after_dispatch, state, smem_buffer);
     return;
+}
 
-    // const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
-    // const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
-    // compute_worker<kComputeDType>(sm_id, reused_compute_sm_idx, total_compute_sms_after_dispatch, state, smem_buffer);
-    // return;
-
-// #if 0
+#if 0
     auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
 
     // const int thread_id = threadIdx.x;
@@ -3102,6 +3116,7 @@ __device__ void dispatch_worker_v2(
 // #endif
 
 }
+#endif  // stale dispatch-local compute copy
 
 // ============================================================================
 // Compute Scheduler + Worker: scheduler enqueues expert batches, compute groups run GEMM+SwiGLU
@@ -4037,8 +4052,9 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     }  // tid == 0
 #endif
 }
+
 template <ComputeDType kComputeDType>
-__device__ void compute_worker(
+__device__ __forceinline__ void compute_worker(
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
@@ -7455,7 +7471,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     switch (role) {
         case SmRole::kDispatch:
-            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType>(sm_id, role_idx, state);
+            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType, false>(sm_id, role_idx, state);
             break;
 
         case SmRole::kCombine:
@@ -7468,7 +7484,9 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             break;
 
         case SmRole::kCompute:
-            compute_worker<kComputeDType>(sm_id, role_idx, total_compute_sms_after_dispatch, state, smem_buffer);
+            MK_FORWARD_COMPUTE_WORKER(
+                kComputeDType, sm_id, role_idx,
+                total_compute_sms_after_dispatch, state, smem_buffer);
             break;
 
         case SmRole::kGather:
@@ -10972,7 +10990,7 @@ __global__ void bwd_transpose_weights_kernel(
 // state == bs->bwd_device_state: combine_input holds grad_down (filled by the re-run
 // dispatch of grad_output), compute_output_slot/combine_input receive grad_xperm.
 template <ComputeDType kComputeDType>
-__device__ void compute_backward_worker(
+__device__ __forceinline__ void compute_backward_worker(
     MegaKernelBackwardState* bs,
     int sm_id,
     int compute_sm_idx,
@@ -11262,9 +11280,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     switch (role) {
         case SmRole::kDispatch:
-            // Dispatch SMs only scatter grad_output; they are not repurposed as
-            // backward compute workers.
-            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType>(sm_id, role_idx, state);
+            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType, true>(sm_id, role_idx, state, bs);
             break;
         case SmRole::kCombine:
             combine_worker_v2<kNumRDMARanks, kStage>(role_idx, state);
@@ -11273,9 +11289,9 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             compute_scheduler_worker(state, role_idx, COMPUTE_SCHEDULER_SMS);
             break;
         case SmRole::kCompute:
-            // Backward compute is done ONLY by the dedicated compute-role SMs (dispatch SMs
-            // are not repurposed), so the compute space is num_compute_sms (not +dispatch).
-            compute_backward_worker<kComputeDType>(bs, sm_id, role_idx, num_compute_sms, smem_buffer);
+            MK_BACKWARD_COMPUTE_WORKER(
+                kComputeDType, bs, sm_id, role_idx,
+                total_compute_sms_after_dispatch, smem_buffer);
             break;
         case SmRole::kGather:
             gather_worker(state, role_idx);
