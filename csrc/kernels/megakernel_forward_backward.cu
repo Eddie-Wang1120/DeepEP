@@ -6162,6 +6162,20 @@ __device__ void combine_precompute_worker(
             else
                 slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
+
+        // ==== Backward activation save ====
+        // Save fc1 input (permuted X) by recv_token for the backward pass. input_buf still
+        // holds X here (the scatter above only overwrote combine_input, not input_buf).
+        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
+        if (state->bwd_fc1_input != nullptr) {
+            const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
+            int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
+            for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
+                int row = idx / hidden_int4;
+                int v = idx - row * hidden_int4;
+                bwd_in_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = bwd_in_src_i4[idx];
+            }
+        }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
