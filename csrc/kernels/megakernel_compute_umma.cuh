@@ -9,7 +9,7 @@
 // Ref: MEGAKERNEL_COMPUTE_DESIGN.md I.9 (tile schedule), I.9.10 (route B2).
 // Assumes hidden == intermediate == 4096 (I.9.0).
 //
-// USAGE (in megakernel.cu, an nvcc TU):
+// USAGE (in megakernel_forward_backward.cu, an nvcc TU):
 //   - MegaKernelState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
 //   - Host: build_compute_tma_atoms(host_struct, W_gateup, E, I, d); upload.
 //   - Device (compute_worker stage1, per 1-CTA/2-CTA cluster): call
@@ -54,7 +54,7 @@ using namespace cute;
 // 800 threads and deadlock, since only thread_id<128 enter this code path.
 //
 // IMPORTANT: barrier ids 0/1/2 are ALREADY in use by the dispatch/combine roles
-// of this megakernel (megakernel.cu: `barrier.sync 0/1/2`). Reusing id 1 (the old
+// of this megakernel (`barrier.sync 0/1/2`). Reusing id 1 (the old
 // value) aliased the combine forwarder's `barrier.sync 1`, corrupting the
 // cluster-scoped tcgen05 alloc handshake and tripping
 //   __cuda_sm10x_tcgen05_guardrail_trap_phase_invalid_during_alloc.

@@ -37,7 +37,7 @@ if __name__ == '__main__':
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel.cu', 'csrc/kernels/megakernel_forward_backward.cu']
+    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel_forward_backward.cu']
     include_dirs = ['csrc/']
     # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute (S4.4 / MEGAKERNEL_COMPUTE_DESIGN.md I.9.10).
     # Header-only; only adds include paths. cutlass_ref is the cloned NVIDIA/cutlass v4.5.2.
@@ -137,6 +137,13 @@ if __name__ == '__main__':
     assert mk_compute_kernel in (0, 1, 2), 'MK_COMPUTE_KERNEL must be 0, 1, or 2'
     cxx_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
     nvcc_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
+
+    # Narrow UMMA diagnostics. Defaults keep the production path unchanged.
+    for name in ('MK_UMMA_SAVE_PREACT', 'MK_UMMA_GATEUP', 'MK_UMMA_DOWN'):
+        value = int(os.getenv(name, '1'))
+        assert value in (0, 1), f'{name} must be 0 or 1'
+        cxx_flags.append(f'-D{name}={value}')
+        nvcc_flags.append(f'-D{name}={value}')
 
 
     if int(os.getenv('ENABLE_FAST_DEBUG', 0)):

@@ -1,5 +1,5 @@
 /**
- * megakernel.cu — MK-v7: Fused Dispatch(DeepEP RDMA) + Compute(GEMM+SwiGLU) + Combine
+ * megakernel_forward_backward.cu: Fused dispatch, compute, combine, and backward debug path
  *
  * Architecture:
  *   Single persistent kernel with overlapping phases:
@@ -11003,28 +11003,20 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const __nv_bfloat16* WguT_e = &bs->W_gateup_T[(size_t)expert_id * hidden * twoI];        // [hidden,2I]
         const __nv_bfloat16* WdT_e  = &bs->W_down_T[(size_t)expert_id * intermediate * hidden];  // [I,hidden]
 
-        if (bs->bwd_preact != nullptr) {
+        // Saved-PreAct path eliminates the PreAct->gu_buf gather: dSwiGLU below reads
+        // gate/up straight from bs->bwd_preact by (recv_token, topk_slot) and writes dGU
+        // into gu_buf[0:batch_size]. Here we only zero gu_buf's padding rows
+        // [batch_size, COMPUTE_BATCH_SIZE) so the fixed-extent GEMM3 (which consumes
+        // gu_buf as dGU) sees 0 for padded rows. Fallback (no saved PreAct) recomputes
+        // gate/up into gu_buf via WMMA, then the same tail zero-fill applies.
+        const bool preact_direct = (bs->bwd_preact != nullptr);
+        {
             const int preact_int4 = twoI * sizeof(__nv_bfloat16) / sizeof(int4);
-            const int4* preact_i4 = reinterpret_cast<const int4*>(bs->bwd_preact);
             int4* gu_i4 = reinterpret_cast<int4*>(gu_buf);
-            for (int idx = group_thread_id; idx < COMPUTE_BATCH_SIZE * preact_int4; idx += group_num_threads) {
-                const int row = idx / preact_int4;
-                const int v = idx - row * preact_int4;
-                if (row < batch_size) {
-                    const int recv_token = s_recv_token_idx[row];
-                    const int topk_slot = s_topk_slot[row];
-                    const int64_t src_row = ((int64_t)recv_token * num_topk + topk_slot) * preact_int4;
-                    gu_i4[idx] = preact_i4[src_row + v];
-                } else {
-                    gu_i4[idx] = make_int4(0, 0, 0, 0);
-                }
+            if (!preact_direct) {
+                device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
+                                 group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
             }
-        } else {
-            // Fallback for states created without forward-saved gate/up preactivation.
-            device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
-                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-            const int preact_int4 = twoI * sizeof(__nv_bfloat16) / sizeof(int4);
-            int4* gu_i4 = reinterpret_cast<int4*>(gu_buf);
             for (int idx = batch_size * preact_int4 + group_thread_id;
                  idx < COMPUTE_BATCH_SIZE * preact_int4;
                  idx += group_num_threads) {
@@ -11076,10 +11068,17 @@ __device__ __forceinline__ void compute_backward_worker_core(
         for (int m = group_warp_id; m < batch_size; m += group_num_warps) {
             const float route = s_route_w[m];
             const int slot = expert_id * max_tpe + start_slot + m;
+            const int recv_token_m = s_recv_token_idx[m];
+            const int topk_slot_m = s_topk_slot[m];
+            // No PreAct gather: read gate/up straight from bwd_preact (slot-major by
+            // (recv_token, topk_slot)) when available, else from the recomputed gu_buf.
+            const __nv_bfloat16* gu_src = preact_direct
+                ? bs->bwd_preact + ((int64_t)recv_token_m * num_topk + topk_slot_m) * twoI
+                : gu_buf + (size_t)m * twoI;
             float route_grad = 0.0f;
             for (int i = lane_id; i < intermediate; i += 32) {
-                float gate = __bfloat162float(gu_buf[m * twoI + 2 * i]);
-                float up = __bfloat162float(gu_buf[m * twoI + 2 * i + 1]);
+                float gate = __bfloat162float(gu_src[2 * i]);
+                float up = __bfloat162float(gu_src[2 * i + 1]);
                 float ga = __bfloat162float(up_buf[m * intermediate + i]);
                 float sig = 1.0f / (1.0f + __expf(-gate));
                 float silu = gate * sig;
@@ -11100,9 +11099,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             for (int offset = 16; offset > 0; offset >>= 1)
                 route_grad += __shfl_down_sync(0xffffffff, route_grad, offset);
             if (lane_id == 0) {
-                const int recv_token = s_recv_token_idx[m];
-                const int topk_slot = s_topk_slot[m];
-                state->combine_input_topk_weights[recv_token * num_topk + topk_slot] = route_grad;
+                state->combine_input_topk_weights[recv_token_m * num_topk + topk_slot_m] = route_grad;
             }
         }
         compute_group_sync(state, group_id, group_size);

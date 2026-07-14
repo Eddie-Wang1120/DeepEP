@@ -329,26 +329,6 @@ public:
 
     void low_latency_clean_mask_buffer();
 
-    // MegaKernel: fused dispatch + tensorcore GEMM + SwiGLU + combine
-    torch::Tensor megakernel_forward(
-        const torch::Tensor& x,
-        const torch::Tensor& topk_idx,
-        const torch::Tensor& topk_weights,
-        const torch::Tensor& W_gateup,
-        const torch::Tensor& W_down,
-        int num_experts,
-        int num_dispatch_sms,
-        int num_combine_sms,
-        int total_sms,
-        int stage,
-        const Config& dispatch_config,
-        const Config& combine_config,
-        const pybind11::object& hidden_states_scales,
-        const pybind11::object& W_gateup_fp8,
-        const pybind11::object& W_down_fp8,
-        const pybind11::object& W_gateup_fp8_sf,
-        const pybind11::object& W_down_fp8_sf);
-
     torch::Tensor megakernel_debug_forward(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
@@ -388,7 +368,7 @@ public:
         int total_sms,
         int stage);
 
-    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_forward_impl(
+    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_debug_forward_impl(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -406,7 +386,6 @@ public:
         const pybind11::object& W_down_fp8,
         const pybind11::object& W_gateup_fp8_sf,
         const pybind11::object& W_down_fp8_sf,
-        bool debug,
         bool retain_state);
 
 #if MK_PERF_TRACE_ENABLED

@@ -2,7 +2,6 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <cuda_runtime.h>
 #include <pybind11/functional.h>
 #include <torch/python.h>
@@ -1990,7 +1989,7 @@ void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor>
     retained_layout_tensors_ = std::move(tensors);
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_forward_impl(
+std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2008,7 +2007,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     const pybind11::object& W_down_fp8_obj,
     const pybind11::object& W_gateup_fp8_sf_obj,
     const pybind11::object& W_down_fp8_sf_obj,
-    bool debug,
     bool retain_state) {
 #ifndef DISABLE_NVSHMEM
     auto optional_tensor = [](const pybind11::object& obj) -> torch::Tensor {
@@ -2101,7 +2099,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     constexpr int compute_group_size = megakernel_config::kComputeGroupSize;
     constexpr int compute_cluster_dim = megakernel_config::kComputeClusterDim;
     // Scheduler region keeps fixed SMs for layout compatibility; only scheduler SM #0
-    // does work today, #1 idles (see compute_scheduler_worker gating in megakernel.cu).
+    // does work today, #1 idles (see compute_scheduler_worker gating in the debug kernel).
     constexpr int compute_scheduler_sms = megakernel_config::kComputeSchedulerSms;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
@@ -2310,7 +2308,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // barrier inside the collective). This mirrors internode_combine's cached_notify and replaces
     // the old host-side full-buffer memset + intranode/internode barriers. The combine buffers live
     // in the second half of the symmetric allocation:
-    //   RDMA  combine half : rdma_buffer_ptr + num_rdma_bytes  (see megakernel.cu combine_rdma_ptr)
+    //   RDMA  combine half : rdma_buffer_ptr + num_rdma_bytes
     //   NVL   combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
     {
         void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
@@ -2417,9 +2415,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         num_nvl_bytes);
     };
 
-    void* state = debug
-        ? static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7))
-        : static_cast<void*>(allocate_state(megakernel::allocate_megakernel_state_v7));
+    void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
 
     printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
 
@@ -2454,15 +2450,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     auto compute_dtype = use_fp8_compute
         ? megakernel::ComputeDType::kFP8E4M3
         : megakernel::ComputeDType::kBF16;
-    if (debug) {
-        megakernel_debug::launch_megakernel_debug_forward(
-            static_cast<megakernel_debug::MegaKernelState*>(state),
-            active_total_sms, smem_size, stage, compute_dtype, stream);
-    } else {
-        megakernel::launch_megakernel_v7(
-            static_cast<megakernel::MegaKernelState*>(state),
-            active_total_sms, smem_size, stage, compute_dtype, stream);
-    }
+    megakernel_debug::launch_megakernel_debug_forward(
+        static_cast<megakernel_debug::MegaKernelState*>(state),
+        active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
 #ifdef MK_TOKEN_TRACE
     fprintf(stderr, "[MK-HOST][LAUNCH][AFTER_ERROR_CHECK] rank=%d stream=%p state=%p\n",
@@ -2478,46 +2468,19 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 #endif
 
     // Get combined_x directly (bf16, no extra copy/convert)
-    void* combined_x_ptr = debug
-        ? megakernel_debug::get_combined_x_ptr(
-              static_cast<megakernel_debug::MegaKernelState*>(state))
-        : megakernel::get_combined_x_ptr(
-              static_cast<megakernel::MegaKernelState*>(state));
+    void* combined_x_ptr = megakernel_debug::get_combined_x_ptr(
+        static_cast<megakernel_debug::MegaKernelState*>(state));
     auto combined_x_tensor = torch::from_blob(
         combined_x_ptr,
         {num_tokens, hidden_dim},
         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
-
-    // torch::Tensor result;
-    // if (debug) {
-    //     void* combined_x_ptr = megakernel_debug::get_combined_x_ptr(
-    //         static_cast<megakernel_debug::MegaKernelState*>(state));
-    //     auto combined_x_tensor = torch::from_blob(
-    //         combined_x_ptr,
-    //         {num_tokens, hidden_dim},
-    //         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
-    //     // Debug state owns combined_x (plain cudaMalloc, freed by its free()); clone before free.
-    //     result = combined_x_tensor.clone();
-    // } else {
-    //     void* combined_x_ptr = megakernel::get_combined_x_ptr(
-    //         static_cast<megakernel::MegaKernelState*>(state));
-    //     // Transfer ownership of combined_x to the returned tensor — no D2D clone. The buffer was
-    //     // allocated from PyTorch's caching allocator, so it is released via raw_delete when the
-    //     // tensor is destroyed. megakernel::free_megakernel_state_v7 no longer frees combined_x.
-    //     result = torch::from_blob(
-    //         combined_x_ptr,
-    //         {num_tokens, hidden_dim},
-    //         [](void* p) { c10::cuda::CUDACachingAllocator::raw_delete(p); },
-    //         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
-    // }
-
 
     // Clone before freeing state
     auto result = combined_x_tensor.clone();
 
     std::shared_ptr<MegaKernelAutogradContext> context;
     if (retain_state) {
-        EP_HOST_ASSERT(debug && !use_fp8_compute && "training state currently requires debug BF16 mode");
+        EP_HOST_ASSERT(!use_fp8_compute && "training state currently requires debug BF16 mode");
         context = std::make_shared<MegaKernelAutogradContext>(
             static_cast<megakernel_debug::MegaKernelState*>(state));
         // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
@@ -2533,51 +2496,42 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             topk_idx,
             topk_weights,
         });
-    } else if (debug) {
+    } else {
         megakernel_debug::free_megakernel_state_v7(
             static_cast<megakernel_debug::MegaKernelState*>(state));
-    } else {
-        megakernel::free_megakernel_state_v7(
-            static_cast<megakernel::MegaKernelState*>(state));
     }
 
     return {result, context};
 #else
-    EP_HOST_ASSERT(false && "megakernel_forward requires NVSHMEM support");
+    EP_HOST_ASSERT(false && "megakernel_debug_forward requires NVSHMEM support");
     return {torch::Tensor(), nullptr};
 #endif
 }
 
-#define MEGAKERNEL_FORWARD_ARGS \
-    x, topk_idx, topk_weights, W_gateup, W_down, num_experts, \
-    num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config, \
-    combine_config, hidden_states_scales_obj, W_gateup_fp8_obj, \
-    W_down_fp8_obj, W_gateup_fp8_sf_obj, W_down_fp8_sf_obj
-
-#define DEFINE_MEGAKERNEL_FORWARD_MEMBER(name, debug_mode) \
-torch::Tensor Buffer::name( \
-    const torch::Tensor& x, \
-    const torch::Tensor& topk_idx, \
-    const torch::Tensor& topk_weights, \
-    const torch::Tensor& W_gateup, \
-    const torch::Tensor& W_down, \
-    int num_experts, \
-    int num_dispatch_sms, \
-    int num_combine_sms, \
-    int total_sms, \
-    int stage, \
-    const Config& dispatch_config, \
-    const Config& combine_config, \
-    const pybind11::object& hidden_states_scales_obj, \
-    const pybind11::object& W_gateup_fp8_obj, \
-    const pybind11::object& W_down_fp8_obj, \
-    const pybind11::object& W_gateup_fp8_sf_obj, \
-    const pybind11::object& W_down_fp8_sf_obj) { \
-    return std::get<0>(megakernel_forward_impl(MEGAKERNEL_FORWARD_ARGS, debug_mode, false)); \
+torch::Tensor Buffer::megakernel_debug_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& W_gateup,
+    const torch::Tensor& W_down,
+    int num_experts,
+    int num_dispatch_sms,
+    int num_combine_sms,
+    int total_sms,
+    int stage,
+    const Config& dispatch_config,
+    const Config& combine_config,
+    const pybind11::object& hidden_states_scales_obj,
+    const pybind11::object& W_gateup_fp8_obj,
+    const pybind11::object& W_down_fp8_obj,
+    const pybind11::object& W_gateup_fp8_sf_obj,
+    const pybind11::object& W_down_fp8_sf_obj) {
+    return std::get<0>(megakernel_debug_forward_impl(
+        x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
+        num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config,
+        combine_config, hidden_states_scales_obj, W_gateup_fp8_obj,
+        W_down_fp8_obj, W_gateup_fp8_sf_obj, W_down_fp8_sf_obj, false));
 }
-
-DEFINE_MEGAKERNEL_FORWARD_MEMBER(megakernel_forward, false)
-DEFINE_MEGAKERNEL_FORWARD_MEMBER(megakernel_debug_forward, true)
 
 std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_train(
     const torch::Tensor& x,
@@ -2593,10 +2547,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     const Config& dispatch_config,
     const Config& combine_config) {
     pybind11::object none = pybind11::none();
-    return megakernel_forward_impl(
+    return megakernel_debug_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage,
-        dispatch_config, combine_config, none, none, none, none, none, true, true);
+        dispatch_config, combine_config, none, none, none, none, none, true);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Buffer::megakernel_debug_backward(
@@ -2642,8 +2596,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Buffer::m
 #endif
 }
 
-#undef DEFINE_MEGAKERNEL_FORWARD_MEMBER
-#undef MEGAKERNEL_FORWARD_ARGS
 
 }  // namespace deep_ep
 
@@ -2694,24 +2646,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer)
-        .def("megakernel_forward", &deep_ep::Buffer::megakernel_forward,
-             py::arg("x"),
-             py::arg("topk_idx"),
-             py::arg("topk_weights"),
-             py::arg("W_gateup"),
-             py::arg("W_down"),
-             py::arg("num_experts"),
-             py::arg("num_dispatch_sms") = 24,
-             py::arg("num_combine_sms") = 24,
-             py::arg("total_sms") = 148,
-             py::arg("stage") = 1,
-             py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
-             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
-             py::arg("hidden_states_scales") = py::none(),
-             py::arg("W_gateup_fp8") = py::none(),
-             py::arg("W_down_fp8") = py::none(),
-             py::arg("W_gateup_fp8_sf") = py::none(),
-             py::arg("W_down_fp8_sf") = py::none())
         .def("megakernel_debug_forward", &deep_ep::Buffer::megakernel_debug_forward,
              py::arg("x"),
              py::arg("topk_idx"),
