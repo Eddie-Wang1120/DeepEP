@@ -33,6 +33,8 @@
 #include "megakernel_compute_umma.cuh"
 #include "megakernel_compute_umma_fp8.cuh"
 
+#include <cute/arch/simd_sm100.hpp>
+
 #include <ATen/cuda/CUDABlas.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
@@ -10728,6 +10730,41 @@ __global__ void bwd_transpose_weights_kernel(
     }
 }
 
+__device__ __forceinline__ float mk_bwd_bf16_from_u32(uint32_t v, int lane) {
+    return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&v)[lane]);
+}
+
+__device__ __forceinline__ uint32_t mk_bwd_cvt_f32x2_bf16x2(float lo, float hi) {
+    uint32_t out;
+    asm volatile("cvt.rn.satfinite.bf16x2.f32 %0, %1, %2;\n"
+                 : "=r"(out) : "f"(hi), "f"(lo));
+    return out;
+}
+
+__device__ __forceinline__ void mk_bwd_dswiglu_pair2_side_f32x2(
+    uint32_t gu0, uint32_t gu1, uint32_t grad01, float route,
+    uint32_t& out0, uint32_t& out1, uint32_t& act01, float& route_grad
+) {
+    float2 gate = {mk_bwd_bf16_from_u32(gu0, 0), mk_bwd_bf16_from_u32(gu1, 0)};
+    float2 up = {mk_bwd_bf16_from_u32(gu0, 1), mk_bwd_bf16_from_u32(gu1, 1)};
+    float2 grad_raw = {mk_bwd_bf16_from_u32(grad01, 0), mk_bwd_bf16_from_u32(grad01, 1)};
+    float2 grad = {grad_raw.x * route, grad_raw.y * route};
+    float2 sig = {
+        1.0f / (1.0f + __expf(-gate.x)),
+        1.0f / (1.0f + __expf(-gate.y))};
+    float2 silu, activation, silu_grad, sig_minus_silu_sig, d_silu_grad, dgate;
+    cute::mul(silu, gate, sig);
+    cute::mul(activation, silu, up);
+    cute::mul(silu_grad, silu, grad);
+    cute::fma(sig_minus_silu_sig, silu, {-sig.x, -sig.y}, sig);
+    cute::fma(d_silu_grad, sig_minus_silu_sig, grad, silu_grad);
+    cute::mul(dgate, d_silu_grad, up);
+    out0 = mk_bwd_cvt_f32x2_bf16x2(dgate.x, silu_grad.x);
+    out1 = mk_bwd_cvt_f32x2_bf16x2(dgate.y, silu_grad.y);
+    act01 = mk_bwd_cvt_f32x2_bf16x2(route * activation.x, route * activation.y);
+    route_grad += grad_raw.x * activation.x + grad_raw.y * activation.y;
+}
+
 // Expert-compute backward for one compute SM. Mirrors the forward compute_worker's
 // task-queue / gather / output-scatter / signaling protocol EXACTLY (so the reused
 // combine handshake works), swapping only the GEMM math for the backward pass.
@@ -11065,6 +11102,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
         // SwiGLU backward and route-probability gradient. One warp owns each route row,
         // so dTopKWeight needs only a warp reduction and one scalar store (no atomics).
         const int lane_id = get_lane_id();
+        const bool dswiglu_packed4 = ((intermediate & 3) == 0);
+        const int intermediate_i4 = intermediate >> 2;
         for (int m = group_warp_id; m < batch_size; m += group_num_warps) {
             const float route = s_route_w[m];
             const int slot = expert_id * max_tpe + start_slot + m;
@@ -11076,24 +11115,48 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 ? bs->bwd_preact + ((int64_t)recv_token_m * num_topk + topk_slot_m) * twoI
                 : gu_buf + (size_t)m * twoI;
             float route_grad = 0.0f;
-            for (int i = lane_id; i < intermediate; i += 32) {
-                float gate = __bfloat162float(gu_src[2 * i]);
-                float up = __bfloat162float(gu_src[2 * i + 1]);
-                float ga = __bfloat162float(up_buf[m * intermediate + i]);
-                float sig = 1.0f / (1.0f + __expf(-gate));
-                float silu = gate * sig;
-                float activation = silu * up;
-                float g_pre = ga * route;
-                float g_up = g_pre * silu;
-                float dsilu = sig * (1.0f + gate * (1.0f - sig));
-                float g_gate = g_pre * up * dsilu;
-                route_grad += ga * activation;
-                bs->wgrad_act_slot[(int64_t)slot * intermediate + i] =
-                    __float2bfloat16(route * activation);
-                bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i] = __float2bfloat16(g_gate);
-                bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i + 1] = __float2bfloat16(g_up);
-                gu_buf[m * twoI + 2 * i] = __float2bfloat16(g_gate);
-                gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+            if (dswiglu_packed4) {
+                const int4* gu4 = reinterpret_cast<const int4*>(gu_src);
+                const int2* ga4 = reinterpret_cast<const int2*>(up_buf + (size_t)m * intermediate);
+                int4* dgu4 = reinterpret_cast<int4*>(gu_buf + (size_t)m * twoI);
+                int4* wgrad_dgu4 = reinterpret_cast<int4*>(bs->wgrad_dgu_slot + (int64_t)slot * twoI);
+                int2* wgrad_act4 = reinterpret_cast<int2*>(bs->wgrad_act_slot + (int64_t)slot * intermediate);
+                for (int q = lane_id; q < intermediate_i4; q += 32) {
+                    const int4 gu = gu4[q];
+                    const int2 ga = ga4[q];
+                    uint32_t o0, o1, o2, o3, a01, a23;
+                    mk_bwd_dswiglu_pair2_side_f32x2(
+                        static_cast<uint32_t>(gu.x), static_cast<uint32_t>(gu.y),
+                        static_cast<uint32_t>(ga.x), route, o0, o1, a01, route_grad);
+                    mk_bwd_dswiglu_pair2_side_f32x2(
+                        static_cast<uint32_t>(gu.z), static_cast<uint32_t>(gu.w),
+                        static_cast<uint32_t>(ga.y), route, o2, o3, a23, route_grad);
+                    const int4 out = make_int4(static_cast<int>(o0), static_cast<int>(o1),
+                                               static_cast<int>(o2), static_cast<int>(o3));
+                    dgu4[q] = out;
+                    wgrad_dgu4[q] = out;
+                    wgrad_act4[q] = make_int2(static_cast<int>(a01), static_cast<int>(a23));
+                }
+            } else {
+                for (int i = lane_id; i < intermediate; i += 32) {
+                    float gate = __bfloat162float(gu_src[2 * i]);
+                    float up = __bfloat162float(gu_src[2 * i + 1]);
+                    float ga = __bfloat162float(up_buf[m * intermediate + i]);
+                    float sig = 1.0f / (1.0f + __expf(-gate));
+                    float silu = gate * sig;
+                    float activation = silu * up;
+                    float g_pre = ga * route;
+                    float g_up = g_pre * silu;
+                    float dsilu = sig * (1.0f + gate * (1.0f - sig));
+                    float g_gate = g_pre * up * dsilu;
+                    route_grad += ga * activation;
+                    bs->wgrad_act_slot[(int64_t)slot * intermediate + i] =
+                        __float2bfloat16(route * activation);
+                    bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i] = __float2bfloat16(g_gate);
+                    bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+                    gu_buf[m * twoI + 2 * i] = __float2bfloat16(g_gate);
+                    gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+                }
             }
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1)
