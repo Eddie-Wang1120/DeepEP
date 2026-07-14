@@ -357,6 +357,7 @@ struct MegaKernelState {
     int intermediate_dim;
     int num_local_experts;
     int max_tokens_per_expert;
+    int total_expert_slots;           // Σ expert_count[le] = size of the per-expert-slot buffers
     int max_total_recv_tokens;
 
     // --- SM allocation ---
@@ -9713,6 +9714,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.intermediate_dim = intermediate_dim;
     host_state.num_local_experts = num_local_experts;
     host_state.max_tokens_per_expert = max_tokens_per_expert;
+    host_state.total_expert_slots = static_cast<int>(total_expert_slots);
     host_state.max_total_recv_tokens = max_total_recv_tokens;
 
     // SM allocation
@@ -11470,6 +11472,20 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     EP_HOST_ASSERT(fs.num_compute_groups > 0);
     EP_HOST_ASSERT(total_sms >= fs.num_compute_groups * COMPUTE_GROUP_SIZE);
 
+    // Compact backward slot layout: reuse the forward per-expert counts (routing is
+    // deterministic across the dispatch re-run, so counts are identical) so the backward
+    // state and its wgrad_* scratch pack by Σ count instead of num_local_experts*max_tpe.
+    std::vector<int> h_bwd_expert_count(num_local_experts);
+    CUDA_CHECK(cudaMemcpy(h_bwd_expert_count.data(), fs.expert_count,
+                          (size_t)num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> h_bwd_expert_slot_base(num_local_experts);
+    size_t total_bwd_slots = 0;
+    for (int e = 0; e < num_local_experts; ++e) {
+        h_bwd_expert_slot_base[e] = static_cast<int>(total_bwd_slots);
+        total_bwd_slots += static_cast<size_t>(h_bwd_expert_count[e]);
+    }
+    if (total_bwd_slots == 0) total_bwd_slots = 1;
+
     // Transposed weights (backward-only; live in MegaKernelBackwardState, not MegaKernelState).
     __nv_bfloat16 *Wgu_T, *Wd_T;
     CUDA_CHECK(cudaMalloc(&Wgu_T, (size_t)num_local_experts * hidden * twoI * sizeof(__nv_bfloat16)));
@@ -11512,7 +11528,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         fs.allocator_num_compute_sms, fs.allocator_num_combine_sms,
         fs.allocator_num_logical_channels,
         fs.allocator_max_tokens_per_expert, fs.allocator_max_total_recv_tokens,
-        fs.allocator_num_rdma_bytes, fs.allocator_num_nvl_bytes);
+        fs.allocator_num_rdma_bytes, fs.allocator_num_nvl_bytes,
+        h_bwd_expert_count.data());
 
     MegaKernelState rebuilt;
     CUDA_CHECK(cudaMemcpy(&rebuilt, bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
@@ -11544,8 +11561,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.grad_w_gateup = reinterpret_cast<__nv_bfloat16*>(grad_w_gateup);
     hs.grad_w_down = reinterpret_cast<__nv_bfloat16*>(grad_w_down);
     hs.grad_topk_weights = reinterpret_cast<float*>(grad_topk_weights);
-    const size_t num_expert_slots =
-        (size_t)fs.num_local_experts * fs.max_tokens_per_expert;
+    // Compact Family B (wgrad) scratch: Σ count, same per-expert slot layout as the backward
+    // state. wgrad_dgu_slot gets one extra COMPUTE_BATCH_SIZE of padding so the last batch's
+    // CBS-row TMA descriptor tile stays within the allocation.
+    const size_t num_expert_slots = total_bwd_slots;
     const size_t num_dgu_batch_tmas =
         (size_t)fs.num_local_experts * fs.max_batches_per_expert;
     CUDA_CHECK(cudaMalloc(&hs.wgrad_x_slot,
@@ -11555,12 +11574,17 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     CUDA_CHECK(cudaMalloc(&hs.wgrad_dz_slot,
                           num_expert_slots * hidden * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&hs.wgrad_dgu_slot,
-                          num_expert_slots * twoI * sizeof(__nv_bfloat16)));
+                          (num_expert_slots + COMPUTE_BATCH_SIZE) * twoI * sizeof(__nv_bfloat16)));
     std::vector<CUtensorMap> h_wgrad_dgu_a_tma(num_dgu_batch_tmas);
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
+        const int ebase = h_bwd_expert_slot_base[expert];
+        const int ecnt = h_bwd_expert_count[expert];
         for (int batch = 0; batch < fs.max_batches_per_expert; ++batch) {
-            const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot +
-                ((size_t)expert * fs.max_tokens_per_expert + (size_t)batch * COMPUTE_BATCH_SIZE) * twoI;
+            // Descriptors for batches past this expert's real slots are never consumed by
+            // the compute worker; keep them in-bounds by clamping to the expert base.
+            const int row = (batch * COMPUTE_BATCH_SIZE < ecnt)
+                ? (ebase + batch * COMPUTE_BATCH_SIZE) : ebase;
+            const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot + (size_t)row * twoI;
             h_wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
                 umma::dg_make_a_desc(dgu_batch, COMPUTE_BATCH_SIZE, twoI);
         }
@@ -11805,7 +11829,9 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     const int NPC = hs.num_dispatch_channels;
     const int NPUB = hs.num_pub_warps_total;
     const int MBE = (hs.max_tokens_per_expert + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
-    const size_t total_slots = (size_t)E * hs.max_tokens_per_expert;
+    // Per-expert-slot buffers are sized by the compact Σ expert_count (see allocator);
+    // reset must cover exactly that, not the legacy num_local_experts*max_tpe.
+    const size_t total_slots = (size_t)hs.total_expert_slots;
     const int round_slots = (NLC + NPC - 1) / NPC;
     const int combine_rdma_head_stride = hs.num_tokens * kRDMA;
     const int combine_nvl_head_stride = (hs.num_tokens * TK) * NUM_MAX_NVL_PEERS;
@@ -12031,7 +12057,10 @@ void launch_megakernel_debug_backward(
     CUDA_CHECK(cudaMemcpy(
         expert_token_counts.data(), hstate.expert_token_offsets,
         (size_t)hstate.num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
-    const int max_tpe = hstate.max_tokens_per_expert;
+    std::vector<int> expert_slot_base_host(hstate.num_local_experts);
+    CUDA_CHECK(cudaMemcpy(
+        expert_slot_base_host.data(), hstate.expert_slot_base,
+        (size_t)hstate.num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
     const int hidden = hstate.hidden_dim;
     const int intermediate = hstate.intermediate_dim;
     const int two_i = 2 * intermediate;
@@ -12039,7 +12068,7 @@ void launch_megakernel_debug_backward(
         const int tokens = expert_token_counts[expert];
         if (tokens <= 0)
             continue;
-        const int64_t slot_base = (int64_t)expert * max_tpe;
+        const int64_t slot_base = (int64_t)expert_slot_base_host[expert];
         launch_backward_wgrad_gemm(
             hbs.wgrad_x_slot + slot_base * hidden,
             hbs.wgrad_dgu_slot + slot_base * two_i,
