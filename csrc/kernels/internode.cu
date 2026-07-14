@@ -1636,6 +1636,94 @@ void cached_notify(int hidden_int4,
                   cpu_rdma_team);
 }
 
+// Megakernel-specific launcher for the cached_notify kernel (above). The stock cached_notify
+// host sizes num_threads = 32 * num_channels and dynamic smem = 8192 * num_warps, which exceeds
+// the 1024 threads/block and per-block shared-memory limits once logical channels expand
+// (num_channels = num_physical_channels * stage, stage>1) — this is exactly the
+// cudaFuncSetAttribute failure at stage>1.
+//
+// The megakernel only uses cached_notify in clean+barrier mode (is_cached_dispatch=true,
+// num_combined_tokens=0, null head/prefix pointers): the sm_id>=1 head-normalization warps
+// return early (see the kernel), so they never touch the per-channel TMA shared memory nor the
+// `num_warps >= num_channels` device assert, and only sm_id==0 (RDMA/NVL clean + cross-rank
+// barrier) runs. That path works with any thread count and needs no dynamic shared memory.
+// So we launch the SAME kernel with a fixed geometry that is independent of num_channels.
+// The original DeepEP cached_notify (kernel and host) is left untouched.
+void cached_notify_mk(int hidden_int4,
+                      int num_scales,
+                      int num_topk_idx,
+                      int num_topk_weights,
+                      int num_ranks,
+                      int num_channels,
+                      int num_combined_tokens,
+                      int* combined_rdma_head,
+                      const int* rdma_channel_prefix_matrix,
+                      const int* rdma_rank_prefix_sum,
+                      int* combined_nvl_head,
+                      void* rdma_buffer_ptr,
+                      int num_max_rdma_chunked_recv_tokens,
+                      void** buffer_ptrs,
+                      int num_max_nvl_chunked_recv_tokens,
+                      int** barrier_signal_ptrs,
+                      int rank,
+                      cudaStream_t stream,
+                      int64_t num_rdma_bytes,
+                      int64_t num_nvl_bytes,
+                      bool is_cached_dispatch,
+                      bool low_latency_mode) {
+    // This variant only supports the clean+barrier path used by the megakernel.
+    EP_HOST_ASSERT(is_cached_dispatch && "cached_notify_mk only supports clean+barrier (is_cached_dispatch=true)");
+    const int kNumTMABytesPerWarp = 8192;
+    // Fixed, num_channels-independent geometry. 512 threads is ample for the sm_id==0 clean
+    // loops (strided over the clean range) and the barrier (uses thread 0/32 and <=NUM_MAX_NVL_PEERS);
+    // the head-normalization TMA shared memory is unused in clean+barrier mode, so request none.
+    const int num_threads = 512;
+    const int smem_size = 0;
+    const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+
+    // Get clean meta (identical to cached_notify)
+    auto rdma_clean_meta = get_rdma_clean_meta(
+        hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+    auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4,
+                                             num_scales,
+                                             num_topk_idx,
+                                             num_topk_weights,
+                                             num_rdma_ranks,
+                                             NUM_MAX_NVL_PEERS,
+                                             num_max_nvl_chunked_recv_tokens,
+                                             num_channels,
+                                             is_cached_dispatch);
+    EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
+    EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_channels * 2 > 3);
+
+    // Launch the same kernel with fixed geometry (no dynamic smem).
+    auto cached_notify_func = low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp> : cached_notify<false, kNumTMABytesPerWarp>;
+    SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
+    SET_SHARED_MEMORY_FOR_TMA(cached_notify_func);
+    LAUNCH_KERNEL(&cfg,
+                  cached_notify_func,
+                  rdma_clean_meta.first,
+                  rdma_clean_meta.second,
+                  nvl_clean_meta.first,
+                  nvl_clean_meta.second,
+                  combined_rdma_head,
+                  num_combined_tokens,
+                  num_channels,
+                  rdma_channel_prefix_matrix,
+                  rdma_rank_prefix_sum,
+                  combined_nvl_head,
+                  rdma_buffer_ptr,
+                  buffer_ptrs,
+                  barrier_signal_ptrs,
+                  rank,
+                  num_ranks,
+                  is_cached_dispatch,
+                  cpu_rdma_team);
+}
+
 template <int kNumRanks,
           bool kMaybeWithBias,
           typename dtype_t,

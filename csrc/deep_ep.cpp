@@ -2114,9 +2114,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.
     const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
-    // Keep dispatch communication identical to DeepEP: notify_dispatch and the
-    // worker use the same physical channels. Pipeline stages remain a compute concern.
-    const int num_logical_channels = num_physical_channels;
+    // Logical channels = physical channels * stage. notify_dispatch / get_dispatch_layout see
+    // the expanded logical-channel count so the prefix matrices are laid out per logical channel,
+    // consistent with the dispatch worker (num_logical_channels_per_physical = kStage) and the
+    // combine worker. Restores logical!=physical support (was clamped to physical in "add backward").
+    const int num_logical_channels = num_physical_channels * stage;
     const int num_channels = num_logical_channels;  // DeepEP notify sees the expanded logical-channel count.
     const int dispatch_num_max_rdma_chunked_send_tokens = dispatch_config.num_max_rdma_chunked_send_tokens;
     const int dispatch_num_max_rdma_chunked_recv_tokens = dispatch_config.num_max_rdma_chunked_recv_tokens;
@@ -2312,7 +2314,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     //   NVL   combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
     {
         void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
-        internode::cached_notify(hidden_int4,
+        internode::cached_notify_mk(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
                                  num_topk,   // num_topk_weights

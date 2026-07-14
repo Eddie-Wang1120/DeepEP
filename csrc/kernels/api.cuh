@@ -238,6 +238,34 @@ void cached_notify(int hidden_int4,
                    bool is_cached_dispatch,
                    bool low_latency_mode);
 
+// Megakernel-specific launcher for the cached_notify kernel. Identical semantics to
+// cached_notify but with a fixed, num_channels-independent launch geometry so it stays within
+// the per-block thread / shared-memory limits when logical channels expand
+// (num_channels = num_physical_channels * stage, stage>1). Only supports the clean+barrier
+// path (is_cached_dispatch=true), which is all the megakernel uses.
+void cached_notify_mk(int hidden_int4,
+                      int num_scales,
+                      int num_topk_idx,
+                      int num_topk_weights,
+                      int num_ranks,
+                      int num_channels,
+                      int num_combined_tokens,
+                      int* combined_rdma_head,
+                      const int* rdma_channel_prefix_matrix,
+                      const int* rdma_rank_prefix_sum,
+                      int* combined_nvl_head,
+                      void* rdma_buffer_ptr,
+                      int num_max_rdma_chunked_recv_tokens,
+                      void** buffer_ptrs,
+                      int num_max_nvl_chunked_recv_tokens,
+                      int** barrier_signal_ptrs,
+                      int rank,
+                      cudaStream_t stream,
+                      int64_t num_rdma_bytes,
+                      int64_t num_nvl_bytes,
+                      bool is_cached_dispatch,
+                      bool low_latency_mode);
+
 void combine(cudaDataType_t type,
              void* combined_x,
              float* combined_topk_weights,

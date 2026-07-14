@@ -239,6 +239,12 @@ struct MegaKernelState {
     __nv_bfloat16* bwd_preact;          // [max_total_recv_tokens, num_topk, 2 * intermediate] saved gate/up by recv_token/topk_slot
     bool owns_bwd_fc1_input;
     bool owns_bwd_preact;
+    // Phase 3 (A2): compact preact storage. bwd_preact is keyed by the compact forward slot
+    // (like recv_tokens), and fwd_slot_map translates the cross-pass-stable key
+    // (recv_token, topk_slot) -> forward slot so the backward pass can find it (slot ids are
+    // non-deterministic across the two dispatch runs, but recv_token/topk_slot are stable).
+    int* fwd_slot_map;                  // [max_total_recv_tokens * num_topk] (recv_token,topk_slot) -> forward slot, -1 if none
+    bool owns_fwd_slot_map;
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
     int* token_slot_list;               // [max_total_recv_tokens * num_topk] absolute slot ids per hit
     int* priority_token_cursor;         // scheduler combine-order cursor for token priority scan
@@ -1295,10 +1301,12 @@ __device__ void dispatch_worker_v2(
 #endif
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     const auto num_channels = state->num_dispatch_channels, channel_id = sm_id / 2;
-    // Match DeepEP dispatch: one communication channel per sender/forwarder CTA pair.
-    // kStage remains available to the compute pipeline but must not reshape dispatch prefixes.
-    constexpr int num_logical_channels_per_physical = 1;
-    const int num_logical_channels = num_channels;
+    // Logical channels per physical CTA pair = kStage. Must match host num_logical_channels =
+    // num_physical_channels * stage and the combine worker's num_logical_channels_per_physical,
+    // so the dispatch receiver writes and the combine sender reads the gbl-channel arrays with
+    // the same (logical) stride. Restores logical!=physical support.
+    constexpr int num_logical_channels_per_physical = kStage;
+    const int num_logical_channels = num_channels * num_logical_channels_per_physical;
     const bool is_forwarder = dispatch_sm_idx % 2 == 0;
     const auto rdma_rank = state->rank / NUM_MAX_NVL_PEERS, nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
     const auto num_ranks = state->num_ranks;
@@ -3918,6 +3926,12 @@ __device__ __forceinline__ void compute_worker(
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
+            // Phase 3 (Step 3.3a): record (recv_token, topk_slot) -> compact forward slot,
+            // and repurpose s_topk_slot to carry that compact slot so the preact epilogue
+            // (called with num_topk=0) writes bwd_preact by slot: (recv*0 + slot)*stride = slot*stride.
+            if (recv_token >= 0 && topk_slot >= 0)
+                state->fwd_slot_map[recv_token * num_topk + topk_slot] = base_offset;
+            s_topk_slot[i] = base_offset;
 // #ifdef MK_TOKEN_TRACE
 //             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
 //                    state->rank, sm_id, expert_id, i, recv_token, topk_slot);
@@ -3992,7 +4006,8 @@ __device__ __forceinline__ void compute_worker(
                 cluster_smem, umma_accum_iter,
                 (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
                 s_recv_token_idx, s_topk_slot,
-                num_topk, 2 * intermediate, batch_size);
+                /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
+                0, 2 * intermediate, batch_size);
             umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
             umma_tmem_allocated = false;   // freed each task (4a)
 #if MK_PERF_TRACE_ARGS
@@ -4004,7 +4019,7 @@ __device__ __forceinline__ void compute_worker(
                                      batch_size, batch_size, hidden, intermediate,
                                      group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf,
                                      state->bwd_preact, s_recv_token_idx, s_topk_slot,
-                                     num_topk, 2 * intermediate);
+                                     /* preact num_topk = 0: s_topk_slot carries compact slot */ 0, 2 * intermediate);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -5680,6 +5695,12 @@ __device__ void combine_precompute_worker(
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
+            // Phase 3 (Step 3.3a): record (recv_token, topk_slot) -> compact forward slot,
+            // and repurpose s_topk_slot to carry that compact slot so the preact epilogue
+            // (called with num_topk=0) writes bwd_preact by slot: (recv*0 + slot)*stride = slot*stride.
+            if (recv_token >= 0 && topk_slot >= 0)
+                state->fwd_slot_map[recv_token * num_topk + topk_slot] = base_offset;
+            s_topk_slot[i] = base_offset;
 #ifdef MK_TOKEN_TRACE
             printf("[MK-TOKEN][COMPUTE] rank=%d sm=%d expert=%d row=%d recv_token=%d topk_slot=%d\n",
                    state->rank, sm_id, expert_id, i, recv_token, topk_slot);
@@ -5754,7 +5775,8 @@ __device__ void combine_precompute_worker(
                 cluster_smem, umma_accum_iter,
                 (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
                 s_recv_token_idx, s_topk_slot,
-                num_topk, 2 * intermediate, batch_size);
+                /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
+                0, 2 * intermediate, batch_size);
             umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
             umma_tmem_allocated = false;   // freed each task (4a)
 #if MK_PERF_TRACE_ARGS
@@ -5766,7 +5788,7 @@ __device__ void combine_precompute_worker(
                                      batch_size, batch_size, hidden, intermediate,
                                      group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf,
                                      state->bwd_preact, s_recv_token_idx, s_topk_slot,
-                                     num_topk, 2 * intermediate);
+                                     /* preact num_topk = 0: s_topk_slot carries compact slot */ 0, 2 * intermediate);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -9365,9 +9387,20 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&bwd_fc1_input, bwd_fc1_input_bytes));
     CUDA_CHECK(cudaMemset(bwd_fc1_input, 0, bwd_fc1_input_bytes));
     __nv_bfloat16* bwd_preact;
-    const size_t bwd_preact_bytes = (size_t)max_total_recv_tokens * num_topk * 2 * intermediate_dim * sizeof(__nv_bfloat16);
+    // Phase 3 (Step 3.3b): compact preact storage. bwd_preact is now indexed by the compact
+    // forward slot (Step 3.3a), so it only needs total_expert_slots (= Σ expert_count = S) rows
+    // instead of the max_total_recv_tokens * num_topk (= R*K) sparse upper bound. Written per-row
+    // by slot (no batched TMA tile over preact), so no padding is required.
+    const size_t bwd_preact_bytes = (size_t)total_expert_slots * 2 * intermediate_dim * sizeof(__nv_bfloat16);
     CUDA_CHECK(cudaMalloc(&bwd_preact, bwd_preact_bytes));
     CUDA_CHECK(cudaMemset(bwd_preact, 0, bwd_preact_bytes));
+    // Phase 3 (A2) scaffolding: (recv_token, topk_slot) -> forward slot translation table.
+    // Init to -1; populated by the forward compute worker (Step 3.2), consumed by backward
+    // (Step 3.3a). Not read/written yet at this step.
+    int* fwd_slot_map;
+    const size_t fwd_slot_map_bytes = (size_t)max_total_recv_tokens * num_topk * sizeof(int);
+    CUDA_CHECK(cudaMalloc(&fwd_slot_map, fwd_slot_map_bytes));
+    CUDA_CHECK(cudaMemset(fwd_slot_map, 0xff, fwd_slot_map_bytes));
     CUDA_CHECK(cudaMalloc(&token_nhits, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&token_slot_list, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
@@ -9738,6 +9771,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.bwd_preact = bwd_preact;
     host_state.owns_bwd_fc1_input = true;
     host_state.owns_bwd_preact = true;
+    host_state.fwd_slot_map = fwd_slot_map;
+    host_state.owns_fwd_slot_map = true;
     host_state.token_nhits = token_nhits;
     host_state.token_slot_list = token_slot_list;
     host_state.priority_token_cursor = priority_token_cursor;
@@ -10345,6 +10380,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
     if (host_state.owns_bwd_fc1_input) CUDA_CHECK(cudaFree(host_state.bwd_fc1_input));
     if (host_state.owns_bwd_preact) CUDA_CHECK(cudaFree(host_state.bwd_preact));
+    if (host_state.owns_fwd_slot_map) CUDA_CHECK(cudaFree(host_state.fwd_slot_map));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
     CUDA_CHECK(cudaFree(host_state.token_slot_list));
     CUDA_CHECK(cudaFree(host_state.priority_token_cursor));
@@ -11155,8 +11191,13 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const int topk_slot_m = s_topk_slot[m];
             // No PreAct gather: read gate/up straight from bwd_preact (slot-major by
             // (recv_token, topk_slot)) when available, else from the recomputed gu_buf.
+            // Phase 3 (Step 3.3a): translate the cross-pass-stable (recv_token, topk_slot) to
+            // forward's compact preact slot via fwd_slot_map, then read bwd_preact by slot.
+            int fwd_preact_slot = preact_direct
+                ? state->fwd_slot_map[(int64_t)recv_token_m * num_topk + topk_slot_m] : -1;
+            if (fwd_preact_slot < 0) fwd_preact_slot = 0;  // safety net; should not occur for a real hit
             const __nv_bfloat16* gu_src = preact_direct
-                ? bs->bwd_preact + ((int64_t)recv_token_m * num_topk + topk_slot_m) * twoI
+                ? bs->bwd_preact + (int64_t)fwd_preact_slot * twoI
                 : gu_buf + (size_t)m * twoI;
             float route_grad = 0.0f;
             if (dswiglu_packed4) {
@@ -11537,10 +11578,14 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         CUDA_CHECK(mk_caching_free(rebuilt.bwd_fc1_input));
     if (rebuilt.owns_bwd_preact)
         CUDA_CHECK(mk_caching_free(rebuilt.bwd_preact));
+    if (rebuilt.owns_fwd_slot_map)
+        CUDA_CHECK(mk_caching_free(rebuilt.fwd_slot_map));
     rebuilt.bwd_fc1_input = fs.bwd_fc1_input;
     rebuilt.bwd_preact = fs.bwd_preact;
     rebuilt.owns_bwd_fc1_input = false;
     rebuilt.owns_bwd_preact = false;
+    rebuilt.fwd_slot_map = fs.fwd_slot_map;
+    rebuilt.owns_fwd_slot_map = false;
     int4* owned_combined_x = rebuilt.combined_x;
     float* owned_combined_topk_weights = rebuilt.combined_topk_weights;
     rebuilt.combined_x = reinterpret_cast<int4*>(grad_input);
@@ -11646,7 +11691,7 @@ void prepare_megakernel_communication_replay(
 
     // Use the same cached notify path as ordinary DeepEP dispatch/combine. Besides the
     // cross-rank barriers, this owns the exact RDMA/NVL metadata layout and cleanup sizes.
-    internode::cached_notify(
+    internode::cached_notify_mk(
         hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
         hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
