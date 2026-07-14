@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-TRACE_RE = re.compile(r"(mk|deepep)_perf_trace_rank(\d+)(?:_(dispatch|combine|notify))?(?:_iter(\d+))?\.json$")
+TRACE_RE = re.compile(r"(mk|deepep)_perf_trace_rank(\d+)(?:_(forward|backward|dispatch|combine|notify))?(?:_iter(\d+))?\.json$")
 
 
 def parse_trace_name(path: Path) -> tuple[str, int, str, int]:
@@ -38,18 +38,23 @@ def load_events(path: Path) -> list[dict[str, Any]]:
 
 
 def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: str = "all",
-              iter_filter: int | None = None) -> tuple[int, int]:
-    files = sorted(
-        [
-            path for path in input_dir.glob("*perf_trace_rank*.json")
-            if TRACE_RE.search(path.name)
-            and (source_filter == "all" or parse_trace_name(path)[0] == source_filter)
-            and (iter_filter is None or parse_trace_name(path)[3] == iter_filter)
-        ],
-        key=lambda path: parse_trace_name(path),
-    )
+              phase_filter: str | None = None, iter_filter: int | None = None) -> tuple[int, int]:
+    files = []
+    for path in input_dir.glob("*perf_trace_rank*.json"):
+        if not TRACE_RE.search(path.name):
+            continue
+        source, _rank, phase, iteration = parse_trace_name(path)
+        if source_filter != "all" and source != source_filter:
+            continue
+        if phase_filter is not None and phase != phase_filter:
+            continue
+        if iter_filter is not None and iteration != iter_filter:
+            continue
+        files.append(path)
+    files = sorted(files, key=lambda path: parse_trace_name(path))
     if not files:
-        raise FileNotFoundError(f"no {source_filter} *perf_trace_rank*.json found under {input_dir}")
+        phase_desc = f" {phase_filter}" if phase_filter is not None else ""
+        raise FileNotFoundError(f"no {source_filter}{phase_desc} *perf_trace_rank*.json found under {input_dir}")
 
     # Pass 1: extract per-file base_ts_ns from metadata events for cross-rank alignment.
     # DeepEP can emit dispatch/combine as separate files for the same rank, so keep files distinct.
@@ -84,8 +89,9 @@ def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: 
 
     for path, (source, rank, phase, events) in sorted(file_events.items(), key=lambda item: parse_trace_name(item[0])):
         offset = file_offset_us.get(path, 0.0)
-        tid_offset = 10000 if phase in ("dispatch", "deepep") else 20000 if phase == "combine" else 0
+        tid_offset = 10000 if phase in ("dispatch", "deepep") else 20000 if phase == "combine" else 30000 if phase == "backward" else 0
         is_deepep_trace = phase in ("dispatch", "combine", "deepep")
+        is_megakernel_phase = source == "mk" and phase in ("forward", "backward")
         for event in events:
             if not isinstance(event, dict):
                 continue
@@ -95,6 +101,8 @@ def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: 
             args.setdefault("trace_source", "deepep" if is_deepep_trace else "megakernel")
             if is_deepep_trace:
                 args.setdefault("deepep_phase", "combined" if phase == "deepep" else phase)
+            if is_megakernel_phase:
+                args.setdefault("megakernel_phase", phase)
             event["args"] = args
             event["pid"] = rank
             tid = event.get("tid")
@@ -124,8 +132,17 @@ def aggregate(input_dir: Path, output: Path, normalize_ts: bool, source_filter: 
     return len(files), len(all_events)
 
 
+def direction_output_path(output: Path, direction: str) -> Path:
+    stem = output.stem
+    if stem.startswith("mk_perf_trace_all"):
+        stem = "mk_perf_trace_" + direction + stem[len("mk_perf_trace_all"):]
+    else:
+        stem = f"{stem}_{direction}"
+    return output.with_name(stem + output.suffix)
+
+
 def run_aggregate(input_dir: Path, output: Path, normalize_ts: bool, source: str,
-                  split_sources: bool, iter_filter: int | None) -> None:
+                  split_sources: bool, split_directions: bool, iter_filter: int | None) -> None:
     num_files, num_events = aggregate(input_dir, output, normalize_ts=normalize_ts,
                                       source_filter=source, iter_filter=iter_filter)
     print(f"Aggregated {num_events} events from {num_files} files -> {output}")
@@ -142,6 +159,19 @@ def run_aggregate(input_dir: Path, output: Path, normalize_ts: bool, source: str
                 continue
             print(f"Aggregated {src} {num_events} events from {num_files} files -> {source_output}")
 
+    if split_directions and source == "all":
+        for direction in ("forward", "backward"):
+            direction_output = direction_output_path(output, direction)
+            try:
+                num_files, num_events = aggregate(
+                    input_dir, direction_output, normalize_ts=normalize_ts,
+                    source_filter="mk", phase_filter=direction, iter_filter=iter_filter,
+                )
+            except FileNotFoundError as exc:
+                print(f"Skipped mk {direction}: {exc}")
+                continue
+            print(f"Aggregated mk {direction} {num_events} events from {num_files} files -> {direction_output}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate megakernel and DeepEP perf traces into one Perfetto trace")
@@ -149,7 +179,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None, help="output JSON path")
     parser.add_argument("--source", choices=("all", "mk", "deepep"), default="all", help="trace source to aggregate")
     parser.add_argument("--split-sources", action="store_true", default=True, help="also write source-specific JSON files")
-    parser.add_argument("--no-split-sources", action="store_false", dest="split_sources", help="only write the requested output")
+    parser.add_argument("--no-split-sources", action="store_false", dest="split_sources", help="do not write source-specific JSON files")
+    parser.add_argument("--split-directions", action="store_true", default=True, help="also write mk forward/backward JSON files")
+    parser.add_argument("--no-split-directions", action="store_false", dest="split_directions", help="do not write mk forward/backward JSON files")
     parser.add_argument("--no-normalize-ts", action="store_true", help="keep original timestamps instead of shifting min ts to 0")
     args = parser.parse_args()
 
@@ -170,10 +202,16 @@ def main() -> None:
         # One aggregated output per run: mk_perf_trace_all_iter{N}.json
         for i in tagged_iters:
             iter_output = output.with_name(f"{output.stem}_iter{i}{output.suffix}")
-            run_aggregate(input_dir, iter_output, normalize_ts, args.source, args.split_sources, iter_filter=i)
+            run_aggregate(
+                input_dir, iter_output, normalize_ts, args.source,
+                args.split_sources, args.split_directions, iter_filter=i,
+            )
     else:
         # Legacy single-run behavior.
-        run_aggregate(input_dir, output, normalize_ts, args.source, args.split_sources, iter_filter=None)
+        run_aggregate(
+            input_dir, output, normalize_ts, args.source,
+            args.split_sources, args.split_directions, iter_filter=None,
+        )
 
 
 if __name__ == "__main__":

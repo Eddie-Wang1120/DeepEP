@@ -390,8 +390,9 @@ void Buffer::sync(const std::vector<int>& device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
-        // Allocate. Non-low-latency megakernel uses a second RDMA region for combine.
-        int64_t rdma_alloc_bytes = low_latency_mode ? num_rdma_bytes : num_rdma_bytes * 2;
+        // Allocate dispatch and combine RDMA regions. The regular low-latency APIs use
+        // the first region, while megakernel uses the second region for combine.
+        int64_t rdma_alloc_bytes = num_rdma_bytes * 2;
         rdma_buffer_ptr = internode::alloc(rdma_alloc_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)

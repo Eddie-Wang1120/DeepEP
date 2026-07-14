@@ -39,6 +39,7 @@
 #include <mma.h>
 #include <limits>
 #include <vector>
+#include <cstdlib>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #if MK_PERF_TRACE_ENABLED
@@ -80,6 +81,15 @@ constexpr int PUB_CONSUME_BATCH = megakernel_config::kPubConsumeBatch;
 constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
 #ifndef MK_ASYNC_PUBLISH
 #define MK_ASYNC_PUBLISH 0
+#endif
+#ifndef MK_UMMA_SAVE_PREACT
+#define MK_UMMA_SAVE_PREACT 1
+#endif
+#ifndef MK_UMMA_GATEUP
+#define MK_UMMA_GATEUP 1
+#endif
+#ifndef MK_UMMA_DOWN
+#define MK_UMMA_DOWN 1
 #endif
 
 enum TimeoutLogSite {
@@ -216,7 +226,9 @@ struct MegaKernelState {
     // the original X is recovered here by the same recv_token index. A token that hits
     // multiple local experts writes the same X (idempotent).
     __nv_bfloat16* bwd_fc1_input;       // [max_total_recv_tokens, hidden] fc1 input (permuted X) by recv_token
+    __nv_bfloat16* bwd_preact;          // [max_total_recv_tokens, num_topk, 2 * intermediate] saved gate/up by recv_token/topk_slot
     bool owns_bwd_fc1_input;
+    bool owns_bwd_preact;
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
     int* token_slot_list;               // [max_total_recv_tokens * num_topk] absolute slot ids per hit
     int* priority_token_cursor;         // scheduler combine-order cursor for token priority scan
@@ -385,6 +397,17 @@ struct MegaKernelState {
     int64_t* perf_async_publish_all_done_ts; // [1] timestamp when publish_all_done is released
 #endif
 #if MK_PERF_TRACE_ARGS
+    struct DispatchRoundTrace {
+        int64_t sender_work_begin_ns, sender_work_end_ns;
+        int64_t forwarder_wait_begin_ns, forwarder_wait_end_ns;
+        int64_t forwarder_work_begin_ns, forwarder_work_end_ns;
+        int64_t channel_barrier_arrival_ns, round_barrier_arrival_ns, async_publish_ns;
+        int64_t actual_token_count, rdma_packet_slot_count, polling_iteration_count;
+        int64_t ready_wait_ns, tail_head_wait_ns;
+    };
+    // Fixed round dimension: num_ranks / NUM_MAX_NVL_PEERS.
+    DispatchRoundTrace* perf_dispatch_round_trace;
+
     // Accumulated semaphore-interaction times (ns), indexed [logical_ch * 2 + role].
     // Rendered as args on existing dispatch/combine rows (no new rows added).
     int64_t* perf_disp_wait_nvl_ns;        // NVL data-wait spin in dispatch NVL receiver
@@ -409,17 +432,40 @@ struct MegaKernelState {
     int64_t* perf_disp_allrecv_prefix_wait_start_ts;
     int64_t* perf_disp_allrecv_prefix_observe_ts;
     int64_t* perf_disp_allrecv_prefix_done_ts;
+    int64_t* perf_disp_allrecv_prefix_start_first_negative_ts;
+    int64_t* perf_disp_allrecv_prefix_end_first_negative_ts;
+    int64_t* perf_disp_allrecv_prefix_pair_ready_ts;
+    int64_t* perf_disp_allrecv_prefix_poll_count;
+    int64_t* perf_disp_allrecv_prefix_mixed_poll_count;
     int64_t* perf_disp_allrecv_prefix_slowest_rdma;
     int64_t* perf_disp_allrecv_prefix_src_nvl;
     int64_t* perf_disp_allrecv_prefix_raw_start;
     int64_t* perf_disp_allrecv_prefix_raw_end;
     int64_t* perf_disp_allrecv_token_loop_ns;
     int64_t* perf_disp_allrecv_retire_ns;
+    int64_t* perf_disp_sender_meta_build_start_ts; // [lch * 2 * kNumRDMARanks]
+    int64_t* perf_disp_sender_meta_ready_ts;
+    int64_t* perf_disp_sender_meta_put_begin_ts;
+    int64_t* perf_disp_sender_meta_put_end_ts;
+    int64_t* perf_disp_sender_meta_raw_2;
+    int64_t* perf_disp_sender_meta_raw_3;
+    int64_t* perf_disp_prefix_meta_wait_start_ts; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks]
+    int64_t* perf_disp_prefix_meta_ready_ts;
+    int64_t* perf_disp_prefix_meta_first_negative_ts; // [... * 4], one timestamp per metadata word
+    int64_t* perf_disp_prefix_meta_mixed_poll_count;
+    int64_t* perf_disp_prefix_meta_poll_count;
+    int64_t* perf_disp_prefix_meta_raw_0;
+    int64_t* perf_disp_prefix_meta_raw_1;
+    int64_t* perf_disp_prefix_meta_raw_2;
+    int64_t* perf_disp_prefix_meta_raw_3;
+    int64_t* perf_disp_prefix_store_start_done_ts;
     int64_t* perf_disp_prefix_store_begin_ts; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer before prefix stores
     int64_t* perf_disp_prefix_publish_ts;   // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer after prefix stores
     int64_t* perf_disp_prefix_fence_done_ts;
     int64_t* perf_disp_prefix_store_to_fence_ns;
     int64_t* perf_disp_prefix_meta_wait_ns; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer wait for RDMA meta
+    int64_t* perf_disp_prefix_raw_start;
+    int64_t* perf_disp_prefix_raw_end;
     int64_t* perf_disp_prefix_tokens;       // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer token count
     int64_t* perf_disp_prefix_producer_rank;
     int64_t* perf_disp_prefix_producer_nvl;
@@ -722,7 +768,12 @@ __device__ void device_gemm_swiglu_fused(
     int M, int K, int N,
     int tile_warp_id, int num_tile_warps,
     int smem_warp_id,
-    float* smem_buf
+    float* smem_buf,
+    __nv_bfloat16* __restrict__ preact = nullptr,
+    const int* __restrict__ preact_recv_idx = nullptr,
+    const int* __restrict__ preact_topk_idx = nullptr,
+    int num_topk = 0,
+    int preact_stride = 0
 ) {
     const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
     const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
@@ -775,6 +826,15 @@ __device__ void device_gemm_swiglu_fused(
                 float u = up_buf[i];
                 float silu_g = g * (1.0f / (1.0f + __expf(-g)));
                 act[out_row * N + out_col] = __float2bfloat16(silu_g * u * route_w[out_row]);
+                if (preact != nullptr && preact_recv_idx != nullptr && preact_topk_idx != nullptr) {
+                    const int recv_idx = preact_recv_idx[out_row];
+                    const int topk_idx = preact_topk_idx[out_row];
+                    if (recv_idx >= 0 && topk_idx >= 0) {
+                        __nv_bfloat16* preact_row = preact + ((int64_t)recv_idx * num_topk + topk_idx) * preact_stride;
+                        preact_row[2 * out_col] = __float2bfloat16(g);
+                        preact_row[2 * out_col + 1] = __float2bfloat16(u);
+                    }
+                }
             } else {
                 act[out_row * N + out_col] = __float2bfloat16(0.0f);
             }
@@ -3670,10 +3730,11 @@ __device__ __forceinline__ void compute_worker(
     constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
 
     constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kTopkSlotBytes = COMPUTE_BATCH_SIZE * sizeof(int);
     constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
     constexpr size_t kRouteWAlignPad = alignof(float) - 1;
     constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
-    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
+    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
     static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
                   kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
                   "compute dynamic smem metadata must fit after compute scratch");
@@ -3681,9 +3742,11 @@ __device__ __forceinline__ void compute_worker(
     uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
     int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
     compute_smem += kRecvTokenIdxBytes;
+    int* s_topk_slot = reinterpret_cast<int*>(compute_smem);
+    compute_smem += kTopkSlotBytes;
     unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
     constexpr size_t kRouteWOffset =
-        (kComputeMetaOffset + kRecvTokenIdxBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
+        (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
     // Per-row route weight, gathered once and consumed inside the fused
     // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
     float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
@@ -3766,23 +3829,29 @@ __device__ __forceinline__ void compute_worker(
         //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
         //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
-        const bool use_umma_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
+        constexpr bool kUseUmmaGateup = kUseUmmaCompute && (MK_UMMA_GATEUP != 0);
+        constexpr bool kUseUmmaDown = kUseUmmaCompute && (MK_UMMA_DOWN != 0);
+        const bool use_umma_gateup_for_group = kUseUmmaGateup && group_size == COMPUTE_GROUP_SIZE;
+        const bool use_umma_down_for_group = kUseUmmaDown && group_size == COMPUTE_GROUP_SIZE;
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
         // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
-        // Do the same after task decode so descriptor fetch can overlap input gather.
+        // Keep gate/up and down independent so diagnostic switches can isolate each UMMA path.
         if constexpr (kUseUmmaCompute) {
-            if (use_umma_for_group && state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
-                batch_size <= COMPUTE_BATCH_SIZE) {
+            if (batch_size <= COMPUTE_BATCH_SIZE) {
                 const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
                 if (local_warp_id == 0) {
-                    cute::prefetch_tma_descriptor(&prefetch_atom.a);
-                    cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
-                    cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                    if (use_umma_gateup_for_group && state->compute_tma != nullptr) {
+                        cute::prefetch_tma_descriptor(&prefetch_atom.a);
+                        cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
+                        cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
+                    }
+                    if (use_umma_down_for_group && state->compute_down_tma != nullptr) {
+                        cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
+                        cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
+                        cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                    }
                 }
             }
         }
@@ -3819,6 +3888,7 @@ __device__ __forceinline__ void compute_worker(
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
             s_recv_token_idx[i] = recv_token;
+            s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
 // #ifdef MK_TOKEN_TRACE
@@ -3827,12 +3897,14 @@ __device__ __forceinline__ void compute_worker(
 // #endif
         }
         // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
-        // can run at fixed M=256 for tail batches: padded input_buf rows are 0, and
+        // can run over the fixed task extent: padded input_buf rows are 0, and
         // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
         // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
         // so padding rows never leave the kernel.
         for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
             s_route_w[i] = 0.0f;
+            s_recv_token_idx[i] = -1;
+            s_topk_slot[i] = -1;
         }
         __syncthreads();
 #if MK_PERF_TRACE_ARGS
@@ -3868,12 +3940,11 @@ __device__ __forceinline__ void compute_worker(
         // must stay in phase. Declared here so it spans both if-blocks below.
         uint32_t umma_accum_iter = 0;
 
-        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
-        // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
-        // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
+        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path over
+        // the fixed task extent: input_buf rows [batch_size, COMPUTE_BATCH_SIZE) are
+        // zero-padded above, so padded GEMM rows are harmless and SwiGLU/output/
         // reduce/signal all mask by batch_size, so padding never leaves the kernel.
-        // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
-        if (use_umma_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+        if (use_umma_gateup_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
@@ -3891,7 +3962,10 @@ __device__ __forceinline__ void compute_worker(
                 s_route_w,
                 COMPUTE_BATCH_SIZE, intermediate, hidden,
                 cluster_in_group, num_clusters,
-                cluster_smem, umma_accum_iter);
+                cluster_smem, umma_accum_iter,
+                (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
+                s_recv_token_idx, s_topk_slot,
+                num_topk, 2 * intermediate, batch_size);
             umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
             umma_tmem_allocated = false;   // freed each task (4a)
 #if MK_PERF_TRACE_ARGS
@@ -3901,7 +3975,9 @@ __device__ __forceinline__ void compute_worker(
         } else {
             device_gemm_swiglu_fused(input_buf, w_gateup, up_buf, s_route_w,
                                      batch_size, batch_size, hidden, intermediate,
-                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf,
+                                     state->bwd_preact, s_recv_token_idx, s_topk_slot,
+                                     num_topk, 2 * intermediate);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -3916,10 +3992,10 @@ __device__ __forceinline__ void compute_worker(
         // once, run the persistent down GEMM (tile loop inside the three warp
         // roles, zero cluster sync between tiles), dealloc once. A fresh accum
         // counter is used because gate/up already freed TMEM at their dealloc.
-        // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
-        // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
-        // are 0 and are masked off by the batch_size-bounded output/reduce below.
-        if (use_umma_for_group &&
+        // Tail batches run over the fixed task extent: padded act rows hold the
+        // SwiGLU of zero-padded gate/up (== 0), so padded down output rows are 0
+        // and are masked off by the batch_size-bounded output/reduce below.
+        if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
@@ -5413,10 +5489,11 @@ __device__ void combine_precompute_worker(
     constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
 
     constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kTopkSlotBytes = COMPUTE_BATCH_SIZE * sizeof(int);
     constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
     constexpr size_t kRouteWAlignPad = alignof(float) - 1;
     constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
-    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
+    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
     static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
                   kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
                   "compute dynamic smem metadata must fit after compute scratch");
@@ -5424,9 +5501,11 @@ __device__ void combine_precompute_worker(
     uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
     int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
     compute_smem += kRecvTokenIdxBytes;
+    int* s_topk_slot = reinterpret_cast<int*>(compute_smem);
+    compute_smem += kTopkSlotBytes;
     unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
     constexpr size_t kRouteWOffset =
-        (kComputeMetaOffset + kRecvTokenIdxBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
+        (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
     // Per-row route weight, gathered once and consumed inside the fused
     // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
     float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
@@ -5512,23 +5591,29 @@ __device__ void combine_precompute_worker(
         //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
         //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
-        const bool use_umma_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
+        constexpr bool kUseUmmaGateup = kUseUmmaCompute && (MK_UMMA_GATEUP != 0);
+        constexpr bool kUseUmmaDown = kUseUmmaCompute && (MK_UMMA_DOWN != 0);
+        const bool use_umma_gateup_for_group = kUseUmmaGateup && group_size == COMPUTE_GROUP_SIZE;
+        const bool use_umma_down_for_group = kUseUmmaDown && group_size == COMPUTE_GROUP_SIZE;
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
         // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
-        // Do the same after task decode so descriptor fetch can overlap input gather.
+        // Keep gate/up and down independent so diagnostic switches can isolate each UMMA path.
         if constexpr (kUseUmmaCompute) {
-            if (use_umma_for_group && state->compute_tma != nullptr && state->compute_down_tma != nullptr &&
-                batch_size <= COMPUTE_BATCH_SIZE) {
+            if (batch_size <= COMPUTE_BATCH_SIZE) {
                 const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
                 if (local_warp_id == 0) {
-                    cute::prefetch_tma_descriptor(&prefetch_atom.a);
-                    cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
-                    cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
-                    cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                    if (use_umma_gateup_for_group && state->compute_tma != nullptr) {
+                        cute::prefetch_tma_descriptor(&prefetch_atom.a);
+                        cute::prefetch_tma_descriptor(&state->compute_tma->wgateup[expert_id]);
+                        cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
+                    }
+                    if (use_umma_down_for_group && state->compute_down_tma != nullptr) {
+                        cute::prefetch_tma_descriptor(&prefetch_atom.act_a);
+                        cute::prefetch_tma_descriptor(&state->compute_down_tma->wdown[expert_id]);
+                        cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                    }
                 }
             }
         }
@@ -5565,6 +5650,7 @@ __device__ void combine_precompute_worker(
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
             s_recv_token_idx[i] = recv_token;
+            s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
 #ifdef MK_TOKEN_TRACE
@@ -5573,12 +5659,14 @@ __device__ void combine_precompute_worker(
 #endif
         }
         // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
-        // can run at fixed M=256 for tail batches: padded input_buf rows are 0, and
+        // can run over the fixed task extent: padded input_buf rows are 0, and
         // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
         // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
         // so padding rows never leave the kernel.
         for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
             s_route_w[i] = 0.0f;
+            s_recv_token_idx[i] = -1;
+            s_topk_slot[i] = -1;
         }
         __syncthreads();
 #if MK_PERF_TRACE_ARGS
@@ -5614,12 +5702,11 @@ __device__ void combine_precompute_worker(
         // must stay in phase. Declared here so it spans both if-blocks below.
         uint32_t umma_accum_iter = 0;
 
-        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path at
-        // FIXED M=256: input_buf rows [batch_size,256) are zero-padded above, so the
-        // GEMM computes 256 rows (padding rows -> 0, harmless) but SwiGLU/output/
+        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path over
+        // the fixed task extent: input_buf rows [batch_size, COMPUTE_BATCH_SIZE) are
+        // zero-padded above, so padded GEMM rows are harmless and SwiGLU/output/
         // reduce/signal all mask by batch_size, so padding never leaves the kernel.
-        // The 2-CTA UMMA M-tile is 256 regardless, so padding costs no extra time.
-        if (use_umma_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+        if (use_umma_gateup_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
@@ -5637,7 +5724,10 @@ __device__ void combine_precompute_worker(
                 s_route_w,
                 COMPUTE_BATCH_SIZE, intermediate, hidden,
                 cluster_in_group, num_clusters,
-                cluster_smem, umma_accum_iter);
+                cluster_smem, umma_accum_iter,
+                (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
+                s_recv_token_idx, s_topk_slot,
+                num_topk, 2 * intermediate, batch_size);
             umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
             umma_tmem_allocated = false;   // freed each task (4a)
 #if MK_PERF_TRACE_ARGS
@@ -5647,7 +5737,9 @@ __device__ void combine_precompute_worker(
         } else {
             device_gemm_swiglu_fused(input_buf, w_gateup, up_buf, s_route_w,
                                      batch_size, batch_size, hidden, intermediate,
-                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf,
+                                     state->bwd_preact, s_recv_token_idx, s_topk_slot,
+                                     num_topk, 2 * intermediate);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -5662,10 +5754,10 @@ __device__ void combine_precompute_worker(
         // once, run the persistent down GEMM (tile loop inside the three warp
         // roles, zero cluster sync between tiles), dealloc once. A fresh accum
         // counter is used because gate/up already freed TMEM at their dealloc.
-        // Tail batches run at FIXED M=256: act rows [batch_size,256) hold the
-        // SwiGLU of zero-padded gate/up (== 0), so down output rows [batch_size,256)
-        // are 0 and are masked off by the batch_size-bounded output/reduce below.
-        if (use_umma_for_group &&
+        // Tail batches run over the fixed task extent: padded act rows hold the
+        // SwiGLU of zero-padded gate/up (== 0), so padded down output rows are 0
+        // and are masked off by the batch_size-bounded output/reduce below.
+        if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
@@ -7051,7 +7143,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // ============================================================================
 
 #if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms);
+static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms, const char* trace_phase);
 #endif
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
@@ -7146,14 +7238,21 @@ void launch_megakernel_v7(
 #undef MEGAKERNEL_LAUNCH_STAGE_CASE
 
 #if MK_PERF_TRACE_ENABLED
-    dump_perf_trace_perfetto(device_state, total_sms);
+    dump_perf_trace_perfetto(device_state, total_sms, "forward");
 #endif
 }
 
 #if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms) {
+static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms, const char* trace_phase) {
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+
+    static int forward_trace_iter = 0;
+    static int backward_trace_iter = 0;
+    const bool is_backward_trace = trace_phase != nullptr && trace_phase[0] == 'b';
+    const int trace_iter = is_backward_trace ? backward_trace_iter++ : forward_trace_iter++;
+    const char* trace_retention = std::getenv("MK_PERF_TRACE_RETENTION");
+    const bool keep_all_trace_iters = trace_retention != nullptr && trace_retention[0] == 'a';
 
     int num_logical_channels = host_state.num_logical_channels;
     constexpr int NLP = MegaKernelState::MK_PERF_NUM_LCH_PHASES;
@@ -7218,8 +7317,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     if (base_ts == std::numeric_limits<int64_t>::max()) base_ts = 0;
 
     char filename[256];
-    snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d.json", host_state.rank);
+    if (keep_all_trace_iters) {
+        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s_iter%d.json", host_state.rank, trace_phase, trace_iter);
+    } else {
+        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s.json", host_state.rank, trace_phase);
+    }
     FILE* f = fopen(filename, "w");
+
     if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
     printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
 
@@ -7699,8 +7803,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     // use aggregate_mk_perf_traces.py which aligns rank baselines.
 
     char filename[256];
-    snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d.json", host_state.rank);
+    if (keep_all_trace_iters) {
+        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s_iter%d.json", host_state.rank, trace_phase, trace_iter);
+    } else {
+        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s.json", host_state.rank, trace_phase);
+    }
     FILE* f = fopen(filename, "w");
+
     if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
 
     // Also write raw base_ts so post-processing can re-align ranks
@@ -9198,11 +9307,15 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* priority_batch_retry_epoch;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
     CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
-    // Backward activation save: fc1 input (permuted X) by recv_token, [max_total_recv_tokens, hidden].
+    // Backward activation save: original fc1 input X plus gate/up preact by recv_token.
     __nv_bfloat16* bwd_fc1_input;
     const size_t bwd_fc1_input_bytes = (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16);
     CUDA_CHECK(cudaMalloc(&bwd_fc1_input, bwd_fc1_input_bytes));
     CUDA_CHECK(cudaMemset(bwd_fc1_input, 0, bwd_fc1_input_bytes));
+    __nv_bfloat16* bwd_preact;
+    const size_t bwd_preact_bytes = (size_t)max_total_recv_tokens * num_topk * 2 * intermediate_dim * sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMalloc(&bwd_preact, bwd_preact_bytes));
+    CUDA_CHECK(cudaMemset(bwd_preact, 0, bwd_preact_bytes));
     CUDA_CHECK(cudaMalloc(&token_nhits, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&token_slot_list, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
@@ -9567,7 +9680,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_compute_expected = token_compute_expected;
     host_state.compute_output_slot = compute_output_slot;
     host_state.bwd_fc1_input = bwd_fc1_input;
+    host_state.bwd_preact = bwd_preact;
     host_state.owns_bwd_fc1_input = true;
+    host_state.owns_bwd_preact = true;
     host_state.token_nhits = token_nhits;
     host_state.token_slot_list = token_slot_list;
     host_state.priority_token_cursor = priority_token_cursor;
@@ -9620,6 +9735,13 @@ MegaKernelState* allocate_megakernel_state_v7(
 #endif
 
 #if MK_PERF_TRACE_ARGS
+    const size_t dispatch_round_trace_count = static_cast<size_t>(num_logical_channels) *
+                                              (num_ranks / NUM_MAX_NVL_PEERS);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_dispatch_round_trace,
+                          dispatch_round_trace_count * sizeof(MegaKernelState::DispatchRoundTrace)));
+    CUDA_CHECK(cudaMemset(host_state.perf_dispatch_round_trace, 0,
+                          dispatch_round_trace_count * sizeof(MegaKernelState::DispatchRoundTrace)));
+
     // Accumulated dispatch/combine semaphore-interaction timers (rendered as args on existing rows).
     int64_t* perf_disp_wait_nvl_ns;
     int64_t* perf_disp_publish_ns;
@@ -9834,6 +9956,16 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_observe_ts, 0, disp_recv_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_done_ts, disp_recv_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_done_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_start_first_negative_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_start_first_negative_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_end_first_negative_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_end_first_negative_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_pair_ready_ts, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_pair_ready_ts, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_poll_count, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_poll_count, 0, disp_recv_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_mixed_poll_count, disp_recv_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_mixed_poll_count, 0, disp_recv_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_slowest_rdma, disp_recv_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_slowest_rdma, 0xff, disp_recv_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_src_nvl, disp_recv_bytes));
@@ -9842,7 +9974,40 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_start, 0, disp_recv_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_raw_end, disp_recv_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_end, 0, disp_recv_bytes));
+    const size_t disp_sender_meta_bytes = (size_t)num_logical_channels * 2 * (host_state.num_ranks / NUM_MAX_NVL_PEERS) * sizeof(int64_t);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_build_start_ts, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_build_start_ts, 0, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_ready_ts, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_ready_ts, 0, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_put_begin_ts, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_put_begin_ts, 0, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_put_end_ts, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_put_end_ts, 0, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_raw_2, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_raw_2, 0, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_raw_3, disp_sender_meta_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_raw_3, 0, disp_sender_meta_bytes));
     const size_t disp_prefix_prod_bytes = disp_recv_bytes * (host_state.num_ranks / NUM_MAX_NVL_PEERS);
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_wait_start_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_wait_start_ts, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_ready_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_ready_ts, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_first_negative_ts, disp_prefix_prod_bytes * 4));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_first_negative_ts, 0, disp_prefix_prod_bytes * 4));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_mixed_poll_count, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_mixed_poll_count, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_poll_count, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_poll_count, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_0, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_1, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_1, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_2, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_2, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_3, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_3, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_start_done_ts, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_start_done_ts, 0, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_begin_ts, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_begin_ts, 0, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_publish_ts, disp_prefix_prod_bytes));
@@ -9853,6 +10018,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_to_fence_ns, 0, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_wait_ns, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_wait_ns, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_raw_start, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_raw_start, 0, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_raw_end, disp_prefix_prod_bytes));
+    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_raw_end, 0, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_tokens, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_tokens, 0, disp_prefix_prod_bytes));
     CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_rank, disp_prefix_prod_bytes));
@@ -10118,6 +10287,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
     if (host_state.owns_bwd_fc1_input) CUDA_CHECK(cudaFree(host_state.bwd_fc1_input));
+    if (host_state.owns_bwd_preact) CUDA_CHECK(cudaFree(host_state.bwd_preact));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
     CUDA_CHECK(cudaFree(host_state.token_slot_list));
     CUDA_CHECK(cudaFree(host_state.priority_token_cursor));
@@ -10207,6 +10377,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_async_publish_all_done_ts));
 #endif
 #if MK_PERF_TRACE_ARGS
+    CUDA_CHECK(cudaFree(host_state.perf_dispatch_round_trace));
     CUDA_CHECK(cudaFree(host_state.perf_disp_wait_nvl_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_publish_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_wait_recvcount_ns));
@@ -10228,15 +10399,38 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_wait_start_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_observe_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_done_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_start_first_negative_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_end_first_negative_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_pair_ready_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_poll_count));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_mixed_poll_count));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_slowest_rdma));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_src_nvl));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_start));
     CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_end));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_build_start_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_ready_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_put_begin_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_put_end_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_raw_2));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_raw_3));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_wait_start_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_ready_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_first_negative_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_mixed_poll_count));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_poll_count));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_0));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_1));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_2));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_3));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_start_done_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_begin_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_publish_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_fence_done_ts));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_to_fence_ns));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_wait_ns));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_raw_start));
+    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_raw_end));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_tokens));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_rank));
     CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_nvl));
@@ -10446,8 +10640,10 @@ struct MegaKernelBackwardState {
     MegaKernelState* bwd_device_state;    // patched device copy: x=grad_output, combined_x=grad_input
 
     const __nv_bfloat16* bwd_fc1_input;   // fwd.bwd_fc1_input [max_total_recv_tokens, hidden] (X by recv_token)
+    const __nv_bfloat16* bwd_preact;      // fwd.bwd_preact [max_total_recv_tokens, num_topk, 2I]
     const __nv_bfloat16* W_gateup_T;      // [E, hidden, 2I]
     const __nv_bfloat16* W_down_T;        // [E, I, hidden]
+    umma::ComputeBackwardTmaAtoms* compute_bwd_tma;
 
     const __nv_bfloat16* grad_output;     // [num_combined_tokens, hidden] dY (== bwd_device_state->x)
     __nv_bfloat16* grad_input;            // [num_combined_tokens, hidden] dX (== bwd_device_state->combined_x)
@@ -10591,22 +10787,59 @@ __device__ __forceinline__ void compute_backward_worker_core(
     __nv_bfloat16* up_buf    = gu_buf + gu_stride;
     __nv_bfloat16* down_buf  = up_buf + act_stride;
 
-    // Dynamic smem: [WMMA C scratch: num_warps_per_sm * WMMA_M*WMMA_N floats]
-    //               [s_recv_token_idx int[M]][s_is_single uchar[M]][s_route_w float[M]]
     float* smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
-    size_t off = (size_t)num_warps_per_sm * WMMA_M * WMMA_N * sizeof(float);
-    off = (off + 15) & ~size_t(15);
-    int* s_recv_token_idx = reinterpret_cast<int*>(smem_buffer + off);
-    off += (size_t)COMPUTE_BATCH_SIZE * sizeof(int);
-    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(smem_buffer + off);
-    off += (size_t)COMPUTE_BATCH_SIZE * sizeof(unsigned char);
-    off = (off + alignof(float) - 1) & ~size_t(alignof(float) - 1);
-    float* s_route_w = reinterpret_cast<float*>(smem_buffer + off);
+
+    using ComputeUmmaSmemLayout = umma::DgSmemLayout<umma::kDgRunMulticast>;
+    constexpr size_t kComputeUmmaBarrierBytes =
+        (ComputeUmmaSmemLayout::kNumStages * 3 + ComputeUmmaSmemLayout::kNumEpilogueStages * 2 + 1) *
+        sizeof(cutlass::arch::ClusterTransactionBarrier) + sizeof(uint32_t);
+    constexpr size_t kComputeUmmaScratchBytes =
+        ComputeUmmaSmemLayout::SMEM_CD_SIZE +
+        ComputeUmmaSmemLayout::kNumStages *
+            (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
+        kComputeUmmaBarrierBytes;
+    constexpr size_t kComputeWmmaScratchBytes =
+        (kNumCombineForwarderWarps + 1) * 2 * WMMA_M * WMMA_N * sizeof(float);
+    constexpr size_t kComputeScratchBytes =
+        kComputeWmmaScratchBytes > kComputeUmmaScratchBytes ? kComputeWmmaScratchBytes : kComputeUmmaScratchBytes;
+    constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
+
+    constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kTopkSlotBytes = COMPUTE_BATCH_SIZE * sizeof(int);
+    constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
+    constexpr size_t kRouteWAlignPad = alignof(float) - 1;
+    constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
+    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
+    static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
+                  kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
+                  "backward compute dynamic smem metadata must fit after compute scratch");
+
+    uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
+    int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
+    compute_smem += kRecvTokenIdxBytes;
+    int* s_topk_slot = reinterpret_cast<int*>(compute_smem);
+    compute_smem += kTopkSlotBytes;
+    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
+    constexpr size_t kRouteWOffset =
+        (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
+    float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
+#if MK_PERF_TRACE_ARGS
+    int64_t last_task_end_ns = 0;
+#endif
 
     while (true) {
+#if MK_PERF_TRACE_ARGS
+        int64_t pop_start_ns = 0;
+        int64_t pop_done_ns = 0;
+        int pop_attempts = 0;
+        int cas_failures = 0;
+#endif
         // ---- pop a compute task (group leader) and broadcast to the group ----
         if (group_sm_idx == 0 && thread_id == 0) {
             int task_idx = -1;
+#if MK_PERF_TRACE_ARGS
+            pop_start_ns = globaltimer_ns();
+#endif
             while (true) {
                 if constexpr (kStopAtDispatchDone) {
                     if (ld_acquire_global(state->dispatch_done_count) == state->expected_dispatch_done_count) {
@@ -10625,14 +10858,31 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 }
                 if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
                     task_idx = head;
+#if MK_PERF_TRACE_ARGS
+                    pop_done_ns = globaltimer_ns();
+                    if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
+                        state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
+                        state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
+                        state->perf_task_pop_attempts[task_idx] = pop_attempts;
+                        state->perf_task_cas_failures[task_idx] = cas_failures;
+                        state->perf_task_group_id[task_idx] = group_id;
+                    }
+#endif
                     break;
                 }
+#if MK_PERF_TRACE_ARGS
+                cas_failures += 1;
+#endif
             }
             st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
         }
         compute_group_sync(state, group_id, group_size);
 
         int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
+#if MK_PERF_TRACE_ARGS
+        if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
+            state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
+#endif
         if (task_idx == -2 || task_idx == -3)
             break;
         if (task_idx < 0) {
@@ -10647,6 +10897,52 @@ __device__ __forceinline__ void compute_backward_worker_core(
         int start_slot = task.start_slot;
         int batch_size = task.num_tokens;
 
+#if MK_PERF_TRACE_ENABLED
+        const bool perf_leader = (group_sm_idx == 0 && thread_id == 0);
+        int64_t compute_task_start_ns = perf_leader ? globaltimer_ns() : 0;
+        int64_t compute_task_end_ns = 0;
+#endif
+#if MK_PERF_TRACE_ARGS
+        int64_t perf_ph_meta_ns = 0, perf_ph_input_ns = 0, perf_ph_upgemm_ns = 0;
+        int64_t perf_ph_downgemm_ns = 0, perf_ph_output_ns = 0;
+        int64_t perf_up_body_ns = 0, perf_down_body_ns = 0, perf_out_body_ns = 0;
+        int64_t perf_sig_donecount_ns = 0, perf_sig_finalize_ns = 0;
+        int64_t perf_sig_fence_ns = 0, perf_sig_publish_ns = 0;
+        if (perf_leader && task_idx >= 0 && task_idx < state->max_compute_tasks) {
+            state->perf_task_start_ts[task_idx] = compute_task_start_ns;
+            state->perf_task_prev_end_ts[task_idx] = last_task_end_ns;
+            state->perf_task_prev_gap_ns[task_idx] = last_task_end_ns == 0 ? 0 : compute_task_start_ns - last_task_end_ns;
+        }
+        __shared__ int s_perf_multi_expert_rows;
+        __shared__ int s_perf_task_has_multi;
+        if (perf_leader) {
+            s_perf_multi_expert_rows = 0;
+            s_perf_task_has_multi = 0;
+        }
+        __syncthreads();
+#endif
+
+        constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        constexpr bool kUseUmmaBwdGemm = kUseUmmaCompute && (MK_UMMA_DOWN != 0);
+        const bool use_umma_bwd_for_group =
+            kUseUmmaBwdGemm && group_size == COMPUTE_GROUP_SIZE &&
+            state->group_input_tma != nullptr && bs->compute_bwd_tma != nullptr &&
+            batch_size <= COMPUTE_BATCH_SIZE;
+        constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
+        constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
+
+        if constexpr (kUseUmmaBwdGemm) {
+            if (use_umma_bwd_for_group && local_warp_id == 0) {
+                const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
+                cute::prefetch_tma_descriptor(&prefetch_atom.a);
+                cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
+                cute::prefetch_tma_descriptor(&prefetch_atom.gu_a);
+                cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
+                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wdown_t[expert_id]);
+                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wgateup_t[expert_id]);
+            }
+        }
+
         // ---- gather per-row (recv_token, single-hit flag, route weight) ----
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
             int base_offset = expert_id * max_tpe + start_slot + i;
@@ -10654,10 +10950,20 @@ __device__ __forceinline__ void compute_backward_worker_core(
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
             s_recv_token_idx[i] = recv_token;
+            s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
         }
+        for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
+            s_recv_token_idx[i] = -1;
+            s_topk_slot[i] = -1;
+            s_is_single[i] = 0;
+            s_route_w[i] = 0.0f;
+        }
         __syncthreads();
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
+#endif
 
         // ---- gather grad_down (input_buf) and X_perm (down_buf) by recv_token ----
         const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
@@ -10683,6 +10989,9 @@ __device__ __forceinline__ void compute_backward_worker_core(
             }
         }
         compute_group_sync(state, group_id, group_size);
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_input_ns = globaltimer_ns();
+#endif
         if (group_sm_idx == 0) {
             trace_backward_values("GRAD-DOWN", input_buf, batch_size * hidden,
                                   state->rank, task_idx, expert_id, batch_size);
@@ -10694,15 +11003,68 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const __nv_bfloat16* WguT_e = &bs->W_gateup_T[(size_t)expert_id * hidden * twoI];        // [hidden,2I]
         const __nv_bfloat16* WdT_e  = &bs->W_down_T[(size_t)expert_id * intermediate * hidden];  // [I,hidden]
 
-        // GU = X @ W_gateup^T -> gu_buf [M,2I]
-        device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
-                         group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+        if (bs->bwd_preact != nullptr) {
+            const int preact_int4 = twoI * sizeof(__nv_bfloat16) / sizeof(int4);
+            const int4* preact_i4 = reinterpret_cast<const int4*>(bs->bwd_preact);
+            int4* gu_i4 = reinterpret_cast<int4*>(gu_buf);
+            for (int idx = group_thread_id; idx < COMPUTE_BATCH_SIZE * preact_int4; idx += group_num_threads) {
+                const int row = idx / preact_int4;
+                const int v = idx - row * preact_int4;
+                if (row < batch_size) {
+                    const int recv_token = s_recv_token_idx[row];
+                    const int topk_slot = s_topk_slot[row];
+                    const int64_t src_row = ((int64_t)recv_token * num_topk + topk_slot) * preact_int4;
+                    gu_i4[idx] = preact_i4[src_row + v];
+                } else {
+                    gu_i4[idx] = make_int4(0, 0, 0, 0);
+                }
+            }
+        } else {
+            // Fallback for states created without forward-saved gate/up preactivation.
+            device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
+                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            const int preact_int4 = twoI * sizeof(__nv_bfloat16) / sizeof(int4);
+            int4* gu_i4 = reinterpret_cast<int4*>(gu_buf);
+            for (int idx = batch_size * preact_int4 + group_thread_id;
+                 idx < COMPUTE_BATCH_SIZE * preact_int4;
+                 idx += group_num_threads) {
+                gu_i4[idx] = make_int4(0, 0, 0, 0);
+            }
+        }
         compute_group_sync(state, group_id, group_size);
 
-        // grad_act = grad_down @ W_down -> up_buf [M,I]  (device_gemm computes grad_down @ W_down_T^T)
-        device_gemm_bf16(input_buf, WdT_e, up_buf, batch_size, hidden, intermediate,
-                         group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-        compute_group_sync(state, group_id, group_size);
+        // grad_act = grad_down @ W_down -> up_buf [M,I]. Prefer the verified
+        // DeepGEMM/UMMA saved-preact baseline; keep WMMA as descriptor fallback.
+        if (use_umma_bwd_for_group) {
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+            uint32_t grad_act_accum_iter = 0;
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_down_persistent(
+                &in_atom.a,
+                &bs->compute_bwd_tma->wdown_t[expert_id],
+                &in_atom.act_cd,
+                COMPUTE_BATCH_SIZE, intermediate, hidden,
+                cluster_in_group, num_clusters,
+                cluster_smem, grad_act_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_up_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+        } else {
+            device_gemm_bf16(input_buf, WdT_e, up_buf, batch_size, hidden, intermediate,
+                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_up_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+        }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
+#endif
         if (group_sm_idx == 0) {
             trace_backward_values("GRAD-ACT", up_buf, batch_size * intermediate,
                                   state->rank, task_idx, expert_id, batch_size);
@@ -10739,9 +11101,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 route_grad += __shfl_down_sync(0xffffffff, route_grad, offset);
             if (lane_id == 0) {
                 const int recv_token = s_recv_token_idx[m];
-                const int source_offset = expert_id * max_tpe + start_slot + m;
-                const int topk_slot = ld_acquire_global(
-                    &state->recv_token_source_info[source_offset * 2 + 1]);
+                const int topk_slot = s_topk_slot[m];
                 state->combine_input_topk_weights[recv_token * num_topk + topk_slot] = route_grad;
             }
         }
@@ -10751,10 +11111,37 @@ __device__ __forceinline__ void compute_backward_worker_core(
                                   state->rank, task_idx, expert_id, batch_size);
         }
 
-        // grad_xperm = grad_gu @ W_gateup -> down_buf [M,hidden] (device_gemm computes grad_gu @ W_gateup_T^T)
-        device_gemm_bf16(gu_buf, WguT_e, down_buf, batch_size, twoI, hidden,
-                         group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-        compute_group_sync(state, group_id, group_size);
+        // grad_xperm = grad_gu @ W_gateup -> down_buf [M,hidden].
+        if (use_umma_bwd_for_group) {
+            const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
+            const int num_clusters = kUmmaClustersPerGroup;
+            char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+            const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+            uint32_t grad_x_accum_iter = 0;
+            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            umma::umma_down_persistent(
+                &in_atom.gu_a,
+                &bs->compute_bwd_tma->wgateup_t[expert_id],
+                &in_atom.down_cd,
+                COMPUTE_BATCH_SIZE, hidden, twoI,
+                cluster_in_group, num_clusters,
+                cluster_smem, grad_x_accum_iter);
+            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_down_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+        } else {
+            device_gemm_bf16(gu_buf, WguT_e, down_buf, batch_size, twoI, hidden,
+                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+#if MK_PERF_TRACE_ARGS
+            if (perf_leader) perf_down_body_ns = globaltimer_ns();
+#endif
+            compute_group_sync(state, group_id, group_size);
+        }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
+#endif
         if (group_sm_idx == 0) {
             trace_backward_values("GRAD-XPERM", down_buf, batch_size * hidden,
                                   state->rank, task_idx, expert_id, batch_size);
@@ -10774,8 +11161,14 @@ __device__ __forceinline__ void compute_backward_worker_core(
             else
                 slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_out_body_ns = globaltimer_ns();
+#endif
         __threadfence();
         compute_group_sync(state, group_id, group_size);
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_ph_output_ns = globaltimer_ns();
+#endif
         if (group_sm_idx == 0 && batch_size > 0) {
             const int recv_token = s_recv_token_idx[0];
             const __nv_bfloat16* scatter_values = s_is_single[0]
@@ -10787,6 +11180,20 @@ __device__ __forceinline__ void compute_backward_worker_core(
         }
 
         // ---- signal per-token completion (identical to forward) ----
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) {
+            perf_sig_donecount_ns = globaltimer_ns();
+            perf_sig_finalize_ns = perf_sig_donecount_ns;
+            perf_sig_fence_ns = perf_sig_donecount_ns;
+        }
+        if (perf_leader) {
+            int mr = 0;
+            for (int row = 0; row < batch_size; ++row)
+                if (!s_is_single[row]) ++mr;
+            s_perf_multi_expert_rows = mr;
+            s_perf_task_has_multi = (mr != 0);
+        }
+#endif
         for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
             const int recv_token = s_recv_token_idx[row];
             int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
@@ -10796,6 +11203,55 @@ __device__ __forceinline__ void compute_backward_worker_core(
             }
         }
         compute_group_sync(state, group_id, group_size);
+#if MK_PERF_TRACE_ENABLED
+        if (perf_leader) compute_task_end_ns = globaltimer_ns();
+#endif
+#if MK_PERF_TRACE_ARGS
+        if (perf_leader) perf_sig_publish_ns = compute_task_end_ns;
+#endif
+
+#if MK_PERF_TRACE_ENABLED
+        if (perf_leader) {
+#if MK_PERF_TRACE_ARGS
+            last_task_end_ns = compute_task_end_ns;
+#endif
+            int slot = task_idx;
+            if (slot >= 0 && slot < state->max_compute_tasks) {
+                int64_t* rec = state->perf_compute_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
+                rec[0] = compute_task_start_ns;
+                rec[1] = compute_task_end_ns;
+                rec[2] = sm_id;
+                rec[3] = group_id;
+                rec[25] = task.is_flush;
+                rec[26] = 1;
+#if MK_PERF_TRACE_ARGS
+                rec[4] = expert_id;
+                rec[5] = batch_size;
+                rec[6] = hidden;
+                rec[7] = intermediate;
+                rec[8]  = perf_ph_meta_ns;
+                rec[9]  = perf_ph_input_ns;
+                rec[10] = perf_ph_upgemm_ns;
+                rec[11] = perf_ph_downgemm_ns;
+                rec[12] = perf_ph_output_ns;
+                rec[13] = compute_task_end_ns;
+                rec[14] = perf_up_body_ns;
+                rec[15] = perf_down_body_ns;
+                rec[16] = perf_out_body_ns;
+                rec[17] = perf_sig_donecount_ns;
+                rec[18] = perf_sig_finalize_ns;
+                rec[19] = perf_sig_fence_ns;
+                rec[20] = perf_sig_publish_ns;
+                rec[21] = task_idx;
+                rec[22] = start_slot;
+                rec[23] = start_slot + batch_size;
+                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
+                state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
+#endif
+            }
+        }
+#endif
     }
     if constexpr (kStopAtDispatchDone) {
         asm volatile("barrier.sync 15, %0;" :: "r"(static_cast<int>(blockDim.x)) : "memory");
@@ -10920,6 +11376,18 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     bwd_transpose_weights_kernel<<<num_local_experts, 256, 0, stream>>>(
         fs.W_gateup, fs.W_down, Wgu_T, Wd_T, twoI, hidden, intermediate);
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    umma::ComputeBackwardTmaAtoms* d_compute_bwd_tma = nullptr;
+    if (num_local_experts <= umma::kMaxLocalExperts) {
+        umma::ComputeBackwardTmaAtoms h_bwd_atoms;
+        umma::build_compute_backward_tma_atoms(
+            h_bwd_atoms, Wd_T, Wgu_T, num_local_experts, hidden, intermediate);
+        CUDA_CHECK(cudaMalloc(&d_compute_bwd_tma, sizeof(umma::ComputeBackwardTmaAtoms)));
+        CUDA_CHECK(cudaMemcpyAsync(d_compute_bwd_tma, &h_bwd_atoms,
+                                   sizeof(umma::ComputeBackwardTmaAtoms),
+                                   cudaMemcpyHostToDevice, stream));
+    }
 
     MegaKernelState* bwd_device_state = ::deep_ep::megakernel_debug::allocate_megakernel_state_v7(
         reinterpret_cast<const int4*>(grad_output), nullptr,
@@ -10949,8 +11417,12 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     CUDA_CHECK(cudaMemcpy(&rebuilt, bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     if (rebuilt.owns_bwd_fc1_input)
         CUDA_CHECK(mk_caching_free(rebuilt.bwd_fc1_input));
+    if (rebuilt.owns_bwd_preact)
+        CUDA_CHECK(mk_caching_free(rebuilt.bwd_preact));
     rebuilt.bwd_fc1_input = fs.bwd_fc1_input;
+    rebuilt.bwd_preact = fs.bwd_preact;
     rebuilt.owns_bwd_fc1_input = false;
+    rebuilt.owns_bwd_preact = false;
     int4* owned_combined_x = rebuilt.combined_x;
     float* owned_combined_topk_weights = rebuilt.combined_topk_weights;
     rebuilt.combined_x = reinterpret_cast<int4*>(grad_input);
@@ -10962,8 +11434,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.fwd = fwd_device_state;
     hs.bwd_device_state = bwd_device_state;
     hs.bwd_fc1_input = fs.bwd_fc1_input;
+    hs.bwd_preact = fs.bwd_preact;
     hs.W_gateup_T = Wgu_T;
     hs.W_down_T = Wd_T;
+    hs.compute_bwd_tma = d_compute_bwd_tma;
     hs.grad_output = reinterpret_cast<const __nv_bfloat16*>(grad_output);
     hs.grad_input = reinterpret_cast<__nv_bfloat16*>(grad_input);
     hs.grad_w_gateup = reinterpret_cast<__nv_bfloat16*>(grad_w_gateup);
@@ -10999,6 +11473,7 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_gateup_T)));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_down_T)));
+    CUDA_CHECK(cudaFree(hs.compute_bwd_tma));
     CUDA_CHECK(cudaFree(hs.wgrad_x_slot));
     CUDA_CHECK(cudaFree(hs.wgrad_act_slot));
     CUDA_CHECK(cudaFree(hs.wgrad_dz_slot));
@@ -11044,6 +11519,161 @@ void prepare_megakernel_communication_replay(
         combine_barrier_signal_ptrs, hs.rank, stream, hs.num_rdma_bytes,
         hs.num_nvl_bytes, false, false);
 }
+
+#if MK_PERF_TRACE_ENABLED
+static void reset_megakernel_perf_trace_state(const MegaKernelState& hs, cudaStream_t stream) {
+    auto z = [&](void* p, size_t bytes) {
+        if (bytes > 0) CUDA_CHECK(cudaMemsetAsync(p, 0, bytes, stream));
+    };
+    auto f = [&](void* p, size_t bytes) {
+        if (bytes > 0) CUDA_CHECK(cudaMemsetAsync(p, 0xff, bytes, stream));
+    };
+
+    const int NLC = hs.num_logical_channels;
+    const int NPUB = hs.num_pub_warps_total;
+    const size_t lch_ts_bytes = (size_t)NLC * 2 * MegaKernelState::MK_PERF_NUM_LCH_PHASES * sizeof(int64_t);
+    const size_t compute_task_bytes = (size_t)hs.max_compute_tasks * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS * sizeof(int64_t);
+    const size_t gather_task_bytes = (size_t)hs.max_compute_tasks * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS * sizeof(int64_t);
+    const size_t async_pub_bytes = (size_t)NPUB * sizeof(int64_t);
+
+    z(hs.perf_dispatch_lch_ts, lch_ts_bytes);
+    z(hs.perf_combine_lch_ts, lch_ts_bytes);
+    z(hs.perf_compute_task, compute_task_bytes);
+    z(hs.perf_compute_task_count, sizeof(int));
+    z(hs.perf_gather_task, gather_task_bytes);
+    z(hs.perf_gather_task_count, sizeof(int));
+    z(hs.perf_async_pub_start_ts, async_pub_bytes);
+    z(hs.perf_async_pub_end_ts, async_pub_bytes);
+    z(hs.perf_async_publish_all_done_ts, sizeof(int64_t));
+
+#if MK_PERF_TRACE_ARGS
+    const size_t acc_bytes = (size_t)NLC * 2 * sizeof(int64_t);
+    const size_t disp_role_bytes = (size_t)NLC * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS * sizeof(int64_t);
+    const size_t disp_recv_bytes = (size_t)NLC * 2 * NUM_MAX_NVL_PEERS * sizeof(int64_t);
+    const size_t disp_prefix_prod_bytes = disp_recv_bytes * (hs.num_ranks / NUM_MAX_NVL_PEERS);
+    const size_t diag_i64_bytes = (size_t)hs.max_compute_tasks * sizeof(int64_t);
+    const size_t diag_i32_bytes = (size_t)hs.max_compute_tasks * sizeof(int);
+    const size_t expert_batch_bytes = (size_t)hs.num_local_experts * hs.max_batches_per_expert;
+
+    z(hs.expert_batch_enqueue_ts, expert_batch_bytes * sizeof(int64_t));
+    z(hs.token_priority_dep_count, (size_t)hs.max_total_recv_tokens * sizeof(int));
+
+    int64_t* const acc_zero[] = {
+        hs.perf_disp_wait_nvl_ns, hs.perf_disp_publish_ns, hs.perf_disp_wait_recvcount_ns,
+        hs.perf_comb_tma_wait_ns, hs.perf_comb_wait_ready_ns, hs.perf_comb_wait_ready_single_ns,
+        hs.perf_comb_wait_ready_multi_ns, hs.perf_comb_wait_ready_flush_ns,
+        hs.perf_comb_wait_ready_full_ns, hs.perf_comb_wait_ready_flush_count,
+        hs.perf_comb_wait_ready_full_count, hs.perf_comb_gather_reduce_ns,
+        hs.perf_comb_gather_single_ns, hs.perf_comb_gather_multi_ns,
+        hs.perf_comb_pack_meta_ns, hs.perf_comb_pack_meta_work_ns,
+        hs.perf_comb_pack_meta_sync_ns, hs.perf_comb_tma_store_ns,
+        hs.perf_comb_tma_wait_max_ns, hs.perf_comb_wait_ready_max_ns,
+        hs.perf_comb_wait_ready_single_max_ns, hs.perf_comb_wait_ready_multi_max_ns,
+        hs.perf_comb_wait_ready_flush_max_ns, hs.perf_comb_wait_ready_full_max_ns,
+        hs.perf_comb_wait_top_ns, hs.perf_comb_wait_top_nhits,
+        hs.perf_comb_wait_top_priority_deps, hs.perf_comb_gather_reduce_max_ns,
+        hs.perf_comb_gather_single_max_ns, hs.perf_comb_gather_multi_max_ns,
+        hs.perf_comb_pack_meta_max_ns, hs.perf_comb_pack_meta_work_max_ns,
+        hs.perf_comb_pack_meta_sync_max_ns, hs.perf_comb_tma_store_max_ns,
+        hs.perf_comb_nhit_sum, hs.perf_comb_token_count,
+        hs.perf_comb_single_token_count, hs.perf_comb_multi_token_count,
+        hs.perf_disp_pub_scan_ns, hs.perf_disp_pub_atomic_ns,
+        hs.perf_disp_pub_fence_ns, hs.perf_disp_pub_store_ns,
+        hs.perf_disp_cta_barrier_ns, hs.perf_disp_channel_barrier_ns,
+        hs.perf_disp_round_barrier_ns, hs.perf_disp_tokens,
+        hs.perf_disp_local_hit_tokens, hs.perf_disp_local_hits,
+        hs.perf_disp_cta_release_ts,
+    };
+    for (int64_t* p : acc_zero) z(p, acc_bytes);
+
+    int64_t* const acc_ff[] = {
+        hs.perf_comb_wait_top_token, hs.perf_comb_wait_top_slot,
+        hs.perf_comb_wait_top_expert, hs.perf_comb_wait_top_from_flush,
+    };
+    for (int64_t* p : acc_ff) f(p, acc_bytes);
+
+    z(hs.perf_disp_role_arrive_ts, disp_role_bytes);
+    z(hs.perf_disp_role_work_ns, disp_role_bytes);
+
+    int64_t* const disp_recv_zero[] = {
+        hs.perf_disp_allrecv_wait_nvl_ns, hs.perf_disp_allrecv_prefix_wait_ns,
+        hs.perf_disp_allrecv_prefix_wait_start_ts, hs.perf_disp_allrecv_prefix_observe_ts,
+        hs.perf_disp_allrecv_prefix_done_ts, hs.perf_disp_allrecv_prefix_raw_start,
+        hs.perf_disp_allrecv_prefix_raw_end, hs.perf_disp_allrecv_token_loop_ns,
+        hs.perf_disp_allrecv_retire_ns, hs.perf_disp_allrecv_publish_ns,
+        hs.perf_disp_allrecv_tokens, hs.perf_disp_allrecv_local_hits,
+    };
+    for (int64_t* p : disp_recv_zero) z(p, disp_recv_bytes);
+    f(hs.perf_disp_allrecv_prefix_slowest_rdma, disp_recv_bytes);
+    f(hs.perf_disp_allrecv_prefix_src_nvl, disp_recv_bytes);
+
+    int64_t* const disp_prefix_zero[] = {
+        hs.perf_disp_prefix_store_begin_ts, hs.perf_disp_prefix_publish_ts,
+        hs.perf_disp_prefix_fence_done_ts, hs.perf_disp_prefix_store_to_fence_ns,
+        hs.perf_disp_prefix_meta_wait_ns, hs.perf_disp_prefix_tokens,
+    };
+    for (int64_t* p : disp_prefix_zero) z(p, disp_prefix_prod_bytes);
+    f(hs.perf_disp_prefix_producer_rank, disp_prefix_prod_bytes);
+    f(hs.perf_disp_prefix_producer_nvl, disp_prefix_prod_bytes);
+    f(hs.perf_disp_prefix_producer_dst_nvl, disp_prefix_prod_bytes);
+    f(hs.perf_disp_prefix_producer_src_rdma, disp_prefix_prod_bytes);
+
+    int64_t* const async_pub_zero[] = {
+        hs.perf_async_pub_wait_ring_ns, hs.perf_async_pub_poll_ns,
+        hs.perf_async_pub_gap_ns, hs.perf_async_pub_start_gap_ns,
+        hs.perf_async_pub_empty_gap_ns, hs.perf_async_pub_done_recheck_ns,
+        hs.perf_async_pub_ring_load_ns, hs.perf_async_pub_head_release_ns,
+        hs.perf_async_pub_syncwarp_ns, hs.perf_async_pub_batch_wall_ns,
+        hs.perf_async_pub_batch_accounted_ns, hs.perf_async_pub_batch_unattributed_ns,
+        hs.perf_async_pub_token_gap_ns, hs.perf_async_pub_helper_unattributed_ns,
+        hs.perf_async_pub_finish_ns, hs.perf_async_pub_work_ns,
+        hs.perf_async_pub_scan_ns, hs.perf_async_pub_atomic_ns,
+        hs.perf_async_pub_fence_ns, hs.perf_async_pub_store_ns,
+        hs.perf_async_pub_drain_ns, hs.perf_async_pub_tokens,
+        hs.perf_async_pub_batch_count, hs.perf_async_pub_head_release_count,
+        hs.perf_async_pub_max_batch, hs.perf_async_pub_local_hit_tokens,
+        hs.perf_async_pub_local_hits,
+    };
+    for (int64_t* p : async_pub_zero) z(p, async_pub_bytes);
+
+    z(hs.perf_sched_ts, 2 * sizeof(int64_t));
+    int64_t* const sched_zero[] = {
+        hs.perf_sched_scan_ns, hs.perf_sched_enqueue_ns, hs.perf_sched_idle_ns,
+        hs.perf_sched_priority_ns, hs.perf_sched_normal_ns, hs.perf_sched_tail_flush_ns,
+        hs.perf_sched_publish_total_ns, hs.perf_sched_publish_wait_ns,
+        hs.perf_sched_publish_wait_max_ns, hs.perf_sched_priority_scan_tokens,
+        hs.perf_sched_priority_ready_tokens, hs.perf_sched_priority_full_batch_hits,
+        hs.perf_sched_priority_batch_already_enqueued, hs.perf_sched_priority_already_normal,
+        hs.perf_sched_priority_already_priority, hs.perf_sched_priority_already_tail,
+        hs.perf_sched_normal_after_priority_ns, hs.perf_sched_normal_after_priority_count,
+        hs.perf_sched_priority_not_full, hs.perf_sched_normal_full_batch_enqueues,
+        hs.perf_sched_flush_tail_enqueues, hs.perf_sched_queue_empty_count,
+        hs.perf_sched_queue_empty_after_dispatch_count, hs.perf_sched_max_ready_tail_gap,
+        hs.perf_sched_stall_recv_count, hs.perf_sched_stall_alloc_count,
+        hs.perf_sched_stall_enqueue_cursor, hs.perf_sched_stall_first_unready_ready,
+        hs.perf_sched_stall_dispatch_done,
+    };
+    for (int64_t* p : sched_zero) z(p, sizeof(int64_t));
+    f(hs.perf_sched_publish_wait_max_tail, sizeof(int64_t));
+    f(hs.perf_sched_publish_wait_max_visible_tail, sizeof(int64_t));
+    f(hs.perf_sched_stall_expert, sizeof(int64_t));
+    f(hs.perf_sched_stall_first_unready_slot, sizeof(int64_t));
+
+    int64_t* const diag_zero[] = {
+        hs.perf_task_publish_ts, hs.perf_task_pop_start_ts, hs.perf_task_pop_done_ts,
+        hs.perf_task_bcast_done_ts, hs.perf_task_start_ts, hs.perf_task_prev_end_ts,
+        hs.perf_task_prev_gap_ns,
+    };
+    for (int64_t* p : diag_zero) z(p, diag_i64_bytes);
+    z(hs.perf_compute_multi_expert_rows, diag_i32_bytes);
+    z(hs.perf_compute_task_has_multi, diag_i32_bytes);
+    z(hs.perf_task_source, diag_i32_bytes);
+    z(hs.perf_task_pop_attempts, diag_i32_bytes);
+    z(hs.perf_task_cas_failures, diag_i32_bytes);
+    f(hs.perf_task_group_id, diag_i32_bytes);
+#endif
+}
+#endif
 
 static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaStream_t stream) {
     const int E = hs.num_local_experts;
@@ -11127,6 +11757,9 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.recv_gbl_channel_prefix_matrix, (size_t)NR * NLC * sizeof(int));
     z(hs.recv_rdma_channel_token_count, (size_t)kRDMA * NLC * sizeof(int));
     z(hs.recv_gbl_channel_token_count, (size_t)NR * NLC * sizeof(int));
+#if MK_PERF_TRACE_ENABLED
+    reset_megakernel_perf_trace_state(hs, stream);
+#endif
 }
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
@@ -11270,6 +11903,10 @@ void launch_megakernel_debug_backward(
     // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 1);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+#if MK_PERF_TRACE_ENABLED
+    dump_perf_trace_perfetto(hbs.bwd_device_state, active_total_sms, "backward");
+#endif
 
     std::vector<int> expert_token_counts(hstate.num_local_experts);
     CUDA_CHECK(cudaMemcpy(

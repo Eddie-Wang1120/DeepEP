@@ -302,6 +302,7 @@ struct InputTmaAtom_t {
     CUtensorMap act_a;    // up_buf    [M, I]   K-major A (down-proj A operand)
     CUtensorMap down_cd;  // down_buf  [M, hidden] row-major CD (down-proj output)
     CUtensorMap gu_cd;    // gate_buf  [M, 2I]  row-major CD (reserved GU scratch / legacy helpers)
+    CUtensorMap gu_a;     // gate_buf  [M, 2I]  K-major A (backward grad_x A operand)
 };
 
 inline InputTmaAtom_t make_input_tma_atom(const __nv_bfloat16* input_buf_ptr, int M, int d) {
@@ -330,6 +331,7 @@ inline InputTmaAtom_t make_input_group_atoms(const __nv_bfloat16* input_buf_ptr,
     // Reserved GU scratch descriptor for legacy helpers; the interleaved path stores
     // act directly through act_cd and does not write this region.
     out.gu_cd   = dg_make_cd_desc(gate_buf_ptr, M, 2 * I);
+    out.gu_a    = dg_make_a_desc(gate_buf_ptr, M, 2 * I);
     return out;
 }
 
@@ -463,10 +465,12 @@ __device__ void dg_dealloc_tmem(char* cluster_smem) {
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<L::kNumAccumTmemCols>();
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
-    __syncthreads();
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
     if (warp_idx == 0)
         Allocator().free(*L::tmem_ptr_in_smem(cluster_smem), kNumTmemCols);
-    __syncthreads();
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
 }
 
 template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1, bool kFuseSwiGLUInterleaved = false>
@@ -475,7 +479,13 @@ __device__ void dg_gemm_tile(
     int m_block, int n_block,
     int shape_m, int shape_n, int shape_k,
     char* cluster_smem, bool& tmem_allocated, uint32_t& accum_iter,
-    const cutlass::bfloat16_t* gate_ptr, const float* route_ptr, uint32_t stride_n) {
+    const cutlass::bfloat16_t* gate_ptr, const float* route_ptr, uint32_t stride_n,
+    cutlass::bfloat16_t* preact_ptr = nullptr,
+    const int* preact_recv_idx = nullptr,
+    const int* preact_topk_idx = nullptr,
+    uint32_t num_topk = 0,
+    uint32_t preact_stride = 0,
+    uint32_t valid_rows = 0xffffffffu) {
 
     using namespace deep_gemm;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -753,7 +763,8 @@ __device__ void dg_gemm_tile(
                 cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
             (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
              epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
-             tensor_map_cd, route_ptr);
+             tensor_map_cd, route_ptr, preact_ptr, preact_recv_idx, preact_topk_idx,
+             num_topk, preact_stride, valid_rows);
         } else if constexpr (kFuseSwiGLU) {
             deep_gemm::sm100_store_swiglu_from_gate<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                 kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
@@ -817,7 +828,13 @@ __device__ void dg_gemm_persistent(
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     int cluster_idx, int num_clusters,
     char* cluster_smem, uint32_t& accum_iter,
-    const cutlass::bfloat16_t* gate_ptr, const float* route_ptr, uint32_t stride_n) {
+    const cutlass::bfloat16_t* gate_ptr, const float* route_ptr, uint32_t stride_n,
+    cutlass::bfloat16_t* preact_ptr = nullptr,
+    const int* preact_recv_idx = nullptr,
+    const int* preact_topk_idx = nullptr,
+    uint32_t num_topk = 0,
+    uint32_t preact_stride = 0,
+    uint32_t valid_rows = 0xffffffffu) {
 
     using namespace deep_gemm;
     using L = DgSmemLayout<kNumMulticast>;
@@ -996,7 +1013,8 @@ __device__ void dg_gemm_persistent(
                     GemmType::Normal, false, cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
                 (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
                  epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd, route_ptr);
+                 tensor_map_cd, route_ptr, preact_ptr, preact_recv_idx, preact_topk_idx,
+                 num_topk, preact_stride, valid_rows);
             } else if constexpr (kFuseSwiGLU) {
                 deep_gemm::sm100_store_swiglu_from_gate<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
@@ -1052,10 +1070,12 @@ __device__ inline void umma_dealloc(char* cluster_smem) {
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(
         barrier_start_ptr + kDgWsNumStages * 3 + kDgWsNumEpilogueStages * 2 + 1);
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
-    __syncthreads();
+    if constexpr (kDgRunMulticast > 1) deep_gemm::comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
     if (warp_idx == 0)
         Allocator().free(*tmem_ptr_in_smem, kDgWsNumTmemCols);
-    __syncthreads();
+    if constexpr (kDgRunMulticast > 1) deep_gemm::comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
 }
 
 // DeepGEMM gate/up + SwiGLU for one (m_block,n_block) tile. Mirrors
@@ -1135,13 +1155,20 @@ __device__ inline void umma_gateup_interleaved_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_wgateup, const CUtensorMap* desc_act_cd,
     const float* route_w, int M, int I, int d,
     int cluster_idx, int num_clusters,
-    char* cluster_smem, uint32_t& accum_iter) {
+    char* cluster_smem, uint32_t& accum_iter,
+    cutlass::bfloat16_t* preact_ptr = nullptr,
+    const int* preact_recv_idx = nullptr,
+    const int* preact_topk_idx = nullptr,
+    uint32_t num_topk = 0,
+    uint32_t preact_stride = 0,
+    uint32_t valid_rows = 0xffffffffu) {
 
     dg_gemm_persistent<false, kDgRunMulticast, true>(
         desc_a, desc_wgateup, desc_act_cd,
         (uint32_t)M, (uint32_t)(2 * I), (uint32_t)d,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
-        nullptr, route_w, 0);
+        nullptr, route_w, 0, preact_ptr, preact_recv_idx, preact_topk_idx,
+        num_topk, preact_stride, valid_rows);
 }
 
 
@@ -1210,6 +1237,34 @@ inline void build_compute_down_tma_atoms(ComputeDownTmaAtoms& atoms,
     for (int e = 0; e < E; ++e) {
         const __nv_bfloat16* wd_e = W_down + (size_t)e * hidden * intermediate;
         atoms.wdown[e] = dg_make_b_desc(wd_e, hidden, intermediate);   // [N=hidden, K=intermediate]
+    }
+}
+
+// Per-expert backward weight descriptors. These point at the transposed BF16
+// weights built for the saved-preact backward path:
+//   W_down_T   [E, I, hidden]  => GEMM2:  dY[M,hidden]  x W_down_T[I,hidden]^T
+//   W_gateup_T [E, hidden, 2I] => GEMM3: dGU[M,2I]     x W_gateup_T[hidden,2I]^T
+struct ComputeBackwardTmaAtoms {
+    int num_experts;
+    int hidden;
+    int intermediate;
+    CUtensorMap wdown_t[kMaxLocalExperts];
+    CUtensorMap wgateup_t[kMaxLocalExperts];
+};
+
+inline void build_compute_backward_tma_atoms(ComputeBackwardTmaAtoms& atoms,
+                                             const __nv_bfloat16* W_down_T,
+                                             const __nv_bfloat16* W_gateup_T,
+                                             int E, int hidden, int intermediate) {
+    EP_HOST_ASSERT(E <= kMaxLocalExperts);
+    atoms.num_experts = E;
+    atoms.hidden = hidden;
+    atoms.intermediate = intermediate;
+    for (int e = 0; e < E; ++e) {
+        const __nv_bfloat16* wd_t_e = W_down_T + (size_t)e * intermediate * hidden;
+        const __nv_bfloat16* wgu_t_e = W_gateup_T + (size_t)e * hidden * (2 * intermediate);
+        atoms.wdown_t[e] = dg_make_b_desc(wd_t_e, intermediate, hidden);       // [N=I, K=hidden]
+        atoms.wgateup_t[e] = dg_make_b_desc(wgu_t_e, hidden, 2 * intermediate); // [N=hidden, K=2I]
     }
 }
 

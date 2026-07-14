@@ -52,7 +52,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
     }
 
     if (num_tokens_per_rdma_rank != nullptr)
-        EP_DEVICE_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0 and num_ranks > NUM_MAX_NVL_PEERS);
+        EP_DEVICE_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0 and num_ranks >= NUM_MAX_NVL_PEERS);
 
     // Count rank statistics
     constexpr int kNumRDMARanksPerSM = kNumRanksPerSM / NUM_MAX_NVL_PEERS;
