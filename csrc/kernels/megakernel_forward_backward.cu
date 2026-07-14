@@ -213,6 +213,14 @@ struct MegaKernelState {
     // --- Per-expert receive storage (filled by NVL receiver) ---
     __nv_bfloat16* recv_tokens;       // [num_local_experts * max_tokens_per_expert, hidden]
     int* expert_token_offsets;        // [num_local_experts] — atomic write offset
+    // --- Compact per-expert slot layout (P0 memory optimization scaffolding) ---
+    // Phase 0: placeholder values (expert_slot_base[le]=le*max_tokens_per_expert,
+    // expert_count[le]=max_tokens_per_expert) so addressing is byte-identical to the
+    // legacy `le*max_tpe+slot` scheme. Not read by any kernel yet. Later phases switch
+    // these to real exclusive-prefix-sum bases / real per-expert counts to compact the
+    // per-expert-slot buffers from num_local_experts*max_total_recv_tokens down to Σ count.
+    int* expert_slot_base;            // [num_local_experts] base offset into per-expert-slot buffers
+    int* expert_count;                // [num_local_experts] received token count per local expert
     int* recv_token_source_info;      // [max_total_recv_tokens, 2] — (recv_token_idx, topk_slot)
     float* recv_token_route_weights;  // [max_total_recv_tokens] — route weight for this compute slot
     internode::SourceMeta* recv_src_meta; // [max_total_recv_tokens] — DeepEP SourceMeta for combine routing
@@ -859,6 +867,22 @@ __device__ void device_gemm_swiglu_fused(
 // data to recv_x, we also route tokens to expert storage + signal compute SMs.
 // ============================================================================
 
+// Map an absolute per-expert slot index back to its local expert id via the
+// expert_slot_base / expert_count arrays. Replaces the legacy `slot / max_tpe`
+// division so it stays correct once the layout switches from fixed stride
+// (base[e]=e*max_tpe) to a real exclusive-prefix-sum (variable stride).
+// num_local_experts is small (e.g. 16), so a linear scan is cheap and only runs
+// in scheduler warps, not the per-element compute loops.
+__device__ __forceinline__ int mk_slot_to_local_expert(const MegaKernelState* state, int slot) {
+    const int ne = state->num_local_experts;
+    for (int e = 0; e < ne; ++e) {
+        const int base = state->expert_slot_base[e];
+        if (slot >= base && slot < base + state->expert_count[e])
+            return e;
+    }
+    return ne - 1;  // fallback; should not happen for a valid allocated slot
+}
+
 // Instantiated template constants
 constexpr int kNumDispatchRDMASenderWarps = 7;
 constexpr int kNumTMABytesPerWarp = 16384;
@@ -943,7 +967,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             }
             group_base_slot = __shfl_sync(same_expert_mask, group_base_slot, leader_lane);
             hit_slot = group_base_slot + rank_in_expert;
-            hit_abs_slot = local_expert_id * state->max_tokens_per_expert + hit_slot;
+            hit_abs_slot = state->expert_slot_base[local_expert_id] + hit_slot;
         }
 
 #if MK_PERF_TRACE_ARGS
@@ -978,7 +1002,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
 #endif
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
-            st_na_release(&state->expert_slot_ready[local_expert_id * state->max_tokens_per_expert + hit_slot], 1);
+            st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + hit_slot], 1);
         }
 #if MK_PERF_TRACE_ARGS
         if (lane_id == 0)
@@ -2415,7 +2439,7 @@ __device__ void dispatch_worker_v2(
                                    state->rank, (long long)recv_token_idx, expert_id, slot, state->max_tokens_per_expert);
                             trap();
                         }
-                        int dest_offset = local_expert_id * state->max_tokens_per_expert + slot;
+                        int dest_offset = state->expert_slot_base[local_expert_id] + slot;
                         int* dst_ptr = &state->recv_token_source_info[dest_offset * 2];
                         // Plain stores: ordering vs slot_ready is enforced by the single
                         // __threadfence() below. All readers are this GPU's compute workers,
@@ -2424,7 +2448,7 @@ __device__ void dispatch_worker_v2(
                         st_na_global(dst_ptr + 1, topk_slot);
                         hit_local_expert[num_hits] = local_expert_id;
                         hit_slot[num_hits] = slot;
-                        hit_abs_slot[num_hits] = local_expert_id * state->max_tokens_per_expert + slot;
+                        hit_abs_slot[num_hits] = state->expert_slot_base[local_expert_id] + slot;
                         num_hits += 1;
                     }
                     if (num_hits > 0) {
@@ -2461,7 +2485,7 @@ __device__ void dispatch_worker_v2(
                     for (int h = 0; h < num_hits; ++h) {
                         int local_expert_id = hit_local_expert[h];
                         int slot = hit_slot[h];
-                        st_na_release(&state->expert_slot_ready[local_expert_id * state->max_tokens_per_expert + slot], 1);
+                        st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + slot], 1);
                     }
 #if MK_PERF_TRACE_ARGS
                     int64_t pub_store_ns = globaltimer_ns() - pub_store_start;
@@ -2913,8 +2937,8 @@ __device__ __forceinline__ void scheduler_priority_warp_worker(MegaKernelState* 
                 if (lane == 0) {
                     slot = ld_nc_global(&state->token_slot_list[token * num_topk + h]);
                     if (slot >= 0) {
-                        expert_id = slot / max_tpe;
-                        int expert_local_slot = slot - expert_id * max_tpe;
+                        expert_id = mk_slot_to_local_expert(state, slot);
+                        int expert_local_slot = slot - state->expert_slot_base[expert_id];
                         int batch_id = expert_local_slot / COMPUTE_BATCH_SIZE;
                         batch_start = batch_id * COMPUTE_BATCH_SIZE;
                         batch_end = batch_start + COMPUTE_BATCH_SIZE;
@@ -2969,7 +2993,7 @@ __device__ __forceinline__ void scheduler_priority_warp_worker(MegaKernelState* 
                     continue;
                 }
 
-                const int ready_base = expert_id * max_tpe + batch_start;
+                const int ready_base = state->expert_slot_base[expert_id] + batch_start;
                 bool lane_ready = true;
                 for (int s = lane; s < COMPUTE_BATCH_SIZE; s += 32) {
                     if (ld_acquire_global(&state->expert_slot_ready[ready_base + s]) == 0) {
@@ -3283,7 +3307,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                     int my_ready = 0;
                     if (my_slot < max_tpe) {
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
+                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
                     // All threads report: if all slots in this wave are ready, advance
                     int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
@@ -3292,7 +3316,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         // Thread 0 does a sequential scan of just this wave's portion
                         if (tid == 0) {
                             for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + s]) == 1) {
+                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
                                     count = s + 1;
                                 } else {
                                     break;
@@ -3323,7 +3347,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         stall_alloc_count = alloc_count;
                         stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
                         stall_first_unready_slot = count;
-                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + count]) : -1;
+                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
                         stall_dispatch_done = dispatch_done ? 1 : 0;
                     }
                 }
@@ -3509,12 +3533,12 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                     int my_ready = 0;
                     if (my_slot < max_tpe)
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
+                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         if (tid == 0) {
                             for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + s]) == 1)
+                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1)
                                     count = s + 1;
                                 else
                                     break;
@@ -3885,7 +3909,7 @@ __device__ __forceinline__ void compute_worker(
 #endif
 
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
-            int base_offset = expert_id * max_tpe + start_slot + i;
+            int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
             int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
@@ -4048,7 +4072,7 @@ __device__ __forceinline__ void compute_worker(
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
-        const int slot_base = expert_id * max_tpe + start_slot;
+        const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
@@ -4157,7 +4181,7 @@ __device__ __forceinline__ void compute_worker(
                 rec[21] = task_idx;
                 rec[22] = start_slot;
                 rec[23] = start_slot + batch_size;
-                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                rec[24] = static_cast<int64_t>(state->expert_slot_base[expert_id]) + start_slot;
                 state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
                 state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
 #endif
@@ -5647,7 +5671,7 @@ __device__ void combine_precompute_worker(
 #endif
 
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
-            int base_offset = expert_id * max_tpe + start_slot + i;
+            int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
             int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
@@ -5810,7 +5834,7 @@ __device__ void combine_precompute_worker(
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
-        const int slot_base = expert_id * max_tpe + start_slot;
+        const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
@@ -5919,7 +5943,7 @@ __device__ void combine_precompute_worker(
                 rec[21] = task_idx;
                 rec[22] = start_slot;
                 rec[23] = start_slot + batch_size;
-                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                rec[24] = static_cast<int64_t>(state->expert_slot_base[expert_id]) + start_slot;
                 state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
                 state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
 #endif
@@ -6311,8 +6335,8 @@ __device__ __forceinline__ void scheduler_priority_warp_worker(MegaKernelState* 
                 if (lane == 0) {
                     slot = ld_nc_global(&state->token_slot_list[token * num_topk + h]);
                     if (slot >= 0) {
-                        expert_id = slot / max_tpe;
-                        int expert_local_slot = slot - expert_id * max_tpe;
+                        expert_id = mk_slot_to_local_expert(state, slot);
+                        int expert_local_slot = slot - state->expert_slot_base[expert_id];
                         int batch_id = expert_local_slot / COMPUTE_BATCH_SIZE;
                         batch_start = batch_id * COMPUTE_BATCH_SIZE;
                         batch_end = batch_start + COMPUTE_BATCH_SIZE;
@@ -6367,7 +6391,7 @@ __device__ __forceinline__ void scheduler_priority_warp_worker(MegaKernelState* 
                     continue;
                 }
 
-                const int ready_base = expert_id * max_tpe + batch_start;
+                const int ready_base = state->expert_slot_base[expert_id] + batch_start;
                 bool lane_ready = true;
                 for (int s = lane; s < COMPUTE_BATCH_SIZE; s += 32) {
                     if (ld_acquire_global(&state->expert_slot_ready[ready_base + s]) == 0) {
@@ -6681,7 +6705,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                     int my_ready = 0;
                     if (my_slot < max_tpe) {
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
+                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
                     // All threads report: if all slots in this wave are ready, advance
                     int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
@@ -6690,7 +6714,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         // Thread 0 does a sequential scan of just this wave's portion
                         if (tid == 0) {
                             for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + s]) == 1) {
+                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
                                     count = s + 1;
                                 } else {
                                     break;
@@ -6721,7 +6745,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         stall_alloc_count = alloc_count;
                         stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
                         stall_first_unready_slot = count;
-                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + count]) : -1;
+                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
                         stall_dispatch_done = dispatch_done ? 1 : 0;
                     }
                 }
@@ -6907,12 +6931,12 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     int my_slot = (tid < num_threads) ? count + tid : max_tpe;
                     int my_ready = 0;
                     if (my_slot < max_tpe)
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + my_slot]) == 1) ? 1 : 0;
+                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         if (tid == 0) {
                             for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[expert_id * max_tpe + s]) == 1)
+                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1)
                                     count = s + 1;
                                 else
                                     break;
@@ -9172,6 +9196,28 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&expert_token_offsets, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_token_offsets, 0, num_local_experts * sizeof(int)));
 
+    // Compact per-expert slot layout (P0 scaffolding). Phase 0 fills placeholder values
+    // equivalent to the legacy `le*max_tokens_per_expert` addressing so behavior is
+    // unchanged; later phases replace these with a real exclusive prefix-sum / real counts.
+    // NOTE: cudaMalloc here is the mk_caching_alloc macro; cudaMemcpy below is the real
+    // driver call (not macro'd), matching the TMA-atom upload pattern later in this function.
+    int* expert_slot_base;
+    int* expert_count;
+    CUDA_CHECK(cudaMalloc(&expert_slot_base, num_local_experts * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&expert_count, num_local_experts * sizeof(int)));
+    {
+        std::vector<int> h_expert_slot_base(num_local_experts);
+        std::vector<int> h_expert_count(num_local_experts);
+        for (int le = 0; le < num_local_experts; ++le) {
+            h_expert_slot_base[le] = le * max_tokens_per_expert;
+            h_expert_count[le] = max_tokens_per_expert;
+        }
+        CUDA_CHECK(cudaMemcpy(expert_slot_base, h_expert_slot_base.data(),
+                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(expert_count, h_expert_count.data(),
+                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
     CUDA_CHECK(cudaMalloc(&recv_token_source_info, total_expert_slots * 2 * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_token_source_info, 0xff, total_expert_slots * 2 * sizeof(int)));  // Init to -1
     CUDA_CHECK(cudaMalloc(&recv_token_route_weights, total_expert_slots * sizeof(float)));
@@ -9576,6 +9622,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Per-expert receive storage
     host_state.recv_tokens = recv_tokens;
     host_state.expert_token_offsets = expert_token_offsets;
+    host_state.expert_slot_base = expert_slot_base;
+    host_state.expert_count = expert_count;
     host_state.recv_token_source_info = recv_token_source_info;
     host_state.recv_token_route_weights = recv_token_route_weights;
     host_state.recv_src_meta = recv_src_meta;
@@ -10283,6 +10331,8 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.timeout_log_counters));
     CUDA_CHECK(cudaFree(host_state.recv_tokens));
     CUDA_CHECK(cudaFree(host_state.expert_token_offsets));
+    CUDA_CHECK(cudaFree(host_state.expert_slot_base));
+    CUDA_CHECK(cudaFree(host_state.expert_count));
     CUDA_CHECK(cudaFree(host_state.recv_token_source_info));
     CUDA_CHECK(cudaFree(host_state.recv_token_route_weights));
     CUDA_CHECK(cudaFree(host_state.recv_src_meta));
@@ -10646,6 +10696,7 @@ struct MegaKernelBackwardState {
     const __nv_bfloat16* W_gateup_T;      // [E, hidden, 2I]
     const __nv_bfloat16* W_down_T;        // [E, I, hidden]
     umma::ComputeBackwardTmaAtoms* compute_bwd_tma;
+    CUtensorMap* wgrad_dgu_a_tma;         // [num_local_experts * max_batches_per_expert] batch-start A descs for wgrad_dgu_slot
 
     const __nv_bfloat16* grad_output;     // [num_combined_tokens, hidden] dY (== bwd_device_state->x)
     __nv_bfloat16* grad_input;            // [num_combined_tokens, hidden] dX (== bwd_device_state->combined_x)
@@ -10812,8 +10863,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
     const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
 
     // Per-group global workspace, same layout as the forward compute worker:
-    //   input_buf[M,hidden] = grad_down (gathered)   gu_buf[M,2I] = GU then grad_gu
-    //   up_buf[M,I]         = grad_act                down_buf[M,hidden] = X then grad_xperm
+    //   input_buf[M,hidden] = grad_down (gathered)   gu_buf[M,2I] = GU scratch
+    //   up_buf[M,I]         = grad_act                down_buf[M,hidden] = grad_xperm
     const int input_stride = COMPUTE_BATCH_SIZE * hidden;
     const int gu_stride    = COMPUTE_BATCH_SIZE * twoI;
     const int act_stride   = COMPUTE_BATCH_SIZE * intermediate;
@@ -10964,7 +11015,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const bool use_umma_bwd_for_group =
             kUseUmmaBwdGemm && group_size == COMPUTE_GROUP_SIZE &&
             state->group_input_tma != nullptr && bs->compute_bwd_tma != nullptr &&
-            batch_size <= COMPUTE_BATCH_SIZE;
+            bs->wgrad_dgu_a_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE;
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
@@ -10982,7 +11033,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
 
         // ---- gather per-row (recv_token, single-hit flag, route weight) ----
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
-            int base_offset = expert_id * max_tpe + start_slot + i;
+            int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
             int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
@@ -11002,27 +11053,25 @@ __device__ __forceinline__ void compute_backward_worker_core(
         if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
 #endif
 
-        // ---- gather grad_down (input_buf) and X_perm (down_buf) by recv_token ----
+        // ---- gather grad_down (input_buf) and cache X in wgrad_x_slot by recv_token ----
+        const int64_t slot_base64 = (int64_t)state->expert_slot_base[expert_id] + start_slot;
         const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
         const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);   // = grad_down
         const int4* bwd_x_i4 = reinterpret_cast<const int4*>(bs->bwd_fc1_input);               // = X
         int4* grad_down_i4 = reinterpret_cast<int4*>(input_buf);
-        int4* x_i4 = reinterpret_cast<int4*>(down_buf);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
             if (row < batch_size) {
                 int rt = s_recv_token_idx[row];
-                const int slot = expert_id * max_tpe + start_slot + row;
+                const int64_t slot = slot_base64 + row;
                 const int4 grad_vec = combine_input_i4[(int64_t)rt * hidden_int4 + v];
                 const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
                 grad_down_i4[idx] = grad_vec;
-                x_i4[idx] = x_vec;
-                reinterpret_cast<int4*>(bs->wgrad_dz_slot)[(int64_t)slot * hidden_int4 + v] = grad_vec;
-                reinterpret_cast<int4*>(bs->wgrad_x_slot)[(int64_t)slot * hidden_int4 + v] = x_vec;
+                reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
+                reinterpret_cast<int4*>(bs->wgrad_x_slot)[slot * hidden_int4 + v] = x_vec;
             } else {
                 grad_down_i4[idx] = make_int4(0, 0, 0, 0);
-                x_i4[idx] = make_int4(0, 0, 0, 0);
             }
         }
         compute_group_sync(state, group_id, group_size);
@@ -11032,33 +11081,23 @@ __device__ __forceinline__ void compute_backward_worker_core(
         if (group_sm_idx == 0) {
             trace_backward_values("GRAD-DOWN", input_buf, batch_size * hidden,
                                   state->rank, task_idx, expert_id, batch_size);
-            trace_backward_values("ACTIVATION", down_buf, batch_size * hidden,
-                                  state->rank, task_idx, expert_id, batch_size);
+            trace_backward_values("ACTIVATION", bs->wgrad_x_slot + (size_t)slot_base64 * hidden,
+                                  batch_size * hidden, state->rank, task_idx, expert_id, batch_size);
         }
 
         const __nv_bfloat16* Wgu_e  = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
         const __nv_bfloat16* WguT_e = &bs->W_gateup_T[(size_t)expert_id * hidden * twoI];        // [hidden,2I]
         const __nv_bfloat16* WdT_e  = &bs->W_down_T[(size_t)expert_id * intermediate * hidden];  // [I,hidden]
 
-        // Saved-PreAct path eliminates the PreAct->gu_buf gather: dSwiGLU below reads
-        // gate/up straight from bs->bwd_preact by (recv_token, topk_slot) and writes dGU
-        // into gu_buf[0:batch_size]. Here we only zero gu_buf's padding rows
-        // [batch_size, COMPUTE_BATCH_SIZE) so the fixed-extent GEMM3 (which consumes
-        // gu_buf as dGU) sees 0 for padded rows. Fallback (no saved PreAct) recomputes
-        // gate/up into gu_buf via WMMA, then the same tail zero-fill applies.
+        // Saved-PreAct path skips the PreAct->GU gather: dSwiGLU below reads gate/up
+        // directly from bs->bwd_preact by (recv_token, topk_slot) and writes dGU
+        // straight to wgrad_dgu_slot. Fallback (no saved PreAct) recomputes gate/up
+        // into gu_buf via WMMA first.
         const bool preact_direct = (bs->bwd_preact != nullptr);
-        {
-            const int preact_int4 = twoI * sizeof(__nv_bfloat16) / sizeof(int4);
-            int4* gu_i4 = reinterpret_cast<int4*>(gu_buf);
-            if (!preact_direct) {
-                device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
-                                 group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-            }
-            for (int idx = batch_size * preact_int4 + group_thread_id;
-                 idx < COMPUTE_BATCH_SIZE * preact_int4;
-                 idx += group_num_threads) {
-                gu_i4[idx] = make_int4(0, 0, 0, 0);
-            }
+        __nv_bfloat16* dgu_dst = bs->wgrad_dgu_slot + (size_t)slot_base64 * twoI;
+        if (!preact_direct) {
+            device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
+                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
         }
         compute_group_sync(state, group_id, group_size);
 
@@ -11106,7 +11145,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const int intermediate_i4 = intermediate >> 2;
         for (int m = group_warp_id; m < batch_size; m += group_num_warps) {
             const float route = s_route_w[m];
-            const int slot = expert_id * max_tpe + start_slot + m;
+            const int slot = state->expert_slot_base[expert_id] + start_slot + m;
             const int recv_token_m = s_recv_token_idx[m];
             const int topk_slot_m = s_topk_slot[m];
             // No PreAct gather: read gate/up straight from bwd_preact (slot-major by
@@ -11118,8 +11157,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             if (dswiglu_packed4) {
                 const int4* gu4 = reinterpret_cast<const int4*>(gu_src);
                 const int2* ga4 = reinterpret_cast<const int2*>(up_buf + (size_t)m * intermediate);
-                int4* dgu4 = reinterpret_cast<int4*>(gu_buf + (size_t)m * twoI);
-                int4* wgrad_dgu4 = reinterpret_cast<int4*>(bs->wgrad_dgu_slot + (int64_t)slot * twoI);
+                int4* dgu4 = reinterpret_cast<int4*>(dgu_dst + (size_t)m * twoI);
                 int2* wgrad_act4 = reinterpret_cast<int2*>(bs->wgrad_act_slot + (int64_t)slot * intermediate);
                 for (int q = lane_id; q < intermediate_i4; q += 32) {
                     const int4 gu = gu4[q];
@@ -11134,7 +11172,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
                     const int4 out = make_int4(static_cast<int>(o0), static_cast<int>(o1),
                                                static_cast<int>(o2), static_cast<int>(o3));
                     dgu4[q] = out;
-                    wgrad_dgu4[q] = out;
                     wgrad_act4[q] = make_int2(static_cast<int>(a01), static_cast<int>(a23));
                 }
             } else {
@@ -11152,10 +11189,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
                     route_grad += ga * activation;
                     bs->wgrad_act_slot[(int64_t)slot * intermediate + i] =
                         __float2bfloat16(route * activation);
-                    bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i] = __float2bfloat16(g_gate);
-                    bs->wgrad_dgu_slot[(int64_t)slot * twoI + 2 * i + 1] = __float2bfloat16(g_up);
-                    gu_buf[m * twoI + 2 * i] = __float2bfloat16(g_gate);
-                    gu_buf[m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
+                    dgu_dst[(size_t)m * twoI + 2 * i] = __float2bfloat16(g_gate);
+                    dgu_dst[(size_t)m * twoI + 2 * i + 1] = __float2bfloat16(g_up);
                 }
             }
             #pragma unroll
@@ -11167,7 +11202,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
         }
         compute_group_sync(state, group_id, group_size);
         if (group_sm_idx == 0) {
-            trace_backward_values("GRAD-GU", gu_buf, batch_size * twoI,
+            trace_backward_values("GRAD-GU", dgu_dst, batch_size * twoI,
                                   state->rank, task_idx, expert_id, batch_size);
         }
 
@@ -11177,13 +11212,16 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
+            const int dgu_batch_id = start_slot / COMPUTE_BATCH_SIZE;
+            const CUtensorMap* dgu_a_tma =
+                &bs->wgrad_dgu_a_tma[(int64_t)expert_id * state->max_batches_per_expert + dgu_batch_id];
             uint32_t grad_x_accum_iter = 0;
             umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
             umma::umma_down_persistent(
-                &in_atom.gu_a,
+                dgu_a_tma,
                 &bs->compute_bwd_tma->wgateup_t[expert_id],
                 &in_atom.down_cd,
-                COMPUTE_BATCH_SIZE, hidden, twoI,
+                batch_size, hidden, twoI,
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_x_accum_iter);
             umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
@@ -11192,7 +11230,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
             compute_group_sync(state, group_id, group_size);
         } else {
-            device_gemm_bf16(gu_buf, WguT_e, down_buf, batch_size, twoI, hidden,
+            device_gemm_bf16(dgu_dst, WguT_e, down_buf, batch_size, twoI, hidden,
                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
@@ -11211,7 +11249,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
-        const int slot_base = expert_id * max_tpe + start_slot;
+        const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
@@ -11305,7 +11343,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 rec[21] = task_idx;
                 rec[22] = start_slot;
                 rec[23] = start_slot + batch_size;
-                rec[24] = static_cast<int64_t>(expert_id) * max_tpe + start_slot;
+                rec[24] = static_cast<int64_t>(state->expert_slot_base[expert_id]) + start_slot;
                 state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
                 state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
 #endif
@@ -11505,6 +11543,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.grad_topk_weights = reinterpret_cast<float*>(grad_topk_weights);
     const size_t num_expert_slots =
         (size_t)fs.num_local_experts * fs.max_tokens_per_expert;
+    const size_t num_dgu_batch_tmas =
+        (size_t)fs.num_local_experts * fs.max_batches_per_expert;
     CUDA_CHECK(cudaMalloc(&hs.wgrad_x_slot,
                           num_expert_slots * hidden * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&hs.wgrad_act_slot,
@@ -11513,6 +11553,21 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
                           num_expert_slots * hidden * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&hs.wgrad_dgu_slot,
                           num_expert_slots * twoI * sizeof(__nv_bfloat16)));
+    std::vector<CUtensorMap> h_wgrad_dgu_a_tma(num_dgu_batch_tmas);
+    for (int expert = 0; expert < fs.num_local_experts; ++expert) {
+        for (int batch = 0; batch < fs.max_batches_per_expert; ++batch) {
+            const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot +
+                ((size_t)expert * fs.max_tokens_per_expert + (size_t)batch * COMPUTE_BATCH_SIZE) * twoI;
+            h_wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
+                umma::dg_make_a_desc(dgu_batch, COMPUTE_BATCH_SIZE, twoI);
+        }
+    }
+    CUtensorMap* d_wgrad_dgu_a_tma = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_wgrad_dgu_a_tma, num_dgu_batch_tmas * sizeof(CUtensorMap)));
+    CUDA_CHECK(cudaMemcpyAsync(d_wgrad_dgu_a_tma, h_wgrad_dgu_a_tma.data(),
+                               num_dgu_batch_tmas * sizeof(CUtensorMap),
+                               cudaMemcpyHostToDevice, stream));
+    hs.wgrad_dgu_a_tma = d_wgrad_dgu_a_tma;
     hs.owned_combined_x = owned_combined_x;
     hs.owned_combined_topk_weights = owned_combined_topk_weights;
 
@@ -11534,6 +11589,7 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_gateup_T)));
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_down_T)));
     CUDA_CHECK(cudaFree(hs.compute_bwd_tma));
+    CUDA_CHECK(cudaFree(hs.wgrad_dgu_a_tma));
     CUDA_CHECK(cudaFree(hs.wgrad_x_slot));
     CUDA_CHECK(cudaFree(hs.wgrad_act_slot));
     CUDA_CHECK(cudaFree(hs.wgrad_dz_slot));
