@@ -2363,6 +2363,16 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
 
+    // Per-local-expert received-token counts for compact slot packing (P0 forward path).
+    // moe_recv_expert_counter was populated by notify_dispatch above and equals each local
+    // expert's exact received-token count (= the in-kernel atomicAdd final value), so the
+    // allocator can pack per-expert slot buffers by Σ count instead of num_local_experts*max_tpe.
+    std::vector<int> mk_expert_counts(num_local_experts);
+    for (int i = 0; i < num_local_experts; ++i) {
+        int c = moe_recv_expert_counter[i];  // volatile int* -> plain int read
+        mk_expert_counts[i] = c < 0 ? 0 : c;
+    }
+
     auto allocate_state = [&](auto allocator) {
         return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -2412,7 +2422,8 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         max_tokens_per_expert,
         max_total_recv_tokens > 0 ? max_total_recv_tokens : 1,
         num_rdma_bytes,
-        num_nvl_bytes);
+        num_nvl_bytes,
+        mk_expert_counts.data());
     };
 
     void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));

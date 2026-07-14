@@ -413,7 +413,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     int max_tokens_per_expert,
     int max_total_recv_tokens,
     int64_t num_rdma_bytes,
-    int64_t num_nvl_bytes);
+    int64_t num_nvl_bytes,
+    // Per-local-expert received-token counts (host array, length num_local_experts).
+    // When provided, the per-expert slot buffers are packed compactly via an exclusive
+    // prefix sum (total = Σ count). When nullptr, falls back to the fixed
+    // num_local_experts * max_tokens_per_expert layout.
+    const int* host_expert_count = nullptr);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
 void get_megakernel_backward_dimensions(

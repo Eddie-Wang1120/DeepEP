@@ -959,7 +959,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             int group_base_slot = 0;
             if (lane_id == leader_lane) {
                 group_base_slot = atomicAdd(&state->expert_token_offsets[local_expert_id], group_count);
-                if (group_base_slot + group_count > state->max_tokens_per_expert) {
+                if (group_base_slot + group_count > state->expert_count[local_expert_id]) {
                     printf("MK publish expert slot overflow, rank=%d recv_token=%d expert=%d slot=%d count=%d max_tpe=%d\n",
                            state->rank, recv_token_idx, expert_id, group_base_slot, group_count, state->max_tokens_per_expert);
                     trap();
@@ -2434,7 +2434,7 @@ __device__ void dispatch_worker_v2(
                             continue;
                         int local_expert_id = expert_id - local_expert_begin;
                         int slot = atomicAdd(&state->expert_token_offsets[local_expert_id], 1);
-                        if (slot >= state->max_tokens_per_expert) {
+                        if (slot >= state->expert_count[local_expert_id]) {
                             printf("MK dispatch expert slot overflow, rank=%d recv_token=%lld expert=%d slot=%d max_tpe=%d\n",
                                    state->rank, (long long)recv_token_idx, expert_id, slot, state->max_tokens_per_expert);
                             trap();
@@ -3303,19 +3303,19 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 // Cooperative scan: each thread checks a contiguous chunk of slots starting from old_count.
                 // We scan in waves of num_threads slots at a time, finding the contiguous prefix.
                 int count = old_count;
-                while (count < max_tpe) {
-                    int my_slot = (tid < num_threads) ? count + tid : max_tpe;
+                while (count < state->expert_count[expert_id]) {
+                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
                     int my_ready = 0;
-                    if (my_slot < max_tpe) {
+                    if (my_slot < state->expert_count[expert_id]) {
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
                     // All threads report: if all slots in this wave are ready, advance
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
+                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         // Find the first non-ready slot in this wave via warp vote
                         // Thread 0 does a sequential scan of just this wave's portion
                         if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
+                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
                                 if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
                                     count = s + 1;
                                 } else {
@@ -3329,7 +3329,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         break;
                     }
                     count += num_threads;
-                    if (count > max_tpe) count = max_tpe;
+                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
                 }
 
                 if (tid == 0 && count != old_count) {
@@ -3347,7 +3347,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         stall_alloc_count = alloc_count;
                         stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
                         stall_first_unready_slot = count;
-                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
+                        stall_first_unready_ready = (count < state->expert_count[expert_id]) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
                         stall_dispatch_done = dispatch_done ? 1 : 0;
                     }
                 }
@@ -3529,15 +3529,15 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 scheduler_compute_sync(num_threads);
                 cursor = s_priority_new_cursor;
 
-                while (count < max_tpe) {
-                    int my_slot = (tid < num_threads) ? count + tid : max_tpe;
+                while (count < state->expert_count[expert_id]) {
+                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
                     int my_ready = 0;
-                    if (my_slot < max_tpe)
+                    if (my_slot < state->expert_count[expert_id])
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
+                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
+                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
                                 if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1)
                                     count = s + 1;
                                 else
@@ -3550,7 +3550,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         break;
                     }
                     count += num_threads;
-                    if (count > max_tpe) count = max_tpe;
+                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
 
                     if (tid == 0) {
                         __threadfence();
@@ -6701,19 +6701,19 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 // Cooperative scan: each thread checks a contiguous chunk of slots starting from old_count.
                 // We scan in waves of num_threads slots at a time, finding the contiguous prefix.
                 int count = old_count;
-                while (count < max_tpe) {
-                    int my_slot = (tid < num_threads) ? count + tid : max_tpe;
+                while (count < state->expert_count[expert_id]) {
+                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
                     int my_ready = 0;
-                    if (my_slot < max_tpe) {
+                    if (my_slot < state->expert_count[expert_id]) {
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
                     // All threads report: if all slots in this wave are ready, advance
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
+                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         // Find the first non-ready slot in this wave via warp vote
                         // Thread 0 does a sequential scan of just this wave's portion
                         if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
+                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
                                 if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
                                     count = s + 1;
                                 } else {
@@ -6727,7 +6727,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         break;
                     }
                     count += num_threads;
-                    if (count > max_tpe) count = max_tpe;
+                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
                 }
 
                 if (tid == 0 && count != old_count) {
@@ -6745,7 +6745,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         stall_alloc_count = alloc_count;
                         stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
                         stall_first_unready_slot = count;
-                        stall_first_unready_ready = (count < max_tpe) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
+                        stall_first_unready_ready = (count < state->expert_count[expert_id]) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
                         stall_dispatch_done = dispatch_done ? 1 : 0;
                     }
                 }
@@ -6927,15 +6927,15 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 scheduler_compute_sync(num_threads);
                 cursor = s_priority_new_cursor;
 
-                while (count < max_tpe) {
-                    int my_slot = (tid < num_threads) ? count + tid : max_tpe;
+                while (count < state->expert_count[expert_id]) {
+                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
                     int my_ready = 0;
-                    if (my_slot < max_tpe)
+                    if (my_slot < state->expert_count[expert_id])
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= max_tpe), &s_compute_all_result, num_threads);
+                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
                     if (!all_ready) {
                         if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < max_tpe; ++s) {
+                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
                                 if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1)
                                     count = s + 1;
                                 else
@@ -6948,7 +6948,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         break;
                     }
                     count += num_threads;
-                    if (count > max_tpe) count = max_tpe;
+                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
 
                     if (tid == 0) {
                         __threadfence();
@@ -9094,7 +9094,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     int max_total_recv_tokens,
     // --- Buffer sizes for combine mirror ---
     int64_t num_rdma_bytes,
-    int64_t num_nvl_bytes
+    int64_t num_nvl_bytes,
+    const int* host_expert_count
 ) {
 #define cudaMalloc(pp, n) mk_caching_alloc(reinterpret_cast<void**>(pp), (n))
     struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
@@ -9184,8 +9185,32 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&timeout_log_counters, kTimeoutLogCount * sizeof(int)));
     CUDA_CHECK(cudaMemset(timeout_log_counters, 0, kTimeoutLogCount * sizeof(int)));
 
-    // Receive storage — indexed as [local_expert_id * max_tokens_per_expert + slot]
-    const size_t total_expert_slots = (size_t)num_local_experts * max_tokens_per_expert;
+    // Per-expert slot layout — indexed as [expert_slot_base[le] + slot].
+    // Compact packing: when host_expert_count is provided (forward path), each expert's
+    // region is sized by its real received-token count and regions are packed contiguously
+    // via an exclusive prefix sum (total = Σ count). When null (backward / legacy path),
+    // falls back to the fixed le*max_tokens_per_expert layout (total = num_local_experts*max_tpe).
+    // NOTE: cudaMalloc here is the mk_caching_alloc macro; cudaMemcpy below is the real
+    // driver call (not macro'd), matching the TMA-atom upload pattern later in this function.
+    int* expert_slot_base;
+    int* expert_count;
+    CUDA_CHECK(cudaMalloc(&expert_slot_base, num_local_experts * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&expert_count, num_local_experts * sizeof(int)));
+    std::vector<int> h_expert_slot_base(num_local_experts);
+    std::vector<int> h_expert_count(num_local_experts);
+    size_t total_expert_slots = 0;
+    for (int le = 0; le < num_local_experts; ++le) {
+        const int cnt = (host_expert_count != nullptr) ? host_expert_count[le] : max_tokens_per_expert;
+        EP_HOST_ASSERT(cnt >= 0 && cnt <= max_tokens_per_expert);
+        h_expert_slot_base[le] = static_cast<int>(total_expert_slots);
+        h_expert_count[le] = cnt;
+        total_expert_slots += static_cast<size_t>(cnt);
+    }
+    if (total_expert_slots == 0) total_expert_slots = 1;  // avoid zero-size allocations
+    CUDA_CHECK(cudaMemcpy(expert_slot_base, h_expert_slot_base.data(),
+                          num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(expert_count, h_expert_count.data(),
+                          num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
 
     int* expert_slot_ready;
     CUDA_CHECK(cudaMalloc(&expert_slot_ready, total_expert_slots * sizeof(int)));
@@ -9195,28 +9220,6 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     CUDA_CHECK(cudaMalloc(&expert_token_offsets, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_token_offsets, 0, num_local_experts * sizeof(int)));
-
-    // Compact per-expert slot layout (P0 scaffolding). Phase 0 fills placeholder values
-    // equivalent to the legacy `le*max_tokens_per_expert` addressing so behavior is
-    // unchanged; later phases replace these with a real exclusive prefix-sum / real counts.
-    // NOTE: cudaMalloc here is the mk_caching_alloc macro; cudaMemcpy below is the real
-    // driver call (not macro'd), matching the TMA-atom upload pattern later in this function.
-    int* expert_slot_base;
-    int* expert_count;
-    CUDA_CHECK(cudaMalloc(&expert_slot_base, num_local_experts * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&expert_count, num_local_experts * sizeof(int)));
-    {
-        std::vector<int> h_expert_slot_base(num_local_experts);
-        std::vector<int> h_expert_count(num_local_experts);
-        for (int le = 0; le < num_local_experts; ++le) {
-            h_expert_slot_base[le] = le * max_tokens_per_expert;
-            h_expert_count[le] = max_tokens_per_expert;
-        }
-        CUDA_CHECK(cudaMemcpy(expert_slot_base, h_expert_slot_base.data(),
-                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(expert_count, h_expert_count.data(),
-                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
-    }
 
     CUDA_CHECK(cudaMalloc(&recv_token_source_info, total_expert_slots * 2 * sizeof(int)));
     CUDA_CHECK(cudaMemset(recv_token_source_info, 0xff, total_expert_slots * 2 * sizeof(int)));  // Init to -1
