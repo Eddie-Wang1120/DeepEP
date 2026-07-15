@@ -2597,23 +2597,34 @@ Buffer::megakernel_debug_backward(
     std::vector<int> expert_token_counts(num_local_experts);
     megakernel_debug::get_megakernel_expert_counts(
         context->state(), expert_token_counts.data(), num_local_experts);
+    std::vector<int> h_cu_seqlens_k(num_local_experts + 1, 0);
     size_t total_slots = 0;
-    for (int e = 0; e < num_local_experts; ++e)
+    for (int e = 0; e < num_local_experts; ++e) {
         total_slots += (size_t)expert_token_counts[e];
-    const size_t scratch_slots = std::max<size_t>(total_slots, 1);
+        h_cu_seqlens_k[e + 1] = static_cast<int>(total_slots);
+    }
+    const size_t alloc_slots = std::max<size_t>(total_slots, 1);
     const int two_i = 2 * intermediate;
     const int compute_batch_size = megakernel_debug::get_megakernel_compute_batch_size();
-    auto scratch_x = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
-    auto scratch_act = torch::empty({(int64_t)scratch_slots, intermediate}, bf16_options);
-    auto scratch_dz = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
-    auto scratch_dgu_backing = torch::empty(
-        {(int64_t)scratch_slots + compute_batch_size, two_i}, bf16_options);
-    auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, scratch_slots);
     auto stream = at::cuda::getCurrentCUDAStream();
+    auto cu_options = torch::TensorOptions().dtype(torch::kInt32).device(grad_output.device());
+    auto cu_seqlens_k = torch::empty({num_local_experts + 1}, cu_options);
+    CUDA_CHECK(cudaMemcpyAsync(cu_seqlens_k.data_ptr(), h_cu_seqlens_k.data(),
+                               h_cu_seqlens_k.size() * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    auto scratch_x_backing = torch::empty({(int64_t)alloc_slots, hidden}, bf16_options);
+    auto scratch_act_backing = torch::empty({(int64_t)alloc_slots, intermediate}, bf16_options);
+    auto scratch_dz_backing = torch::empty({(int64_t)alloc_slots, hidden}, bf16_options);
+    auto scratch_dgu_backing = torch::empty(
+        {(int64_t)alloc_slots + compute_batch_size, two_i}, bf16_options);
+    auto scratch_x = scratch_x_backing.narrow(0, 0, total_slots);
+    auto scratch_act = scratch_act_backing.narrow(0, 0, total_slots);
+    auto scratch_dz = scratch_dz_backing.narrow(0, 0, total_slots);
+    auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, total_slots);
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
-        scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
+        scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
         scratch_dgu_backing.data_ptr(), total_sms, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     megakernel_debug::prepare_megakernel_backward_dispatch_replay(
@@ -2632,10 +2643,8 @@ Buffer::megakernel_debug_backward(
     // Synchronize before destroying the borrowed-pointer state and returning them to Python/QuACK.
     CUDA_CHECK(cudaStreamSynchronize(stream));
     megakernel_debug::free_megakernel_backward_state(backward_state);
-    auto count_options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-    auto expert_counts = torch::tensor(expert_token_counts, count_options);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights,
-            scratch_x, scratch_act, scratch_dz, scratch_dgu, expert_counts};
+            scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
 #else
     EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
     return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
