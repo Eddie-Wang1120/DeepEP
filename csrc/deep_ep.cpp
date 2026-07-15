@@ -2430,7 +2430,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         mk_expert_counts.data(),
         nullptr,
         nullptr,
-        nullptr,
         reinterpret_cast<int4*>(result.data_ptr()),
         nullptr);
     };
@@ -2505,9 +2504,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             topk_idx,
             topk_weights,
         });
-        // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
-        // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
-        // from this forward state. Release the forward-only working buffers (recv_tokens,
+        // The backward re-runs dispatch/combine on a fresh v7 state and only reuses
+        // bwd_preact / fwd_slot_map and expert_count from this forward state. It rebuilds
+        // X_by_recv_token with a dispatch-only replay. Release the forward-only working buffers (recv_tokens,
         // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
         // heads, ...) now so they don't stay resident across the forward->backward gap.
         // The returned Torch tensor owns combined_x and is not released with the state.
@@ -2616,10 +2615,15 @@ Buffer::megakernel_debug_backward(
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
         scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
         scratch_dgu_backing.data_ptr(), total_sms, stream);
+    const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
+    megakernel_debug::prepare_megakernel_backward_dispatch_replay(
+        backward_state, barrier_signal_ptrs_gpu, stream);
+    megakernel_debug::launch_megakernel_debug_capture_x(
+        backward_state, total_sms, smem_size, stage,
+        megakernel_debug::ComputeDType::kBF16, stream);
     megakernel_debug::prepare_megakernel_backward_communication_replay(
         backward_state, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
-    const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     megakernel_debug::launch_megakernel_debug_backward(
         backward_state, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);

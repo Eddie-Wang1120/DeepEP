@@ -232,16 +232,12 @@ struct MegaKernelState {
     int* token_compute_expected;        // [max_total_recv_tokens] how many local experts must compute this token
     __nv_bfloat16* compute_output_slot; // [num_local_experts * max_tokens_per_expert, hidden] per-slot output
     // --- Backward activation save (forward writes; backward reads) ---
-    // fc1 input (permuted token X) saved by RECV_TOKEN index (compact, prefix-driven,
-    // deterministic across a dispatch re-run) rather than by expert slot (which is
-    // assigned via a non-deterministic atomicAdd). The backward megakernel re-runs
-    // dispatch with x=grad_output, so combine_input[recv_token] becomes grad_down;
-    // the original X is recovered here by the same recv_token index. A token that hits
-    // multiple local experts writes the same X (idempotent).
-    __nv_bfloat16* bwd_fc1_input;       // [max_total_recv_tokens, hidden] fc1 input (permuted X) by recv_token
-    __nv_bfloat16* bwd_preact;          // [max_total_recv_tokens, num_topk, 2 * intermediate] saved gate/up by recv_token/topk_slot
-    bool owns_bwd_fc1_input;
+    // bwd_preact is keyed by the compact forward slot. The original X is no longer
+    // retained as a forward activation; backward fills a transient recv-token-indexed
+    // X buffer by replaying dispatch before the grad_output replay.
+    __nv_bfloat16* bwd_preact;          // [total_expert_slots, 2 * intermediate] saved gate/up by compact forward slot
     bool owns_bwd_preact;
+    __nv_bfloat16* capture_input_dst;   // backward dispatch-only replay target: [max_total_recv_tokens, hidden], or nullptr
     // Phase 3 (A2): compact preact storage. bwd_preact is keyed by the compact forward slot
     // (like recv_tokens), and fwd_slot_map translates the cross-pass-stable key
     // (recv_token, topk_slot) -> forward slot so the backward pass can find it (slot ids are
@@ -418,6 +414,27 @@ struct MegaKernelState {
     int64_t* perf_async_pub_end_ts;    // [num_pub_warps_total] publisher warp exit timestamp
     int64_t* perf_async_publish_all_done_ts; // [1] timestamp when publish_all_done is released
     int64_t* perf_sched_ts;            // [2] scheduler start/end
+    // TRACE=1-visible pipeline milestones (absolute globaltimer ns; 0 = never happened).
+    // These render as marker events even without MK_PERF_TRACE_ARGS so the dispatch->compute
+    // handoff can be read directly from the timeline.
+    int64_t* perf_ms_dispatch_done_seen_ts;    // [1] scheduler first observes publish_all_done
+    int64_t* perf_ms_first_recv_advance_ts;    // [1] first time any expert recv_count advances
+    int64_t* perf_ms_expert_prefix_full_ts;    // [num_local_experts] per-expert: contiguous ready prefix first reaches COMPUTE_BATCH_SIZE
+    int64_t* perf_ms_first_normal_publish_ts;  // [1] first source=1 (normal) full-batch enqueue success
+    int64_t* perf_ms_first_task_visible_ts;    // [1] first compute_task_tail advance (first task visible to compute)
+    // Source-side readiness: per-expert max globaltimer over all expert_slot_ready writes to slots
+    // [0, COMPUTE_BATCH_SIZE). This is when the FIRST full batch's data physically became ready,
+    // measured at the producer (not via the scheduler scan). Comparing it against
+    // perf_async_publish_all_done_ts tells whether publish_all_done fires before the
+    // compute-critical flags are actually written.
+    int64_t* perf_ms_expert_first_batch_ready_ts;  // [num_local_experts]
+    // Scan-stall probe: per-expert diagnostics for why the ready-prefix scan does not advance
+    // recv_count to COMPUTE_BATCH_SIZE promptly. stall_count = number of times the scan broke
+    // early while still below a full batch; last_stall_ts/last_stall_slot = the most recent such
+    // block (timestamp + first not-ready slot index). Owned by one scheduler tid-0 per expert.
+    int64_t* perf_ms_expert_stall_count;       // [num_local_experts]
+    int64_t* perf_ms_expert_last_stall_ts;     // [num_local_experts]
+    int64_t* perf_ms_expert_last_stall_slot;   // [num_local_experts]
 #endif
 #if MK_PERF_TRACE_ARGS
     struct DispatchRoundTrace {
@@ -669,6 +686,19 @@ struct MegaKernelState {
     int* perf_task_group_id;              // group that popped this task
 #endif
 };
+
+#if MK_PERF_TRACE_ENABLED
+// Record-first / record-max helpers for pipeline milestone timestamps. Defined here (before the
+// dispatch/publish device functions) so producer-side call sites can use them.
+__device__ __forceinline__ bool mk_perf_record_first_i64(int64_t* slot, int64_t value) {
+    return atomicCAS(reinterpret_cast<unsigned long long*>(slot), 0ULL,
+                     static_cast<unsigned long long>(value)) == 0ULL;
+}
+__device__ __forceinline__ void mk_perf_record_max_i64(int64_t* slot, int64_t value) {
+    atomicMax(reinterpret_cast<unsigned long long*>(slot),
+              static_cast<unsigned long long>(value));
+}
+#endif
 
 __device__ __forceinline__ bool mk_debug_bad_float(float v) {
     return v != v || v > 3.402823466e38f || v < -3.402823466e38f;
@@ -1078,6 +1108,12 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
             st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + hit_slot], 1);
+#if MK_PERF_TRACE_ENABLED
+            // Source-side readiness of the first compute batch: stamp when the last of the
+            // [0, COMPUTE_BATCH_SIZE) slot flags for this expert is written by the producer.
+            if (hit_slot < COMPUTE_BATCH_SIZE)
+                mk_perf_record_max_i64(&state->perf_ms_expert_first_batch_ready_ts[local_expert_id], globaltimer_ns());
+#endif
         }
 #if MK_PERF_TRACE_ARGS
         if (lane_id == 0)
@@ -2439,10 +2475,14 @@ __device__ void dispatch_worker_v2(
                 auto weight_data_ptr = reinterpret_cast<float*>(topk_data_ptr + num_topk);
                 auto* src_data = reinterpret_cast<const __nv_bfloat16*>(tma_buffer);
 
-                // Copy token data to DeepEP compact combine-input namespace.
+                // Copy token data to the compact recv-token namespace. Normal dispatch uses
+                // combine_input; backward's dispatch-only X replay redirects this to a transient
+                // capture buffer and leaves combine_input available for the later grad_output replay.
                 const int hidden_int4 = state->hidden_dim * sizeof(__nv_bfloat16) / sizeof(int4);
                 const int4* src_i4 = reinterpret_cast<const int4*>(src_data);
-                int4* dst_i4 = reinterpret_cast<int4*>(state->combine_input) +
+                __nv_bfloat16* token_dst = state->capture_input_dst != nullptr
+                    ? state->capture_input_dst : state->combine_input;
+                int4* dst_i4 = reinterpret_cast<int4*>(token_dst) +
                     (int64_t)recv_token_idx * hidden_int4;
                 for (int v = lane_id; v < hidden_int4; v += 32)
                     dst_i4[v] = src_i4[v];
@@ -2563,6 +2603,10 @@ __device__ void dispatch_worker_v2(
                         int local_expert_id = hit_local_expert[h];
                         int slot = hit_slot[h];
                         st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + slot], 1);
+#if MK_PERF_TRACE_ENABLED
+                        if (slot < COMPUTE_BATCH_SIZE)
+                            mk_perf_record_max_i64(&state->perf_ms_expert_first_batch_ready_ts[local_expert_id], globaltimer_ns());
+#endif
                     }
 #if MK_PERF_TRACE_ARGS
                     int64_t pub_store_ns = globaltimer_ns() - pub_store_start;
@@ -2820,6 +2864,9 @@ __device__ void dispatch_worker_v2(
                state->rank, static_cast<int>(blockIdx.x), dispatch_sm_idx);
 #endif
 
+    if (state->capture_input_dst != nullptr)
+        return;
+
     const int reused_compute_sm_idx = state->num_compute_sms + dispatch_sm_idx;
     const int total_compute_sms_after_dispatch = state->num_compute_sms + state->num_dispatch_sms;
     MK_DISPATCH_REUSED_COMPUTE(
@@ -2845,13 +2892,6 @@ __device__ __forceinline__ bool timeout_log_once(MegaKernelState* state, int sit
 __device__ __forceinline__ void scheduler_compute_sync(int num_threads) {
     asm volatile("barrier.sync 3, %0;" :: "r"(num_threads));
 }
-
-#if MK_PERF_TRACE_ARGS
-__device__ __forceinline__ bool mk_perf_record_first_i64(int64_t* slot, int64_t value) {
-    return atomicCAS(reinterpret_cast<unsigned long long*>(slot), 0ULL,
-                     static_cast<unsigned long long>(value)) == 0ULL;
-}
-#endif
 
 __device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_result, int num_threads) {
     if (threadIdx.x == 0)
@@ -2928,6 +2968,9 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
         __nanosleep(32);
 #endif
     st_na_release(state->compute_task_tail, tail + 1);
+#if MK_PERF_TRACE_ENABLED
+    mk_perf_record_first_i64(state->perf_ms_first_task_visible_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
     int64_t publish_visible_ns = globaltimer_ns();
     if (mk_perf_record_first_i64(state->perf_sched_first_task_publish_ts, publish_visible_ns)) {
@@ -2968,6 +3011,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
 #endif
     if (old_source != 0)
         return false;
+#if MK_PERF_TRACE_ENABLED
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_ms_first_normal_publish_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
     int64_t enqueue_success_ns = globaltimer_ns();
     if (source == 1)
@@ -3387,6 +3434,10 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         }
         scheduler_compute_sync(num_threads);
         bool dispatch_done = (s_dispatch_done != 0);
+#if MK_PERF_TRACE_ENABLED
+        if (tid == 0 && dispatch_done)
+            mk_perf_record_first_i64(state->perf_ms_dispatch_done_seen_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
         if (tid == 0 && dispatch_done)
             mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
@@ -3422,6 +3473,9 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #if MK_ASYNC_PUBLISH
                 if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
                     s_dispatch_done = 1;
+#if MK_PERF_TRACE_ENABLED
+                    mk_perf_record_first_i64(state->perf_ms_dispatch_done_seen_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
                     mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
 #endif
@@ -3461,20 +3515,28 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         &s_compute_all_result, num_threads);
 #endif
                     if (!all_ready) {
-                        // Find the first non-ready slot in this wave via warp vote
-                        // Thread 0 does a sequential scan of just this wave's portion
-                        if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
-                                    count = s + 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            s_priority_alloc_count = count;  // broadcast final count
-                        }
+                        // Parallel first-not-ready reduction. Reuse the my_ready value each thread
+                        // already loaded for this wave instead of a single-thread serial rescan.
+                        // The old tid-0 loop did up to num_threads dependent global loads
+                        // (~100-200us per call) and was the dominant scheduler stall; here the
+                        // contiguous prefix extends by the smallest lane offset whose slot is
+                        // in-range and not ready.
+                        if (tid == 0)
+                            s_priority_alloc_count = num_threads;
                         scheduler_compute_sync(num_threads);
-                        count = s_priority_alloc_count;
+                        if (my_slot < state->expert_count[expert_id] && !my_ready)
+                            atomicMin(&s_priority_alloc_count, tid);
+                        scheduler_compute_sync(num_threads);
+                        count += s_priority_alloc_count;
+#if MK_PERF_TRACE_ENABLED
+                        // Record the stall only while still below a full batch (the region that
+                        // gates the first normal publish). Single owner (this scheduler's tid 0).
+                        if (tid == 0 && count < COMPUTE_BATCH_SIZE) {
+                            state->perf_ms_expert_stall_count[expert_id] += 1;
+                            state->perf_ms_expert_last_stall_ts[expert_id] = globaltimer_ns();
+                            state->perf_ms_expert_last_stall_slot[expert_id] = count;
+                        }
+#endif
                         break;
                     }
                     count += num_threads;
@@ -3488,6 +3550,14 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 if (tid == 0 && count != old_count) {
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
+#if MK_PERF_TRACE_ENABLED
+                    int64_t now_advance_ns = globaltimer_ns();
+                    mk_perf_record_first_i64(state->perf_ms_first_recv_advance_ts, now_advance_ns);
+                    // Per-expert: stamp the moment this expert's contiguous ready prefix first
+                    // reaches a full compute batch (the gate for the first normal full-batch publish).
+                    if (count >= COMPUTE_BATCH_SIZE)
+                        mk_perf_record_first_i64(&state->perf_ms_expert_prefix_full_ts[expert_id], now_advance_ns);
+#endif
 #if MK_PERF_TRACE_ARGS
                     int64_t recv_advance_ns = globaltimer_ns();
                     if (mk_perf_record_first_i64(state->perf_sched_first_recv_count_advance_ts, recv_advance_ns)) {
@@ -4256,19 +4326,6 @@ __device__ __forceinline__ void compute_worker(
                 slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
 
-        // ==== Backward activation save ====
-        // Save fc1 input (permuted X) by recv_token for the backward pass. input_buf still
-        // holds X here (the scatter above only overwrote combine_input, not input_buf).
-        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
-        if (state->bwd_fc1_input != nullptr) {
-            const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
-            int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
-            for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
-                int row = idx / hidden_int4;
-                int v = idx - row * hidden_int4;
-                bwd_in_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = bwd_in_src_i4[idx];
-            }
-        }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
@@ -6025,19 +6082,6 @@ __device__ void combine_precompute_worker(
                 slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
 
-        // ==== Backward activation save ====
-        // Save fc1 input (permuted X) by recv_token for the backward pass. input_buf still
-        // holds X here (the scatter above only overwrote combine_input, not input_buf).
-        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
-        if (state->bwd_fc1_input != nullptr) {
-            const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
-            int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
-            for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
-                int row = idx / hidden_int4;
-                int v = idx - row * hidden_int4;
-                bwd_in_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = bwd_in_src_i4[idx];
-            }
-        }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
@@ -6427,6 +6471,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
 #endif
     if (old_source != 0)
         return false;
+#if MK_PERF_TRACE_ENABLED
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_ms_first_normal_publish_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
     int64_t enqueue_success_ns = globaltimer_ns();
     if (source == 1)
@@ -6846,6 +6894,10 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         }
         scheduler_compute_sync(num_threads);
         bool dispatch_done = (s_dispatch_done != 0);
+#if MK_PERF_TRACE_ENABLED
+        if (tid == 0 && dispatch_done)
+            mk_perf_record_first_i64(state->perf_ms_dispatch_done_seen_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
         if (tid == 0 && dispatch_done)
             mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
@@ -6881,6 +6933,9 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #if MK_ASYNC_PUBLISH
                 if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
                     s_dispatch_done = 1;
+#if MK_PERF_TRACE_ENABLED
+                    mk_perf_record_first_i64(state->perf_ms_dispatch_done_seen_ts, globaltimer_ns());
+#endif
 #if MK_PERF_TRACE_ARGS
                     mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
 #endif
@@ -6920,20 +6975,28 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         &s_compute_all_result, num_threads);
 #endif
                     if (!all_ready) {
-                        // Find the first non-ready slot in this wave via warp vote
-                        // Thread 0 does a sequential scan of just this wave's portion
-                        if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1) {
-                                    count = s + 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            s_priority_alloc_count = count;  // broadcast final count
-                        }
+                        // Parallel first-not-ready reduction. Reuse the my_ready value each thread
+                        // already loaded for this wave instead of a single-thread serial rescan.
+                        // The old tid-0 loop did up to num_threads dependent global loads
+                        // (~100-200us per call) and was the dominant scheduler stall; here the
+                        // contiguous prefix extends by the smallest lane offset whose slot is
+                        // in-range and not ready.
+                        if (tid == 0)
+                            s_priority_alloc_count = num_threads;
                         scheduler_compute_sync(num_threads);
-                        count = s_priority_alloc_count;
+                        if (my_slot < state->expert_count[expert_id] && !my_ready)
+                            atomicMin(&s_priority_alloc_count, tid);
+                        scheduler_compute_sync(num_threads);
+                        count += s_priority_alloc_count;
+#if MK_PERF_TRACE_ENABLED
+                        // Record the stall only while still below a full batch (the region that
+                        // gates the first normal publish). Single owner (this scheduler's tid 0).
+                        if (tid == 0 && count < COMPUTE_BATCH_SIZE) {
+                            state->perf_ms_expert_stall_count[expert_id] += 1;
+                            state->perf_ms_expert_last_stall_ts[expert_id] = globaltimer_ns();
+                            state->perf_ms_expert_last_stall_slot[expert_id] = count;
+                        }
+#endif
                         break;
                     }
                     count += num_threads;
@@ -6947,6 +7010,14 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 if (tid == 0 && count != old_count) {
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
+#if MK_PERF_TRACE_ENABLED
+                    int64_t now_advance_ns = globaltimer_ns();
+                    mk_perf_record_first_i64(state->perf_ms_first_recv_advance_ts, now_advance_ns);
+                    // Per-expert: stamp the moment this expert's contiguous ready prefix first
+                    // reaches a full compute batch (the gate for the first normal full-batch publish).
+                    if (count >= COMPUTE_BATCH_SIZE)
+                        mk_perf_record_first_i64(&state->perf_ms_expert_prefix_full_ts[expert_id], now_advance_ns);
+#endif
 #if MK_PERF_TRACE_ARGS
                     int64_t recv_advance_ns = globaltimer_ns();
                     if (mk_perf_record_first_i64(state->perf_sched_first_recv_count_advance_ts, recv_advance_ns)) {
@@ -7540,6 +7611,30 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         CUDA_CHECK(cudaMemcpy(async_pub_end.data(), host_state.perf_async_pub_end_ts, async_pub_bytes, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(&async_publish_all_done_ts, host_state.perf_async_publish_all_done_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
     }
+    // TRACE=1-visible pipeline milestones (rendered as marker events in both trace modes).
+    int64_t ms_dispatch_done_seen_ts = 0, ms_first_recv_advance_ts = 0;
+    int64_t ms_first_normal_publish_ts = 0, ms_first_task_visible_ts = 0;
+    std::vector<int64_t> ms_expert_prefix_full_ts(host_state.num_local_experts > 0 ? host_state.num_local_experts : 1, 0);
+    std::vector<int64_t> ms_expert_first_batch_ready_ts(host_state.num_local_experts > 0 ? host_state.num_local_experts : 1, 0);
+    std::vector<int64_t> ms_expert_stall_count(host_state.num_local_experts > 0 ? host_state.num_local_experts : 1, 0);
+    std::vector<int64_t> ms_expert_last_stall_ts(host_state.num_local_experts > 0 ? host_state.num_local_experts : 1, 0);
+    std::vector<int64_t> ms_expert_last_stall_slot(host_state.num_local_experts > 0 ? host_state.num_local_experts : 1, -1);
+    CUDA_CHECK(cudaMemcpy(&ms_dispatch_done_seen_ts, host_state.perf_ms_dispatch_done_seen_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&ms_first_recv_advance_ts, host_state.perf_ms_first_recv_advance_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&ms_first_normal_publish_ts, host_state.perf_ms_first_normal_publish_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&ms_first_task_visible_ts, host_state.perf_ms_first_task_visible_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    if (host_state.num_local_experts > 0) {
+        CUDA_CHECK(cudaMemcpy(ms_expert_prefix_full_ts.data(), host_state.perf_ms_expert_prefix_full_ts,
+                              (size_t)host_state.num_local_experts * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ms_expert_first_batch_ready_ts.data(), host_state.perf_ms_expert_first_batch_ready_ts,
+                              (size_t)host_state.num_local_experts * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ms_expert_stall_count.data(), host_state.perf_ms_expert_stall_count,
+                              (size_t)host_state.num_local_experts * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ms_expert_last_stall_ts.data(), host_state.perf_ms_expert_last_stall_ts,
+                              (size_t)host_state.num_local_experts * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ms_expert_last_stall_slot.data(), host_state.perf_ms_expert_last_stall_slot,
+                              (size_t)host_state.num_local_experts * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    }
     const int logical_channels_per_physical = host_state.num_dispatch_channels > 0 ?
         num_logical_channels / host_state.num_dispatch_channels : 1;
 
@@ -7640,6 +7735,11 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
                "\"args\":{\"name\":\"scheduler_bridge\"}}",
             host_state.rank, scheduler_tid);
+    int milestone_tid = scheduler_tid + 1;
+    emit_comma();
+    fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
+               "\"args\":{\"name\":\"pipeline_milestones\"}}",
+            host_state.rank, milestone_tid);
 
     for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
         int dispatch_sender_tid = lch_tid_base + logical_channel_id * 5;
@@ -7717,11 +7817,39 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     emit_event("scheduler_bridge", "scheduler", sched_ts[0], sched_ts[1], host_state.rank, scheduler_tid);
 
-    for (int t = 0; t < gather_task_count; ++t) {
-        int64_t* rec = &gather_task[(size_t)t * NGF];
-        int tid = compute_tid_base + num_compute_groups;
-        emit_event("gather_task", "gather_sm", rec[0], rec[1], host_state.rank, tid);
+    // Pipeline milestones: short 1us markers so the dispatch->ready->publish->compute
+    // handoff can be read directly off the timeline even without MK_PERF_TRACE_ARGS.
+    auto emit_milestone = [&](const char* name, int64_t ts) {
+        if (ts > 0) emit_event(name, "milestone", ts, ts + 1, host_state.rank, milestone_tid);
+    };
+    emit_milestone("ms_sched_start", sched_ts[0]);
+    emit_milestone("ms_first_recv_advance", ms_first_recv_advance_ts);
+    emit_milestone("ms_publish_all_done", async_publish_all_done_ts);
+    emit_milestone("ms_dispatch_done_seen", ms_dispatch_done_seen_ts);
+    emit_milestone("ms_first_normal_publish", ms_first_normal_publish_ts);
+    emit_milestone("ms_first_task_visible", ms_first_task_visible_ts);
+    for (int e = 0; e < host_state.num_local_experts; ++e) {
+        if (ms_expert_prefix_full_ts[e] > 0) {
+            char mname[48];
+            snprintf(mname, sizeof(mname), "ms_e%d_prefix_full_1024", e);
+            emit_event(mname, "milestone", ms_expert_prefix_full_ts[e], ms_expert_prefix_full_ts[e] + 1,
+                       host_state.rank, milestone_tid);
+        }
+        if (ms_expert_first_batch_ready_ts[e] > 0) {
+            char mname[56];
+            snprintf(mname, sizeof(mname), "ms_e%d_src_batch_ready", e);
+            emit_event(mname, "milestone", ms_expert_first_batch_ready_ts[e], ms_expert_first_batch_ready_ts[e] + 1,
+                       host_state.rank, milestone_tid);
+        }
+        if (ms_expert_last_stall_ts[e] > 0) {
+            char mname[80];
+            snprintf(mname, sizeof(mname), "ms_e%d_last_stall_slot%lld_n%lld", e,
+                     (long long)ms_expert_last_stall_slot[e], (long long)ms_expert_stall_count[e]);
+            emit_event(mname, "milestone", ms_expert_last_stall_ts[e], ms_expert_last_stall_ts[e] + 1,
+                       host_state.rank, milestone_tid);
+        }
     }
+
     for (int t = 0; t < compute_task_count; ++t) {
         int64_t* rec = &compute_task[(size_t)t * NCF];
         if (rec[26] == 0) continue;
@@ -8542,6 +8670,16 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
                "\"args\":{\"sort_index\":%d}}",
             host_state.rank, scheduler_tid, scheduler_tid);
+    int milestone_tid = scheduler_tid + 1;
+    emit_comma();
+    fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
+               "\"args\":{\"name\":\"pipeline_milestones\"}}",
+            host_state.rank, milestone_tid);
+    emit_comma();
+    fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
+               "\"args\":{\"sort_index\":%d}}",
+            host_state.rank, milestone_tid, milestone_tid);
+
 
     int pid = host_state.rank;
     auto get_dispatch_role_diag = [&](int acc_idx, int64_t& last_role, int64_t& last_slot,
@@ -9109,6 +9247,39 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                          sched_stall_enqueue_cursor, sched_stall_first_unready_slot,
                          sched_stall_first_unready_ready, sched_stall_dispatch_done);
 
+    // Pipeline milestones (same markers as the non-args path) so the dispatch->ready->publish->compute
+    // handoff is directly visible on the timeline in TRACE=2 as well.
+    auto emit_milestone = [&](const char* name, int64_t ts) {
+        if (ts > 0) emit_event(name, "milestone", ts, ts + 1, pid, milestone_tid);
+    };
+    emit_milestone("ms_sched_start", sched_ts[0]);
+    emit_milestone("ms_first_recv_advance", ms_first_recv_advance_ts);
+    emit_milestone("ms_publish_all_done", async_publish_all_done_ts);
+    emit_milestone("ms_dispatch_done_seen", ms_dispatch_done_seen_ts);
+    emit_milestone("ms_first_normal_publish", ms_first_normal_publish_ts);
+    emit_milestone("ms_first_task_visible", ms_first_task_visible_ts);
+    for (int e = 0; e < host_state.num_local_experts; ++e) {
+        if (ms_expert_prefix_full_ts[e] > 0) {
+            char mname[48];
+            snprintf(mname, sizeof(mname), "ms_e%d_prefix_full_1024", e);
+            emit_event(mname, "milestone", ms_expert_prefix_full_ts[e], ms_expert_prefix_full_ts[e] + 1,
+                       pid, milestone_tid);
+        }
+        if (ms_expert_first_batch_ready_ts[e] > 0) {
+            char mname[56];
+            snprintf(mname, sizeof(mname), "ms_e%d_src_batch_ready", e);
+            emit_event(mname, "milestone", ms_expert_first_batch_ready_ts[e], ms_expert_first_batch_ready_ts[e] + 1,
+                       pid, milestone_tid);
+        }
+        if (ms_expert_last_stall_ts[e] > 0) {
+            char mname[80];
+            snprintf(mname, sizeof(mname), "ms_e%d_last_stall_slot%lld_n%lld", e,
+                     (long long)ms_expert_last_stall_slot[e], (long long)ms_expert_stall_count[e]);
+            emit_event(mname, "milestone", ms_expert_last_stall_ts[e], ms_expert_last_stall_ts[e] + 1,
+                       pid, milestone_tid);
+        }
+    }
+
     // Compute task rows: one Perfetto row per compute group, one X-event per task batch.
     int compute_tid_base = num_logical_channels * 5 + 100;
     int num_compute_groups = host_state.num_compute_groups;
@@ -9390,7 +9561,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t num_nvl_bytes,
     const int* host_expert_count,
     // Optional caller-owned buffers. Non-null pointers are borrowed by the state.
-    __nv_bfloat16* external_bwd_fc1_input,
     __nv_bfloat16* external_bwd_preact,
     int* external_fwd_slot_map,
     int4* external_combined_x,
@@ -9633,7 +9803,6 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     // Combine input namespace from dispatch receive.
     CUDA_CHECK(cudaMalloc(&combine_input, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMemset(combine_input, 0, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&combine_input_topk_weights, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMemset(combine_input_topk_weights, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&combine_input_src_meta, (size_t)max_total_recv_tokens * sizeof(internode::SourceMeta)));
@@ -9656,17 +9825,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* priority_batch_skip_epoch;
     int* priority_batch_retry_epoch;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
-    CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
-    // Backward activation save: original fc1 input X plus gate/up preact by recv_token.
-    // A backward replay borrows the forward state's saved buffers directly, avoiding a
-    // transient allocate/free cycle for hundreds of MiB.
-    __nv_bfloat16* bwd_fc1_input = external_bwd_fc1_input;
-    const bool owns_bwd_fc1_input = bwd_fc1_input == nullptr;
-    const size_t bwd_fc1_input_bytes = (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16);
-    if (owns_bwd_fc1_input) {
-        CUDA_CHECK(cudaMalloc(&bwd_fc1_input, bwd_fc1_input_bytes));
-        CUDA_CHECK(cudaMemset(bwd_fc1_input, 0, bwd_fc1_input_bytes));
-    }
     // Phase 3 (Step 3.3b): compact preact storage. bwd_preact is now indexed by the compact
     // forward slot (Step 3.3a), so it only needs total_expert_slots (= Σ expert_count = S) rows
     // instead of the max_total_recv_tokens * num_topk (= R*K) sparse upper bound. Written per-row
@@ -9676,7 +9834,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     const size_t bwd_preact_bytes = (size_t)total_expert_slots * 2 * intermediate_dim * sizeof(__nv_bfloat16);
     if (owns_bwd_preact) {
         CUDA_CHECK(cudaMalloc(&bwd_preact, bwd_preact_bytes));
-        CUDA_CHECK(cudaMemset(bwd_preact, 0, bwd_preact_bytes));
     }
     // Phase 3 (A2) scaffolding: (recv_token, topk_slot) -> forward slot translation table.
     // Init to -1; populated by the forward compute worker (Step 3.2), consumed by backward
@@ -10054,10 +10211,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.num_logical_channels = num_logical_channels;
     host_state.token_compute_expected = token_compute_expected;
     host_state.compute_output_slot = compute_output_slot;
-    host_state.bwd_fc1_input = bwd_fc1_input;
     host_state.bwd_preact = bwd_preact;
-    host_state.owns_bwd_fc1_input = owns_bwd_fc1_input;
     host_state.owns_bwd_preact = owns_bwd_preact;
+    host_state.capture_input_dst = nullptr;
     host_state.fwd_slot_map = fwd_slot_map;
     host_state.owns_fwd_slot_map = owns_fwd_slot_map;
     host_state.token_nhits = token_nhits;
@@ -10112,6 +10268,24 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     CUDA_CHECK(cudaMalloc(&host_state.perf_sched_ts, 2 * sizeof(int64_t)));
     CUDA_CHECK(cudaMemset(host_state.perf_sched_ts, 0, 2 * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_dispatch_done_seen_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_dispatch_done_seen_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_first_recv_advance_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_first_recv_advance_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_expert_prefix_full_ts, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_expert_prefix_full_ts, 0, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_first_normal_publish_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_first_normal_publish_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_first_task_visible_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_first_task_visible_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_expert_first_batch_ready_ts, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_expert_first_batch_ready_ts, 0, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_expert_stall_count, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_expert_stall_count, 0, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_expert_last_stall_ts, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_expert_last_stall_ts, 0, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_ms_expert_last_stall_slot, (size_t)num_local_experts * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_ms_expert_last_stall_slot, 0xff, (size_t)num_local_experts * sizeof(int64_t)));
 #endif
 
 #if MK_PERF_TRACE_ARGS
@@ -10700,7 +10874,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.recv_src_meta));
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
-    if (host_state.owns_bwd_fc1_input) CUDA_CHECK(cudaFree(host_state.bwd_fc1_input));
     if (host_state.owns_bwd_preact) CUDA_CHECK(cudaFree(host_state.bwd_preact));
     if (host_state.owns_fwd_slot_map) CUDA_CHECK(cudaFree(host_state.fwd_slot_map));
     CUDA_CHECK(cudaFree(host_state.token_nhits));
@@ -10791,6 +10964,15 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_async_pub_end_ts));
     CUDA_CHECK(cudaFree(host_state.perf_async_publish_all_done_ts));
     CUDA_CHECK(cudaFree(host_state.perf_sched_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_dispatch_done_seen_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_first_recv_advance_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_expert_prefix_full_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_first_normal_publish_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_first_task_visible_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_expert_first_batch_ready_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_expert_stall_count));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_expert_last_stall_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_ms_expert_last_stall_slot));
 #endif
 #if MK_PERF_TRACE_ARGS
     CUDA_CHECK(cudaFree(host_state.perf_dispatch_round_trace));
@@ -10988,9 +11170,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
 }
 
 // Release the forward-only working buffers after the kernel has written the caller-owned
-// output. The backward pass allocates a fresh v7 state and only reuses the saved-activation
-// buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) plus expert_count from this forward
-// state (see allocate_megakernel_backward_state). None of the buffers freed here are read
+// output. The backward pass allocates a fresh v7 state and only reuses bwd_preact /
+// fwd_slot_map plus expert_count from this forward state (see allocate_megakernel_backward_state).
+// It rebuilds X_by_recv_token with a backward dispatch-only replay. None of the buffers freed here are read
 // by the backward, so releasing them now removes them from the forward->backward resident
 // set. Each freed pointer is nulled so the eventual free_megakernel_state_v7 skips it
 // (mk_caching_free is null-safe), avoiding a double free.
@@ -11087,17 +11269,18 @@ void launch_megakernel_debug_forward(
 // backward compute worker:
 //   x            := grad_output   (so dispatch scatters grad_output into combine_input =: grad_down)
 //   combined_x   := grad_input    (so combine reduces grad_xperm over a token's hits =: dX)
-//   compute      := compute_backward_worker (reads grad_down + saved X, writes grad_xperm)
+//   compute      := compute_backward_worker (reads grad_down + replayed X, writes grad_xperm)
 //
 // Correctness: dispatch/combine are driven by routing that is deterministic per RECV_TOKEN
 // (prefix-sum indices), while the expert SLOT index is assigned by a non-deterministic
-// atomicAdd and therefore differs run-to-run. Hence the forward saved fc1 input by recv_token
-// (fwd.bwd_fc1_input[recv_token]); the backward gathers grad_down and X by the same recv_token
-// index, so everything stays aligned regardless of the re-run's slot permutation.
+// atomicAdd and therefore differs run-to-run. Backward first replays dispatch with the original
+// forward x and writes X_by_recv_token into a transient buffer, then replays dispatch with
+// grad_output so combine_input[recv_token] holds grad_down. The compute worker gathers both
+// by recv_token, so everything stays aligned regardless of the re-run's slot permutation.
 //
 // Phase 2 math (per compute task; only grad_input / dX is produced — no dW / dprobs):
-//   grad_down = combine_input row for this recv_token (filled by the re-run dispatch)
-//   X_perm    = fwd.bwd_fc1_input[recv_token]
+//   grad_down = combine_input row for this recv_token (filled by the grad_output replay)
+//   X_perm    = transient X_by_recv_token[recv_token]
 //   GU        = X_perm @ W_gateup^T           [M, 2I]   gate=GU[:,0::2], up=GU[:,1::2]
 //   grad_act  = grad_down @ W_down            [M, I]
 //   SwiGLU bwd (route folded in fwd act = silu(gate)*up*route):
@@ -11115,8 +11298,9 @@ struct MegaKernelBackwardState {
     MegaKernelState* fwd;                 // original forward state (buffers reused, freed by caller)
     MegaKernelState* bwd_device_state;    // patched device copy: x=grad_output, combined_x=grad_input
 
-    const __nv_bfloat16* bwd_fc1_input;   // fwd.bwd_fc1_input [max_total_recv_tokens, hidden] (X by recv_token)
-    const __nv_bfloat16* bwd_preact;      // fwd.bwd_preact [max_total_recv_tokens, num_topk, 2I]
+    const int4* fwd_x;                    // original forward x [num_tokens, hidden_int4], retained by autograd
+    __nv_bfloat16* bwd_fc1_input;         // transient X_by_recv_token [max_total_recv_tokens, hidden]
+    const __nv_bfloat16* bwd_preact;      // fwd.bwd_preact [total_expert_slots, 2I]
     umma::ComputeBackwardTmaAtoms* compute_bwd_tma;
     CUtensorMap* wgrad_dgu_a_tma;         // [num_local_experts * max_batches_per_expert] batch-start A descs for wgrad_dgu_slot
 
@@ -11783,6 +11967,16 @@ __device__ __forceinline__ void combine_precompute_backward_worker(
         bs, sm_id, combine_sm_idx, num_combine_sms, post_group_count, smem_buffer);
 }
 
+template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
+__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) moe_megakernel_v7_capture_x(
+    MegaKernelBackwardState* bs
+) {
+    MegaKernelState* state = bs->bwd_device_state;
+    const int dispatch_sm_idx = blockIdx.x;
+    dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType, false>(
+        dispatch_sm_idx, dispatch_sm_idx, state, nullptr);
+}
+
 // Backward megakernel: same role layout as moe_megakernel_v7 (dispatch / combine /
 // scheduler / gather all reused verbatim on the patched bwd state); only the compute
 // role is swapped for compute_backward_worker.
@@ -11921,16 +12115,21 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         fs.allocator_max_tokens_per_expert, fs.allocator_max_total_recv_tokens,
         fs.allocator_num_rdma_bytes, fs.allocator_num_nvl_bytes,
         h_bwd_expert_count.data(),
-        const_cast<__nv_bfloat16*>(fs.bwd_fc1_input),
         const_cast<__nv_bfloat16*>(fs.bwd_preact),
         fs.fwd_slot_map,
         reinterpret_cast<int4*>(grad_input),
         reinterpret_cast<float*>(grad_topk_weights));
 
+    __nv_bfloat16* bwd_fc1_input = nullptr;
+    CUDA_CHECK(mk_caching_alloc(
+        reinterpret_cast<void**>(&bwd_fc1_input),
+        (size_t)fs.max_total_recv_tokens * hidden * sizeof(__nv_bfloat16)));
+
     MegaKernelBackwardState hs{};
     hs.fwd = fwd_device_state;
     hs.bwd_device_state = bwd_device_state;
-    hs.bwd_fc1_input = fs.bwd_fc1_input;
+    hs.fwd_x = fs.x;
+    hs.bwd_fc1_input = bwd_fc1_input;
     hs.bwd_preact = fs.bwd_preact;
     hs.compute_bwd_tma = d_compute_bwd_tma;
     hs.grad_output = reinterpret_cast<const __nv_bfloat16*>(grad_output);
@@ -11990,14 +12189,30 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     MegaKernelBackwardState hs;
     CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
     // wgrad_* buffers are borrowed from caller-owned Torch tensors.
+    CUDA_CHECK(mk_caching_free(hs.bwd_fc1_input));
     CUDA_CHECK(mk_caching_free(hs.compute_bwd_tma));
     CUDA_CHECK(mk_caching_free(hs.wgrad_dgu_a_tma));
     free_megakernel_state_v7(hs.bwd_device_state);
     CUDA_CHECK(mk_caching_free(device_bs));
 }
 
-// Establish the post-allocation state for every launch. Routing inputs, weights and the
-// saved forward activation are immutable across replay and are intentionally preserved.
+// Establish the post-allocation state for every launch. Routing inputs, weights and compact
+// saved preact are immutable across replay and are intentionally preserved.
+static void prepare_megakernel_dispatch_replay(
+    const MegaKernelState& hs,
+    int** dispatch_barrier_signal_ptrs,
+    cudaStream_t stream
+) {
+    // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
+    // Besides the cross-rank barriers, this owns the same RDMA/NVL metadata layout and cleanup sizes.
+    internode::mk_cached_notfy(
+        hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
+        hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
+        hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
+        hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
+        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
+}
+
 void prepare_megakernel_communication_replay(
     MegaKernelState* device_state,
     int** dispatch_barrier_signal_ptrs,
@@ -12008,14 +12223,7 @@ void prepare_megakernel_communication_replay(
     CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     const int combine_hidden_int4 = hs.combine_hidden / (sizeof(int4) / sizeof(__nv_bfloat16));
 
-    // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
-    // Besides the cross-rank barriers, this owns the same RDMA/NVL metadata layout and cleanup sizes.
-    internode::mk_cached_notfy(
-        hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
-        hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
-        hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
-        hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
-        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
+    prepare_megakernel_dispatch_replay(hs, dispatch_barrier_signal_ptrs, stream);
     internode::mk_cached_notfy(
         combine_hidden_int4, 0, 0, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, hs.num_tokens,
@@ -12053,6 +12261,15 @@ static void reset_megakernel_perf_trace_state(const MegaKernelState& hs, cudaStr
     z(hs.perf_async_pub_end_ts, async_pub_bytes);
     z(hs.perf_async_publish_all_done_ts, sizeof(int64_t));
     z(hs.perf_sched_ts, 2 * sizeof(int64_t));
+    z(hs.perf_ms_dispatch_done_seen_ts, sizeof(int64_t));
+    z(hs.perf_ms_first_recv_advance_ts, sizeof(int64_t));
+    z(hs.perf_ms_expert_prefix_full_ts, (size_t)hs.num_local_experts * sizeof(int64_t));
+    z(hs.perf_ms_first_normal_publish_ts, sizeof(int64_t));
+    z(hs.perf_ms_first_task_visible_ts, sizeof(int64_t));
+    z(hs.perf_ms_expert_first_batch_ready_ts, (size_t)hs.num_local_experts * sizeof(int64_t));
+    z(hs.perf_ms_expert_stall_count, (size_t)hs.num_local_experts * sizeof(int64_t));
+    z(hs.perf_ms_expert_last_stall_ts, (size_t)hs.num_local_experts * sizeof(int64_t));
+    f(hs.perf_ms_expert_last_stall_slot, (size_t)hs.num_local_experts * sizeof(int64_t));
 
 #if MK_PERF_TRACE_ARGS
     const size_t acc_bytes = (size_t)NLC * 2 * sizeof(int64_t);
@@ -12253,14 +12470,12 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.publish_done_count, sizeof(int));
     z(hs.publish_all_done, sizeof(int));
     z(hs.token_compute_expected, MTR * sizeof(int));
-    z(hs.compute_output_slot, total_slots * hs.hidden_dim * sizeof(__nv_bfloat16));
     z(hs.token_nhits, MTR * sizeof(int));
     f(hs.token_slot_list, MTR * TK * sizeof(int));
     z(hs.priority_token_cursor, sizeof(int));
     z(hs.expert_batch_enqueued, (size_t)E * MBE * sizeof(int));
     z(hs.priority_batch_skip_epoch, (size_t)E * MBE * sizeof(int));
     z(hs.priority_batch_retry_epoch, (size_t)E * MBE * sizeof(int));
-    z(hs.combine_input, MTR * hs.hidden_dim * sizeof(__nv_bfloat16));
     z(hs.combine_input_topk_weights, MTR * TK * sizeof(float));
     z(hs.output_accum, (size_t)hs.num_tokens * hs.hidden_dim * sizeof(float));
     f(hs.send_rdma_head, (size_t)NLC * combine_rdma_head_stride * sizeof(int));
@@ -12279,6 +12494,25 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
 #if MK_PERF_TRACE_ENABLED
     reset_megakernel_perf_trace_state(hs, stream);
 #endif
+}
+
+template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
+static void launch_megakernel_v7_capture_x_case(
+    MegaKernelBackwardState* device_bs,
+    int num_dispatch_sms,
+    int smem_size,
+    cudaStream_t stream
+) {
+    using RdmaCfg = MegaKernelRdmaConfig<kNumRDMARanks>;
+    constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
+    if (smem_size > 48 * 1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7_capture_x<kNumRDMARanks, kStage, kComputeDType>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    moe_megakernel_v7_capture_x<kNumRDMARanks, kStage, kComputeDType>
+        <<<num_dispatch_sms, kThreads, smem_size, stream>>>(device_bs);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
@@ -12333,6 +12567,80 @@ void prepare_megakernel_backward_communication_replay(
     prepare_megakernel_communication_replay(
         hs.bwd_device_state, dispatch_barrier_signal_ptrs,
         combine_barrier_signal_ptrs, stream);
+}
+
+void prepare_megakernel_backward_dispatch_replay(
+    MegaKernelBackwardState* backward_state,
+    int** dispatch_barrier_signal_ptrs,
+    cudaStream_t stream
+) {
+    EP_HOST_ASSERT(backward_state != nullptr);
+    MegaKernelBackwardState hs;
+    CUDA_CHECK(cudaMemcpy(
+        &hs, backward_state, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    EP_HOST_ASSERT(hs.bwd_device_state != nullptr);
+    MegaKernelState hstate;
+    CUDA_CHECK(cudaMemcpy(&hstate, hs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    prepare_megakernel_dispatch_replay(hstate, dispatch_barrier_signal_ptrs, stream);
+}
+
+void launch_megakernel_debug_capture_x(
+    MegaKernelBackwardState* backward_state,
+    int total_sms,
+    int smem_size,
+    int stage,
+    ComputeDType compute_dtype,
+    cudaStream_t stream
+) {
+    EP_HOST_ASSERT(backward_state != nullptr);
+    EP_HOST_ASSERT(compute_dtype == ComputeDType::kBF16 &&
+                   "megakernel debug backward X capture currently supports BF16 only");
+
+    MegaKernelBackwardState hbs;
+    CUDA_CHECK(cudaMemcpy(&hbs, backward_state, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    MegaKernelState hstate;
+    CUDA_CHECK(cudaMemcpy(&hstate, hbs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    EP_HOST_ASSERT(hbs.fwd_x != nullptr);
+    EP_HOST_ASSERT(hbs.bwd_fc1_input != nullptr);
+    EP_HOST_ASSERT(hstate.num_dispatch_sms > 0 && hstate.num_dispatch_sms <= total_sms);
+
+    hstate.x = hbs.fwd_x;
+    hstate.capture_input_dst = hbs.bwd_fc1_input;
+    CUDA_CHECK(cudaMemcpyAsync(hbs.bwd_device_state, &hstate, sizeof(MegaKernelState),
+                               cudaMemcpyHostToDevice, stream));
+    initialize_megakernel_launch_state(hstate, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int num_ranks = hstate.num_ranks;
+    EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
+
+#define MEGAKERNEL_CAPTURE_X_STAGE_CASE(kNumRDMARanks, kStage, kComputeDType) \
+    launch_megakernel_v7_capture_x_case<kNumRDMARanks, kStage, kComputeDType>( \
+        backward_state, hstate.num_dispatch_sms, smem_size, stream); \
+    break
+
+#define MEGAKERNEL_CAPTURE_X_CASE_WITH_DTYPE(kNumRDMARanks, kComputeDType) \
+    switch (stage) { \
+        case 1: MEGAKERNEL_CAPTURE_X_STAGE_CASE(kNumRDMARanks, 1, kComputeDType); \
+        case 2: MEGAKERNEL_CAPTURE_X_STAGE_CASE(kNumRDMARanks, 2, kComputeDType); \
+        default: EP_HOST_ASSERT(false && "Unsupported megakernel stage"); \
+    } \
+    break
+
+#define MEGAKERNEL_CAPTURE_X_CASE(kNumRDMARanks) \
+    MEGAKERNEL_CAPTURE_X_CASE_WITH_DTYPE(kNumRDMARanks, ComputeDType::kBF16)
+
+    SWITCH_RDMA_RANKS(MEGAKERNEL_CAPTURE_X_CASE);
+
+#undef MEGAKERNEL_CAPTURE_X_CASE
+#undef MEGAKERNEL_CAPTURE_X_CASE_WITH_DTYPE
+#undef MEGAKERNEL_CAPTURE_X_STAGE_CASE
+
+    hstate.x = reinterpret_cast<const int4*>(hbs.grad_output);
+    hstate.capture_input_dst = nullptr;
+    CUDA_CHECK(cudaMemcpyAsync(hbs.bwd_device_state, &hstate, sizeof(MegaKernelState),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void launch_megakernel_debug_backward(
