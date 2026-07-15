@@ -446,7 +446,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     // When provided, the per-expert slot buffers are packed compactly via an exclusive
     // prefix sum (total = Σ count). When nullptr, falls back to the fixed
     // num_local_experts * max_tokens_per_expert layout.
-    const int* host_expert_count = nullptr);
+    const int* host_expert_count = nullptr,
+    // Optional caller-owned buffers. Non-null pointers are borrowed by the state.
+    __nv_bfloat16* external_bwd_fc1_input = nullptr,
+    __nv_bfloat16* external_bwd_preact = nullptr,
+    int* external_fwd_slot_map = nullptr,
+    int4* external_combined_x = nullptr,
+    float* external_combined_topk_weights = nullptr);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
 void free_megakernel_forward_transient(MegaKernelState* device_state);
@@ -482,6 +488,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
+    void* W_gateup_T,
+    void* W_down_T,
     int total_sms,
     cudaStream_t stream);
 void free_megakernel_backward_state(MegaKernelBackwardState* backward_state);

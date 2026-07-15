@@ -1587,21 +1587,18 @@ void Buffer::dump_deepep_perf_trace() {
     snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_dispatch_iter%d.json", rank, trace_iter);
     FILE* f = fopen(filename, "w");
     if (f) {
-        // Timestamps: we use 0-based; notify_dispatch spans [0, notify_us], dispatch spans [notify_us, notify_us+dispatch_us]
-        double notify_us = deepep_perf_trace_notify_dispatch_ms_ * 1000.0;
+        // Export baseline dispatch/combine as separate 0-based spans.
         double dispatch_us = deepep_perf_trace_dispatch_ms_ * 1000.0;
         double combine_us = deepep_perf_trace_combine_ms_ * 1000.0;
         fprintf(f, "[\n");
         fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
         fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
         fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"dispatch\"}},\n", rank);
-        fprintf(f, "{\"name\":\"notify_dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0},\n",
-                notify_us, rank);
-        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
-                notify_us, dispatch_us, rank);
+        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
+                dispatch_us, rank);
         fprintf(f, "]\n");
         fclose(f);
-        // printf("[DEEPEP-PERF] dispatch trace written to %s (notify %.3f us, dispatch %.3f us)\n", filename, notify_us, dispatch_us);
+        // printf("[DEEPEP-PERF] dispatch trace written to %s (dispatch %.3f us)\n", filename, dispatch_us);
 
         // Combine in a separate file
         snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine_iter%d.json", rank, trace_iter);
@@ -2375,6 +2372,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         mk_expert_counts[i] = c < 0 ? 0 : c;
     }
 
+    // The combine worker writes directly into the returned Torch tensor. This removes the
+    // state-owned output allocation and the device-to-device clone that used to follow it.
+    auto result = torch::empty(
+        {num_tokens, hidden_dim}, x.options().dtype(torch::kBFloat16));
+
     auto allocate_state = [&](auto allocator) {
         return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -2425,7 +2427,12 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         max_total_recv_tokens > 0 ? max_total_recv_tokens : 1,
         num_rdma_bytes,
         num_nvl_bytes,
-        mk_expert_counts.data());
+        mk_expert_counts.data(),
+        nullptr,
+        nullptr,
+        nullptr,
+        reinterpret_cast<int4*>(result.data_ptr()),
+        nullptr);
     };
 
     void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
@@ -2480,17 +2487,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     fflush(stderr);
 #endif
 
-    // Get combined_x directly (bf16, no extra copy/convert)
-    void* combined_x_ptr = megakernel_debug::get_combined_x_ptr(
-        static_cast<megakernel_debug::MegaKernelState*>(state));
-    auto combined_x_tensor = torch::from_blob(
-        combined_x_ptr,
-        {num_tokens, hidden_dim},
-        torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA));
-
-    // Clone before freeing state
-    auto result = combined_x_tensor.clone();
-
     std::shared_ptr<MegaKernelAutogradContext> context;
     if (retain_state) {
         EP_HOST_ASSERT(!use_fp8_compute && "training state currently requires debug BF16 mode");
@@ -2513,8 +2509,8 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
         // from this forward state. Release the forward-only working buffers (recv_tokens,
         // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
-        // heads, combined_x, ...) now so they don't stay resident across the forward->backward
-        // gap. This cuts the retained-activation footprint without affecting the backward.
+        // heads, ...) now so they don't stay resident across the forward->backward gap.
+        // The returned Torch tensor owns combined_x and is not released with the state.
         megakernel_debug::free_megakernel_forward_transient(
             static_cast<megakernel_debug::MegaKernelState*>(state));
     } else {
@@ -2614,12 +2610,17 @@ Buffer::megakernel_debug_backward(
     auto scratch_dgu_backing = torch::empty(
         {(int64_t)scratch_slots + compute_batch_size, two_i}, bf16_options);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, scratch_slots);
+    auto W_gateup_T = torch::empty(
+        {num_local_experts, hidden, two_i}, bf16_options);
+    auto W_down_T = torch::empty(
+        {num_local_experts, intermediate, hidden}, bf16_options);
     auto stream = at::cuda::getCurrentCUDAStream();
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
         scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
-        scratch_dgu_backing.data_ptr(), total_sms, stream);
+        scratch_dgu_backing.data_ptr(), W_gateup_T.data_ptr(), W_down_T.data_ptr(),
+        total_sms, stream);
     megakernel_debug::prepare_megakernel_backward_communication_replay(
         backward_state, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
