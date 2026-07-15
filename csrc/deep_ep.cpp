@@ -2509,6 +2509,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             topk_idx,
             topk_weights,
         });
+        // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
+        // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
+        // from this forward state. Release the forward-only working buffers (recv_tokens,
+        // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
+        // heads, combined_x, ...) now so they don't stay resident across the forward->backward
+        // gap. This cuts the retained-activation footprint without affecting the backward.
+        megakernel_debug::free_megakernel_forward_transient(
+            static_cast<megakernel_debug::MegaKernelState*>(state));
     } else {
         megakernel_debug::free_megakernel_state_v7(
             static_cast<megakernel_debug::MegaKernelState*>(state));

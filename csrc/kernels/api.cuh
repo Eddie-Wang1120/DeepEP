@@ -449,6 +449,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     const int* host_expert_count = nullptr);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
+void free_megakernel_forward_transient(MegaKernelState* device_state);
 void get_megakernel_backward_dimensions(
     MegaKernelState* device_state,
     int* num_tokens,

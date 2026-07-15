@@ -3464,41 +3464,55 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             }
             scheduler_compute_sync(num_threads);
 #if MK_ASYNC_PUBLISH
+            // Wait once (tid 0) for every async publisher to drain, then let the
+            // whole scheduler CTA publish the remaining full/tail batches in
+            // parallel (one thread per expert) instead of serializing on tid 0.
+            // The serial tid-0 flush is the direct cause of the dispatch->final-flush
+            // supply gap that starves the compute groups right after publish_all_done.
+            // Per-expert ownership stays exclusive (expert_id strided by thread), and
+            // scheduler_publish_task's ordered publish + per-batch CAS keep task
+            // visibility ordering and de-dup correct across the parallel producers.
             if (tid == 0) {
                 for (int pw = 0; pw < state->num_pub_warps_total; ++pw) {
                     while (ld_acquire_global(&state->publish_warp_done[pw]) == 0)
                         __nanosleep(32);
                 }
-                for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
-                    int count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    if (count < cursor)
-                        count = cursor;
-                    st_na_release(&state->expert_recv_count[expert_id], count);
+            }
+            scheduler_compute_sync(num_threads);
+            for (int expert_id = scheduler_id + tid * num_schedulers;
+                 expert_id < num_local_experts;
+                 expert_id += num_threads * num_schedulers) {
+                int count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
+                int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                if (count < cursor)
+                    count = cursor;
+                st_na_release(&state->expert_recv_count[expert_id], count);
 
-                    int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
-                    for (int b = 0; b < full_batch_count; ++b) {
-                        int start = cursor + b * COMPUTE_BATCH_SIZE;
-                        int batch_id = start / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
+                int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
+                for (int b = 0; b < full_batch_count; ++b) {
+                    int start = cursor + b * COMPUTE_BATCH_SIZE;
+                    int batch_id = start / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
 #if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            normal_full_batch_enqueues += 1;
+                    if (enq)
+                        normal_full_batch_enqueues += 1;
 #endif
-                    }
-                    cursor += full_batch_count * COMPUTE_BATCH_SIZE;
-                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-
-                    if (count > cursor) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            flush_tail_enqueues += 1;
-#endif
-                    }
                 }
+                cursor += full_batch_count * COMPUTE_BATCH_SIZE;
+                st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+
+                if (count > cursor) {
+                    int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
+                    st_na_release(&state->expert_enqueue_cursor[expert_id], count);
+#if MK_PERF_TRACE_ARGS
+                    if (enq)
+                        flush_tail_enqueues += 1;
+#endif
+                }
+            }
+            scheduler_compute_sync(num_threads);
+            if (tid == 0) {
 #if MK_PERF_TRACE_ARGS
                 int64_t sched_done_publish_start = globaltimer_ns();
                 sched_enqueue_acc += sched_done_publish_start - sched_enqueue_start;
@@ -4174,11 +4188,11 @@ __device__ __forceinline__ void compute_worker(
                 rec[1] = compute_task_end_ns;
                 rec[2] = sm_id;
                 rec[3] = group_id;
+                rec[5] = batch_size;
                 rec[25] = task.is_flush;
                 rec[26] = 1;
 #if MK_PERF_TRACE_ARGS
                 rec[4] = expert_id;
-                rec[5] = batch_size;
                 rec[6] = hidden;
                 rec[7] = intermediate;
                 rec[8]  = perf_ph_meta_ns;
@@ -5943,11 +5957,11 @@ __device__ void combine_precompute_worker(
                 rec[1] = compute_task_end_ns;
                 rec[2] = sm_id;
                 rec[3] = group_id;
+                rec[5] = batch_size;
                 rec[25] = task.is_flush;
                 rec[26] = 1;
 #if MK_PERF_TRACE_ARGS
                 rec[4] = expert_id;
-                rec[5] = batch_size;
                 rec[6] = hidden;
                 rec[7] = intermediate;
                 rec[8]  = perf_ph_meta_ns;
@@ -6876,41 +6890,55 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             }
             scheduler_compute_sync(num_threads);
 #if MK_ASYNC_PUBLISH
+            // Wait once (tid 0) for every async publisher to drain, then let the
+            // whole scheduler CTA publish the remaining full/tail batches in
+            // parallel (one thread per expert) instead of serializing on tid 0.
+            // The serial tid-0 flush is the direct cause of the dispatch->final-flush
+            // supply gap that starves the compute groups right after publish_all_done.
+            // Per-expert ownership stays exclusive (expert_id strided by thread), and
+            // scheduler_publish_task's ordered publish + per-batch CAS keep task
+            // visibility ordering and de-dup correct across the parallel producers.
             if (tid == 0) {
                 for (int pw = 0; pw < state->num_pub_warps_total; ++pw) {
                     while (ld_acquire_global(&state->publish_warp_done[pw]) == 0)
                         __nanosleep(32);
                 }
-                for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
-                    int count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    if (count < cursor)
-                        count = cursor;
-                    st_na_release(&state->expert_recv_count[expert_id], count);
+            }
+            scheduler_compute_sync(num_threads);
+            for (int expert_id = scheduler_id + tid * num_schedulers;
+                 expert_id < num_local_experts;
+                 expert_id += num_threads * num_schedulers) {
+                int count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
+                int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                if (count < cursor)
+                    count = cursor;
+                st_na_release(&state->expert_recv_count[expert_id], count);
 
-                    int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
-                    for (int b = 0; b < full_batch_count; ++b) {
-                        int start = cursor + b * COMPUTE_BATCH_SIZE;
-                        int batch_id = start / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
+                int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
+                for (int b = 0; b < full_batch_count; ++b) {
+                    int start = cursor + b * COMPUTE_BATCH_SIZE;
+                    int batch_id = start / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
 #if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            normal_full_batch_enqueues += 1;
+                    if (enq)
+                        normal_full_batch_enqueues += 1;
 #endif
-                    }
-                    cursor += full_batch_count * COMPUTE_BATCH_SIZE;
-                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-
-                    if (count > cursor) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            flush_tail_enqueues += 1;
-#endif
-                    }
                 }
+                cursor += full_batch_count * COMPUTE_BATCH_SIZE;
+                st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+
+                if (count > cursor) {
+                    int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                    bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
+                    st_na_release(&state->expert_enqueue_cursor[expert_id], count);
+#if MK_PERF_TRACE_ARGS
+                    if (enq)
+                        flush_tail_enqueues += 1;
+#endif
+                }
+            }
+            scheduler_compute_sync(num_threads);
+            if (tid == 0) {
 #if MK_PERF_TRACE_ARGS
                 int64_t sched_done_publish_start = globaltimer_ns();
                 sched_enqueue_acc += sched_done_publish_start - sched_enqueue_start;
@@ -7508,10 +7536,12 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int64_t* rec = &compute_task[(size_t)t * NCF];
         if (rec[26] == 0) continue;
         int group_id = static_cast<int>(rec[3]);
-        int is_flush_task = static_cast<int>(rec[25]);
+        int batch_size = static_cast<int>(rec[5]);
         int tid = compute_tid_base + group_id;
-        const char* task_color = is_flush_task ? "rail_response" : "good";
-        emit_colored_event("compute_task", "compute_group", task_color,
+        const bool is_partial_batch = batch_size < COMPUTE_BATCH_SIZE;
+        const char* task_color = is_partial_batch ? "terrible" : "good";
+        const char* task_name = is_partial_batch ? "compute_task_partial" : "compute_task_full";
+        emit_colored_event(task_name, "compute_group", task_color,
                            rec[0], rec[1], host_state.rank, tid);
     }
 
@@ -8925,7 +8955,9 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         int end_slot = static_cast<int>(rec[23]);
         int64_t abs_slot_base = rec[24];
         int is_flush_task = static_cast<int>(rec[25]);
-        const char* task_color = is_flush_task ? "rail_response" : "good";
+        const bool is_partial_batch = batch_size < COMPUTE_BATCH_SIZE;
+        const char* task_color = is_partial_batch ? "terrible" : "good";
+        const char* task_kind = is_partial_batch ? "partial" : "full";
         auto phase_us = [](int64_t a, int64_t b) -> double {
             if (a == 0 || b == 0 || b <= a) return 0.0;
             return (b - a) / 1000.0;
@@ -8977,13 +9009,14 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
         if (boundary_unattributed_us < 0.0 && boundary_unattributed_us > -0.001)
             boundary_unattributed_us = 0.0;
         if (!emit_perf_args) {
-            emit_colored_event("compute_task", "compute_group", task_color,
+            const char* task_name = is_partial_batch ? "compute_task_partial" : "compute_task_full";
+            emit_colored_event(task_name, "compute_group", task_color,
                                start, end, pid, tid);
             continue;
         }
         emit_comma();
-        fprintf(f, "{\"name\":\"compute_e%d\",\"cat\":\"compute_group\",\"cname\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
-                   "\"pid\":%d,\"tid\":%d,\"args\":{\"expert_id\":%d,\"sm_id\":%d,\"group_id\":%d,\"batch_size\":%d,"
+        fprintf(f, "{\"name\":\"compute_e%d_%s\",\"cat\":\"compute_group\",\"cname\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
+                   "\"pid\":%d,\"tid\":%d,\"args\":{\"expert_id\":%d,\"sm_id\":%d,\"group_id\":%d,\"batch_size\":%d,\"batch_kind\":\"%s\","
                    "\"start_slot\":%d,\"end_slot\":%d,\"abs_slot_base\":%lld,\"is_flush_task\":%d,"
                    "\"hidden_size\":%d,\"intermediate_size\":%d,"
                    "\"p1_meta_us\":%.3f,\"p2_input_load_us\":%.3f,\"p3_gateup_gemm_us\":%.3f,"
@@ -8999,7 +9032,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                    "\"pop_done_to_bcast_us\":%.3f,\"bcast_done_to_start_us\":%.3f,"
                    "\"boundary_unattributed_us\":%.3f,\"pop_attempts\":%d,\"cas_failures\":%d,"
                    "\"p6b_multi_expert_rows\":%d,\"p6_task_has_multi\":%d}}",
-                expert_id, task_color, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid, expert_id, sm_id, group_id, batch_size,
+                expert_id, task_kind, task_color, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid, expert_id, sm_id, group_id, batch_size, task_kind,
                 start_slot, end_slot, static_cast<long long>(abs_slot_base), is_flush_task,
                 hidden, intermediate,
                 meta_us, input_us, upgemm_us, downgemm_us, output_us, signal_us,
@@ -10652,6 +10685,38 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
 #undef cudaFree
 }
 
+// Release the forward-only working buffers as soon as the forward output has been cloned
+// out. The backward pass allocates a fresh v7 state and only reuses the saved-activation
+// buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) plus expert_count from this forward
+// state (see allocate_megakernel_backward_state). None of the buffers freed here are read
+// by the backward, so releasing them now removes them from the forward->backward resident
+// set. Each freed pointer is nulled so the eventual free_megakernel_state_v7 skips it
+// (mk_caching_free is null-safe), avoiding a double free.
+void free_megakernel_forward_transient(MegaKernelState* device_state) {
+    if (device_state == nullptr)
+        return;
+    MegaKernelState hs;
+    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    auto free_and_null = [](auto*& ptr) {
+        CUDA_CHECK(mk_caching_free(static_cast<void*>(ptr)));
+        ptr = nullptr;
+    };
+    free_and_null(hs.recv_tokens);
+    free_and_null(hs.compute_output_slot);
+    free_and_null(hs.combine_input);
+    free_and_null(hs.combine_input_topk_weights);
+    free_and_null(hs.combine_input_src_meta);
+    free_and_null(hs.combine_rdma_head_work);
+    free_and_null(hs.combine_nvl_head_work);
+    free_and_null(hs.gemm_workspace);
+    free_and_null(hs.output_accum);
+    free_and_null(hs.send_rdma_head);
+    free_and_null(hs.send_nvl_head);
+    free_and_null(hs.combined_x);
+    free_and_null(hs.combined_topk_weights);
+    CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
+}
+
 void get_megakernel_expert_counts(
     MegaKernelState* device_state,
     int* expert_counts,
@@ -11377,11 +11442,11 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 rec[1] = compute_task_end_ns;
                 rec[2] = sm_id;
                 rec[3] = group_id;
+                rec[5] = batch_size;
                 rec[25] = task.is_flush;
                 rec[26] = 1;
 #if MK_PERF_TRACE_ARGS
                 rec[4] = expert_id;
-                rec[5] = batch_size;
                 rec[6] = hidden;
                 rec[7] = intermediate;
                 rec[8]  = perf_ph_meta_ns;
