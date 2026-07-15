@@ -597,6 +597,19 @@ struct MegaKernelState {
     int64_t* perf_sched_stall_first_unready_slot;
     int64_t* perf_sched_stall_first_unready_ready;
     int64_t* perf_sched_stall_dispatch_done;
+    int64_t* perf_sched_first_done_seen_ts;
+    int64_t* perf_sched_first_recv_count_advance_ts;
+    int64_t* perf_sched_first_recv_count_advance_expert;
+    int64_t* perf_sched_first_recv_count_advance_old;
+    int64_t* perf_sched_first_recv_count_advance_new;
+    int64_t* perf_sched_first_normal_enqueue_attempt_ts;
+    int64_t* perf_sched_first_normal_enqueue_success_ts;
+    int64_t* perf_sched_first_task_publish_ts;
+    int64_t* perf_sched_first_task_source;
+    int64_t* perf_sched_first_task_expert;
+    int64_t* perf_sched_first_task_batch;
+    int64_t* perf_sched_first_task_start_slot;
+    int64_t* perf_sched_first_task_num_tokens;
 #endif
 #if MK_PERF_TRACE_ENABLED
     // Per-compute-task timing buffer (own Perfetto rows per compute group).
@@ -747,6 +760,56 @@ __device__ void device_gemm_bf16(
         for (int k = 0; k < K; k += WMMA_K) {
             wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
             wmma::load_matrix_sync(b_frag, B + col_offset * K + k, K);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        float* c_buf = smem_buf + smem_warp_id * WMMA_M * WMMA_N;
+        wmma::store_matrix_sync(c_buf, c_frag, WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+
+        int lane_id = threadIdx.x % 32;
+        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+            int row = i / WMMA_N;
+            int col = i % WMMA_N;
+            int out_row = row_offset + row;
+            int out_col = col_offset + col;
+            if (out_row < M && out_col < N) {
+                C[out_row * N + out_col] = __float2bfloat16(c_buf[i]);
+            }
+        }
+    }
+}
+
+__device__ void device_gemm_bf16_mn(
+    const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
+    const __nv_bfloat16* __restrict__ B,  // [K, N] row-major
+    __nv_bfloat16* __restrict__ C,        // [M, N] row-major
+    int M, int K, int N,
+    int tile_warp_id, int num_tile_warps,
+    int smem_warp_id,
+    float* smem_buf
+) {
+    const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
+    const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
+    const int total_tiles = tiles_m * tiles_n;
+
+    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
+        int tile_row = tile_idx / tiles_n;
+        int tile_col = tile_idx % tiles_n;
+        int row_offset = tile_row * WMMA_M;
+        int col_offset = tile_col * WMMA_N;
+
+        if (row_offset >= M || col_offset >= N) continue;
+
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        for (int k = 0; k < K; k += WMMA_K) {
+            wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
+            wmma::load_matrix_sync(b_frag, B + k * N + col_offset, N);
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         }
 
@@ -2783,6 +2846,13 @@ __device__ __forceinline__ void scheduler_compute_sync(int num_threads) {
     asm volatile("barrier.sync 3, %0;" :: "r"(num_threads));
 }
 
+#if MK_PERF_TRACE_ARGS
+__device__ __forceinline__ bool mk_perf_record_first_i64(int64_t* slot, int64_t value) {
+    return atomicCAS(reinterpret_cast<unsigned long long*>(slot), 0ULL,
+                     static_cast<unsigned long long>(value)) == 0ULL;
+}
+#endif
+
 __device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_result, int num_threads) {
     if (threadIdx.x == 0)
         *shared_result = 1;
@@ -2794,6 +2864,33 @@ __device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_
     scheduler_compute_sync(num_threads);
     return result;
 }
+
+#if MK_ASYNC_PUBLISH
+__device__ __forceinline__ int scheduler_compute_all_until_publish_done(
+    int predicate, int* shared_result, int num_threads, MegaKernelState* state, int* dispatch_done) {
+    if (threadIdx.x == 0) {
+        if (*dispatch_done == 0 && ld_acquire_global(state->publish_all_done) != 0) {
+            *dispatch_done = 1;
+#if MK_PERF_TRACE_ARGS
+            mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
+#endif
+        }
+        *shared_result = 1;
+    }
+    // Reuse scheduler_compute_all's first barrier to broadcast dispatch_done.
+    scheduler_compute_sync(num_threads);
+    if (*dispatch_done != 0) {
+        if (threadIdx.x == 0)
+            *shared_result = 0;
+    } else if (!predicate) {
+        atomicExch(shared_result, 0);
+    }
+    scheduler_compute_sync(num_threads);
+    int result = *shared_result;
+    scheduler_compute_sync(num_threads);
+    return result;
+}
+#endif
 
 __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens, int is_flush, int source) {
 #if MK_PERF_TRACE_ARGS
@@ -2832,8 +2929,16 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
 #endif
     st_na_release(state->compute_task_tail, tail + 1);
 #if MK_PERF_TRACE_ARGS
+    int64_t publish_visible_ns = globaltimer_ns();
+    if (mk_perf_record_first_i64(state->perf_sched_first_task_publish_ts, publish_visible_ns)) {
+        st_na_global(state->perf_sched_first_task_source, static_cast<int64_t>(source));
+        st_na_global(state->perf_sched_first_task_expert, static_cast<int64_t>(expert_id));
+        st_na_global(state->perf_sched_first_task_batch, static_cast<int64_t>(start_slot / COMPUTE_BATCH_SIZE));
+        st_na_global(state->perf_sched_first_task_start_slot, static_cast<int64_t>(start_slot));
+        st_na_global(state->perf_sched_first_task_num_tokens, static_cast<int64_t>(num_tokens));
+    }
     atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_publish_total_ns),
-              static_cast<unsigned long long>(globaltimer_ns() - publish_start_ns));
+              static_cast<unsigned long long>(publish_visible_ns - publish_start_ns));
 #endif
 }
 
@@ -2846,6 +2951,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
         trap();
     }
     int idx = expert_id * state->max_batches_per_expert + batch_id;
+#if MK_PERF_TRACE_ARGS
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_attempt_ts, globaltimer_ns());
+#endif
     int old_source = atomicCAS(&state->expert_batch_enqueued[idx], 0, source);
 #if MK_PERF_TRACE_ARGS
     if (old_source == 2 && source == 1) {
@@ -2860,7 +2969,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     if (old_source != 0)
         return false;
 #if MK_PERF_TRACE_ARGS
-    state->expert_batch_enqueue_ts[idx] = globaltimer_ns();
+    int64_t enqueue_success_ns = globaltimer_ns();
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_success_ts, enqueue_success_ns);
+    state->expert_batch_enqueue_ts[idx] = enqueue_success_ns;
 #endif
     scheduler_publish_task(state, expert_id, start_slot, num_tokens, is_flush, source);
     return true;
@@ -3275,6 +3387,10 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         }
         scheduler_compute_sync(num_threads);
         bool dispatch_done = (s_dispatch_done != 0);
+#if MK_PERF_TRACE_ARGS
+        if (tid == 0 && dispatch_done)
+            mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
+#endif
 
         if (tail_enqueued)
             break;
@@ -3304,8 +3420,12 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             // scan forward from that point in parallel chunks.
             for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
 #if MK_ASYNC_PUBLISH
-                if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0)
+                if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
                     s_dispatch_done = 1;
+#if MK_PERF_TRACE_ARGS
+                    mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
+#endif
+                }
                 scheduler_compute_sync(num_threads);
                 if (s_dispatch_done != 0)
                     break;
@@ -3327,8 +3447,19 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     if (my_slot < state->expert_count[expert_id]) {
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
-                    // All threads report: if all slots in this wave are ready, advance
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
+                    // Reuse the existing cooperative barriers to broadcast a lane-0
+                    // publish_all_done load; no extra CTA synchronization is added.
+#if MK_ASYNC_PUBLISH
+                    int all_ready = scheduler_compute_all_until_publish_done(
+                        my_ready || (my_slot >= state->expert_count[expert_id]),
+                        &s_compute_all_result, num_threads, state, &s_dispatch_done);
+                    if (s_dispatch_done != 0)
+                        break;
+#else
+                    int all_ready = scheduler_compute_all(
+                        my_ready || (my_slot >= state->expert_count[expert_id]),
+                        &s_compute_all_result, num_threads);
+#endif
                     if (!all_ready) {
                         // Find the first non-ready slot in this wave via warp vote
                         // Thread 0 does a sequential scan of just this wave's portion
@@ -3349,10 +3480,22 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     count += num_threads;
                     if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
                 }
+#if MK_ASYNC_PUBLISH
+                if (s_dispatch_done != 0)
+                    break;
+#endif
 
                 if (tid == 0 && count != old_count) {
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
+#if MK_PERF_TRACE_ARGS
+                    int64_t recv_advance_ns = globaltimer_ns();
+                    if (mk_perf_record_first_i64(state->perf_sched_first_recv_count_advance_ts, recv_advance_ns)) {
+                        st_na_global(state->perf_sched_first_recv_count_advance_expert, static_cast<int64_t>(expert_id));
+                        st_na_global(state->perf_sched_first_recv_count_advance_old, static_cast<int64_t>(old_count));
+                        st_na_global(state->perf_sched_first_recv_count_advance_new, static_cast<int64_t>(count));
+                    }
+#endif
                 }
 #if MK_PERF_TRACE_ARGS
                 if (tid == 0) {
@@ -6267,6 +6410,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
         trap();
     }
     int idx = expert_id * state->max_batches_per_expert + batch_id;
+#if MK_PERF_TRACE_ARGS
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_attempt_ts, globaltimer_ns());
+#endif
     int old_source = atomicCAS(&state->expert_batch_enqueued[idx], 0, source);
 #if MK_PERF_TRACE_ARGS
     if (old_source == 2 && source == 1) {
@@ -6281,7 +6428,10 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     if (old_source != 0)
         return false;
 #if MK_PERF_TRACE_ARGS
-    state->expert_batch_enqueue_ts[idx] = globaltimer_ns();
+    int64_t enqueue_success_ns = globaltimer_ns();
+    if (source == 1)
+        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_success_ts, enqueue_success_ns);
+    state->expert_batch_enqueue_ts[idx] = enqueue_success_ns;
 #endif
     scheduler_publish_task(state, expert_id, start_slot, num_tokens, is_flush, source);
     return true;
@@ -6696,6 +6846,10 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         }
         scheduler_compute_sync(num_threads);
         bool dispatch_done = (s_dispatch_done != 0);
+#if MK_PERF_TRACE_ARGS
+        if (tid == 0 && dispatch_done)
+            mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
+#endif
 
         if (tail_enqueued)
             break;
@@ -6725,8 +6879,12 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             // scan forward from that point in parallel chunks.
             for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
 #if MK_ASYNC_PUBLISH
-                if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0)
+                if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
                     s_dispatch_done = 1;
+#if MK_PERF_TRACE_ARGS
+                    mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
+#endif
+                }
                 scheduler_compute_sync(num_threads);
                 if (s_dispatch_done != 0)
                     break;
@@ -6748,8 +6906,19 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     if (my_slot < state->expert_count[expert_id]) {
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
                     }
-                    // All threads report: if all slots in this wave are ready, advance
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
+                    // Reuse the existing cooperative barriers to broadcast a lane-0
+                    // publish_all_done load; no extra CTA synchronization is added.
+#if MK_ASYNC_PUBLISH
+                    int all_ready = scheduler_compute_all_until_publish_done(
+                        my_ready || (my_slot >= state->expert_count[expert_id]),
+                        &s_compute_all_result, num_threads, state, &s_dispatch_done);
+                    if (s_dispatch_done != 0)
+                        break;
+#else
+                    int all_ready = scheduler_compute_all(
+                        my_ready || (my_slot >= state->expert_count[expert_id]),
+                        &s_compute_all_result, num_threads);
+#endif
                     if (!all_ready) {
                         // Find the first non-ready slot in this wave via warp vote
                         // Thread 0 does a sequential scan of just this wave's portion
@@ -6770,10 +6939,22 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                     count += num_threads;
                     if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
                 }
+#if MK_ASYNC_PUBLISH
+                if (s_dispatch_done != 0)
+                    break;
+#endif
 
                 if (tid == 0 && count != old_count) {
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
+#if MK_PERF_TRACE_ARGS
+                    int64_t recv_advance_ns = globaltimer_ns();
+                    if (mk_perf_record_first_i64(state->perf_sched_first_recv_count_advance_ts, recv_advance_ns)) {
+                        st_na_global(state->perf_sched_first_recv_count_advance_expert, static_cast<int64_t>(expert_id));
+                        st_na_global(state->perf_sched_first_recv_count_advance_old, static_cast<int64_t>(old_count));
+                        st_na_global(state->perf_sched_first_recv_count_advance_new, static_cast<int64_t>(count));
+                    }
+#endif
                 }
 #if MK_PERF_TRACE_ARGS
                 if (tid == 0) {
@@ -7798,6 +7979,13 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     int64_t sched_max_ready_tail_gap = 0, sched_stall_expert = -1, sched_stall_recv_count = 0;
     int64_t sched_stall_alloc_count = 0, sched_stall_enqueue_cursor = 0;
     int64_t sched_stall_first_unready_slot = -1, sched_stall_first_unready_ready = 0, sched_stall_dispatch_done = 0;
+    int64_t sched_first_done_seen_ts = 0, sched_first_recv_count_advance_ts = 0;
+    int64_t sched_first_recv_count_advance_expert = -1, sched_first_recv_count_advance_old = -1;
+    int64_t sched_first_recv_count_advance_new = -1;
+    int64_t sched_first_normal_enqueue_attempt_ts = 0, sched_first_normal_enqueue_success_ts = 0;
+    int64_t sched_first_task_publish_ts = 0, sched_first_task_source = 0;
+    int64_t sched_first_task_expert = -1, sched_first_task_batch = -1;
+    int64_t sched_first_task_start_slot = -1, sched_first_task_num_tokens = 0;
     CUDA_CHECK(cudaMemcpy(sched_ts.data(), host_state.perf_sched_ts, 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_scan_ns, host_state.perf_sched_scan_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_enqueue_ns, host_state.perf_sched_enqueue_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -7832,6 +8020,19 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_slot, host_state.perf_sched_stall_first_unready_slot, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_ready, host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&sched_stall_dispatch_done, host_state.perf_sched_stall_dispatch_done, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_done_seen_ts, host_state.perf_sched_first_done_seen_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_ts, host_state.perf_sched_first_recv_count_advance_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_expert, host_state.perf_sched_first_recv_count_advance_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_old, host_state.perf_sched_first_recv_count_advance_old, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_new, host_state.perf_sched_first_recv_count_advance_new, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_normal_enqueue_attempt_ts, host_state.perf_sched_first_normal_enqueue_attempt_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_normal_enqueue_success_ts, host_state.perf_sched_first_normal_enqueue_success_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_publish_ts, host_state.perf_sched_first_task_publish_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_source, host_state.perf_sched_first_task_source, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_expert, host_state.perf_sched_first_task_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_batch, host_state.perf_sched_first_task_batch, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_start_slot, host_state.perf_sched_first_task_start_slot, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sched_first_task_num_tokens, host_state.perf_sched_first_task_num_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
 
     // Root-cause diagnostic parallel arrays: multi-expert rows.
     const int diag_n = compute_task_count > 0 ? compute_task_count : 1;
@@ -8037,6 +8238,12 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                                     int64_t stall_first_unready_ready, int64_t stall_dispatch_done) {
         if (start == 0 || end == 0 || end <= start) return;
         int64_t ts_ns = start - base_ts;
+        auto trace_ts_us = [&](int64_t value) -> double {
+            return value > 0 ? (value - base_ts) / 1000.0 : -1.0;
+        };
+        auto sched_delta_us = [&](int64_t value) -> double {
+            return value > 0 && sched_ts[0] > 0 ? (value - sched_ts[0]) / 1000.0 : -1.0;
+        };
         int64_t dur_ns = end - start;
         if (dur_ns <= 0) dur_ns = 1;
         if (!emit_perf_args) {
@@ -8058,7 +8265,16 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                    "\"max_ready_tail_gap\":%lld,\"stall_expert\":%lld,\"stall_recv_count\":%lld,"
                    "\"stall_alloc_count\":%lld,\"stall_enqueue_cursor\":%lld,"
                    "\"stall_first_unready_slot\":%lld,\"stall_first_unready_ready\":%lld,"
-                   "\"stall_dispatch_done\":%lld}}",
+                   "\"stall_dispatch_done\":%lld,"
+                   "\"async_publish_all_done_ts_us\":%.3f,\"sched_start_to_publish_all_done_us\":%.3f,"
+                   "\"first_done_seen_ts_us\":%.3f,\"sched_start_to_first_done_seen_us\":%.3f,"
+                   "\"first_recv_count_advance_ts_us\":%.3f,\"sched_start_to_first_recv_count_advance_us\":%.3f,"
+                   "\"first_recv_count_advance_expert\":%lld,\"first_recv_count_advance_old\":%lld,\"first_recv_count_advance_new\":%lld,"
+                   "\"first_normal_enqueue_attempt_ts_us\":%.3f,\"sched_start_to_first_normal_enqueue_attempt_us\":%.3f,"
+                   "\"first_normal_enqueue_success_ts_us\":%.3f,\"sched_start_to_first_normal_enqueue_success_us\":%.3f,"
+                   "\"first_task_publish_ts_us\":%.3f,\"sched_start_to_first_task_publish_us\":%.3f,"
+                   "\"first_task_source\":%lld,\"first_task_expert\":%lld,\"first_task_batch\":%lld,"
+                   "\"first_task_start_slot\":%lld,\"first_task_num_tokens\":%lld}}",
                 name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
                 COMPUTE_SCHEDULER_SMS, scan_ns / 1000.0, enqueue_ns / 1000.0, idle_ns / 1000.0,
                 priority_ns / 1000.0, normal_ns / 1000.0, tail_flush_ns / 1000.0,
@@ -8075,7 +8291,19 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
                 static_cast<long long>(stall_expert), static_cast<long long>(stall_recv_count),
                 static_cast<long long>(stall_alloc_count), static_cast<long long>(stall_enqueue_cursor),
                 static_cast<long long>(stall_first_unready_slot), static_cast<long long>(stall_first_unready_ready),
-                static_cast<long long>(stall_dispatch_done));
+                static_cast<long long>(stall_dispatch_done),
+                trace_ts_us(async_publish_all_done_ts), sched_delta_us(async_publish_all_done_ts),
+                trace_ts_us(sched_first_done_seen_ts), sched_delta_us(sched_first_done_seen_ts),
+                trace_ts_us(sched_first_recv_count_advance_ts), sched_delta_us(sched_first_recv_count_advance_ts),
+                static_cast<long long>(sched_first_recv_count_advance_expert),
+                static_cast<long long>(sched_first_recv_count_advance_old),
+                static_cast<long long>(sched_first_recv_count_advance_new),
+                trace_ts_us(sched_first_normal_enqueue_attempt_ts), sched_delta_us(sched_first_normal_enqueue_attempt_ts),
+                trace_ts_us(sched_first_normal_enqueue_success_ts), sched_delta_us(sched_first_normal_enqueue_success_ts),
+                trace_ts_us(sched_first_task_publish_ts), sched_delta_us(sched_first_task_publish_ts),
+                static_cast<long long>(sched_first_task_source), static_cast<long long>(sched_first_task_expert),
+                static_cast<long long>(sched_first_task_batch), static_cast<long long>(sched_first_task_start_slot),
+                static_cast<long long>(sched_first_task_num_tokens));
     };
     // Dispatch sender/forwarder work event with full publish breakdown as args (us).
     auto emit_event_publish = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
@@ -10320,6 +10548,32 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_first_unready_ready, 0, sizeof(int64_t)));
     CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_dispatch_done, sizeof(int64_t)));
     CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_dispatch_done, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_done_seen_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_done_seen_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_expert, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_expert, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_old, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_old, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_new, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_new, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_normal_enqueue_attempt_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_normal_enqueue_attempt_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_normal_enqueue_success_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_normal_enqueue_success_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_publish_ts, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_publish_ts, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_source, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_source, 0, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_expert, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_expert, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_batch, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_batch, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_start_slot, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_start_slot, 0xff, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_num_tokens, sizeof(int64_t)));
+    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_num_tokens, 0, sizeof(int64_t)));
 
     // Root-cause diagnostic parallel arrays (one entry per compute-task slot).
     const size_t diag_i64_bytes = (size_t)max_compute_tasks * sizeof(int64_t);
@@ -10702,6 +10956,19 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_slot));
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_ready));
     CUDA_CHECK(cudaFree(host_state.perf_sched_stall_dispatch_done));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_done_seen_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_expert));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_old));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_new));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_normal_enqueue_attempt_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_normal_enqueue_success_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_publish_ts));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_source));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_expert));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_batch));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_start_slot));
+    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_num_tokens));
     CUDA_CHECK(cudaFree(host_state.perf_compute_multi_expert_rows));
     CUDA_CHECK(cudaFree(host_state.perf_compute_task_has_multi));
     CUDA_CHECK(cudaFree(host_state.perf_task_publish_ts));
@@ -10832,17 +11099,16 @@ void launch_megakernel_debug_forward(
 //   grad_down = combine_input row for this recv_token (filled by the re-run dispatch)
 //   X_perm    = fwd.bwd_fc1_input[recv_token]
 //   GU        = X_perm @ W_gateup^T           [M, 2I]   gate=GU[:,0::2], up=GU[:,1::2]
-//   grad_act  = grad_down @ W_down            [M, I]    (uses W_down_T)
+//   grad_act  = grad_down @ W_down            [M, I]
 //   SwiGLU bwd (route folded in fwd act = silu(gate)*up*route):
 //     g_pre=grad_act*route ; g_up=g_pre*silu(gate) ; g_gate=g_pre*up*silu'(gate)
 //   grad_gu   = interleave(g_gate, g_up)      [M, 2I]
-//   grad_xperm= grad_gu @ W_gateup            [M, hidden] (uses W_gateup_T)
+//   grad_xperm= grad_gu @ W_gateup            [M, hidden]
 //   -> written to compute_output_slot/combine_input exactly like the forward down output,
 //      then the reused combine reduces it into combined_x = grad_input.
 //
-// GEMMs use the WMMA primitive device_gemm_bf16 (C = A @ B^T); the two contractions needing
-// the "other" weight orientation use pre-transposed copies W_gateup_T [E,hidden,2I] and
-// W_down_T [E,I,hidden] built at setup.
+// UMMA dgrad consumes original weights as MN-major B operands, matching DeepGEMM's
+// layout handling, so no physical W_gateup_T/W_down_T materialization is needed.
 // ============================================================================
 
 struct MegaKernelBackwardState {
@@ -10851,8 +11117,6 @@ struct MegaKernelBackwardState {
 
     const __nv_bfloat16* bwd_fc1_input;   // fwd.bwd_fc1_input [max_total_recv_tokens, hidden] (X by recv_token)
     const __nv_bfloat16* bwd_preact;      // fwd.bwd_preact [max_total_recv_tokens, num_topk, 2I]
-    const __nv_bfloat16* W_gateup_T;      // [E, hidden, 2I]
-    const __nv_bfloat16* W_down_T;        // [E, I, hidden]
     umma::ComputeBackwardTmaAtoms* compute_bwd_tma;
     CUtensorMap* wgrad_dgu_a_tma;         // [num_local_experts * max_batches_per_expert] batch-start A descs for wgrad_dgu_slot
 
@@ -10911,30 +11175,6 @@ __global__ void trace_backward_boundary_kernel(
     //        *state->compute_task_head, *state->compute_task_tail, *state->compute_enqueue_done,
     //        *state->gather_ready_head, *state->gather_ready_tail,
     //        *state->dispatch_done, *state->combine_all_done);
-}
-
-__global__ void bwd_transpose_weights_kernel(
-    const __nv_bfloat16* __restrict__ Wgu,   // [E, 2I, hidden]
-    const __nv_bfloat16* __restrict__ Wd,    // [E, hidden, I]
-    __nv_bfloat16* __restrict__ Wgu_T,       // [E, hidden, 2I]
-    __nv_bfloat16* __restrict__ Wd_T,        // [E, I, hidden]
-    int twoI, int hidden, int intermediate
-) {
-    const int e = blockIdx.x;
-    const __nv_bfloat16* Wgu_e = Wgu + (size_t)e * twoI * hidden;
-    __nv_bfloat16* WguT_e = Wgu_T + (size_t)e * hidden * twoI;
-    for (int idx = threadIdx.x; idx < twoI * hidden; idx += blockDim.x) {
-        int r = idx / hidden;      // row in [0,2I)
-        int h = idx - r * hidden;  // col in [0,hidden)
-        WguT_e[(size_t)h * twoI + r] = Wgu_e[(size_t)r * hidden + h];
-    }
-    const __nv_bfloat16* Wd_e = Wd + (size_t)e * hidden * intermediate;
-    __nv_bfloat16* WdT_e = Wd_T + (size_t)e * intermediate * hidden;
-    for (int idx = threadIdx.x; idx < hidden * intermediate; idx += blockDim.x) {
-        int h = idx / intermediate;      // row in [0,hidden)
-        int i = idx - h * intermediate;  // col in [0,I)
-        WdT_e[(size_t)i * hidden + h] = Wd_e[(size_t)h * intermediate + i];
-    }
 }
 
 __device__ __forceinline__ float mk_bwd_bf16_from_u32(uint32_t v, int lane) {
@@ -11182,8 +11422,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 cute::prefetch_tma_descriptor(&prefetch_atom.act_cd);
                 cute::prefetch_tma_descriptor(&prefetch_atom.gu_a);
                 cute::prefetch_tma_descriptor(&prefetch_atom.down_cd);
-                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wdown_t[expert_id]);
-                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wgateup_t[expert_id]);
+                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wdown[expert_id]);
+                cute::prefetch_tma_descriptor(&bs->compute_bwd_tma->wgateup[expert_id]);
             }
         }
 
@@ -11241,9 +11481,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
                                   batch_size * hidden, state->rank, task_idx, expert_id, batch_size);
         }
 
-        const __nv_bfloat16* Wgu_e  = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
-        const __nv_bfloat16* WguT_e = &bs->W_gateup_T[(size_t)expert_id * hidden * twoI];        // [hidden,2I]
-        const __nv_bfloat16* WdT_e  = &bs->W_down_T[(size_t)expert_id * intermediate * hidden];  // [I,hidden]
+        const __nv_bfloat16* Wgu_e = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
+        const __nv_bfloat16* Wd_e  = &state->W_down[(size_t)expert_id * hidden * intermediate]; // [hidden,I]
 
         // Saved-PreAct path skips the PreAct->GU gather: dSwiGLU below reads gate/up
         // directly from bs->bwd_preact by (recv_token, topk_slot) and writes dGU
@@ -11266,9 +11505,9 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
             uint32_t grad_act_accum_iter = 0;
             umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
-            umma::umma_down_persistent(
+            umma::umma_dgrad_mn_persistent(
                 &in_atom.a,
-                &bs->compute_bwd_tma->wdown_t[expert_id],
+                &bs->compute_bwd_tma->wdown[expert_id],
                 &in_atom.act_cd,
                 COMPUTE_BATCH_SIZE, intermediate, hidden,
                 cluster_in_group, num_clusters,
@@ -11279,8 +11518,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
             compute_group_sync(state, group_id, group_size);
         } else {
-            device_gemm_bf16(input_buf, WdT_e, up_buf, batch_size, hidden, intermediate,
-                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            device_gemm_bf16_mn(input_buf, Wd_e, up_buf, batch_size, hidden, intermediate,
+                                group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -11378,9 +11617,9 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 &bs->wgrad_dgu_a_tma[(int64_t)expert_id * state->max_batches_per_expert + dgu_batch_id];
             uint32_t grad_x_accum_iter = 0;
             umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
-            umma::umma_down_persistent(
+            umma::umma_dgrad_mn_persistent(
                 dgu_a_tma,
-                &bs->compute_bwd_tma->wgateup_t[expert_id],
+                &bs->compute_bwd_tma->wgateup[expert_id],
                 &in_atom.down_cd,
                 batch_size, hidden, twoI,
                 cluster_in_group, num_clusters,
@@ -11391,8 +11630,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
             compute_group_sync(state, group_id, group_size);
         } else {
-            device_gemm_bf16(dgu_dst, WguT_e, down_buf, batch_size, twoI, hidden,
-                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
+            device_gemm_bf16_mn(dgu_dst, Wgu_e, down_buf, batch_size, twoI, hidden,
+                                group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
@@ -11619,8 +11858,6 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
-    void* W_gateup_T,
-    void* W_down_T,
     int total_sms,
     cudaStream_t stream
 ) {
@@ -11648,21 +11885,11 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     }
     if (total_bwd_slots == 0) total_bwd_slots = 1;
 
-    // Transposed weights are owned by Torch tensors allocated by the caller. The backward
-    // state borrows their pointers and never frees them.
-    EP_HOST_ASSERT(W_gateup_T != nullptr && W_down_T != nullptr);
-    auto* Wgu_T = reinterpret_cast<__nv_bfloat16*>(W_gateup_T);
-    auto* Wd_T = reinterpret_cast<__nv_bfloat16*>(W_down_T);
-    bwd_transpose_weights_kernel<<<num_local_experts, 256, 0, stream>>>(
-        fs.W_gateup, fs.W_down, Wgu_T, Wd_T, twoI, hidden, intermediate);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
     umma::ComputeBackwardTmaAtoms* d_compute_bwd_tma = nullptr;
     if (num_local_experts <= umma::kMaxLocalExperts) {
         umma::ComputeBackwardTmaAtoms h_bwd_atoms;
         umma::build_compute_backward_tma_atoms(
-            h_bwd_atoms, Wd_T, Wgu_T, num_local_experts, hidden, intermediate);
+            h_bwd_atoms, fs.W_down, fs.W_gateup, num_local_experts, hidden, intermediate);
         CUDA_CHECK(mk_caching_alloc(
             reinterpret_cast<void**>(&d_compute_bwd_tma), sizeof(umma::ComputeBackwardTmaAtoms)));
         CUDA_CHECK(cudaMemcpyAsync(d_compute_bwd_tma, &h_bwd_atoms,
@@ -11705,8 +11932,6 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.bwd_device_state = bwd_device_state;
     hs.bwd_fc1_input = fs.bwd_fc1_input;
     hs.bwd_preact = fs.bwd_preact;
-    hs.W_gateup_T = Wgu_T;
-    hs.W_down_T = Wd_T;
     hs.compute_bwd_tma = d_compute_bwd_tma;
     hs.grad_output = reinterpret_cast<const __nv_bfloat16*>(grad_output);
     hs.grad_input = reinterpret_cast<__nv_bfloat16*>(grad_input);
@@ -11764,7 +11989,7 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     EP_HOST_ASSERT(device_bs != nullptr);
     MegaKernelBackwardState hs;
     CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
-    // Transposed weights and wgrad_* buffers are borrowed from caller-owned Torch tensors.
+    // wgrad_* buffers are borrowed from caller-owned Torch tensors.
     CUDA_CHECK(mk_caching_free(hs.compute_bwd_tma));
     CUDA_CHECK(mk_caching_free(hs.wgrad_dgu_a_tma));
     free_megakernel_state_v7(hs.bwd_device_state);
@@ -11783,15 +12008,15 @@ void prepare_megakernel_communication_replay(
     CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     const int combine_hidden_int4 = hs.combine_hidden / (sizeof(int4) / sizeof(__nv_bfloat16));
 
-    // Use the same cached notify path as ordinary DeepEP dispatch/combine. Besides the
-    // cross-rank barriers, this owns the exact RDMA/NVL metadata layout and cleanup sizes.
-    internode::cached_notify_mk(
+    // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
+    // Besides the cross-rank barriers, this owns the same RDMA/NVL metadata layout and cleanup sizes.
+    internode::mk_cached_notfy(
         hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
         hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
         hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
         stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
-    internode::cached_notify(
+    internode::mk_cached_notfy(
         combine_hidden_int4, 0, 0, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, hs.num_tokens,
         hs.send_rdma_head, hs.combine_rdma_channel_prefix_matrix,
@@ -11934,12 +12159,22 @@ static void reset_megakernel_perf_trace_state(const MegaKernelState& hs, cudaStr
         hs.perf_sched_stall_recv_count, hs.perf_sched_stall_alloc_count,
         hs.perf_sched_stall_enqueue_cursor, hs.perf_sched_stall_first_unready_ready,
         hs.perf_sched_stall_dispatch_done,
+        hs.perf_sched_first_done_seen_ts, hs.perf_sched_first_recv_count_advance_ts,
+        hs.perf_sched_first_normal_enqueue_attempt_ts, hs.perf_sched_first_normal_enqueue_success_ts,
+        hs.perf_sched_first_task_publish_ts, hs.perf_sched_first_task_source,
+        hs.perf_sched_first_task_num_tokens,
     };
     for (int64_t* p : sched_zero) z(p, sizeof(int64_t));
     f(hs.perf_sched_publish_wait_max_tail, sizeof(int64_t));
     f(hs.perf_sched_publish_wait_max_visible_tail, sizeof(int64_t));
     f(hs.perf_sched_stall_expert, sizeof(int64_t));
     f(hs.perf_sched_stall_first_unready_slot, sizeof(int64_t));
+    f(hs.perf_sched_first_recv_count_advance_expert, sizeof(int64_t));
+    f(hs.perf_sched_first_recv_count_advance_old, sizeof(int64_t));
+    f(hs.perf_sched_first_recv_count_advance_new, sizeof(int64_t));
+    f(hs.perf_sched_first_task_expert, sizeof(int64_t));
+    f(hs.perf_sched_first_task_batch, sizeof(int64_t));
+    f(hs.perf_sched_first_task_start_slot, sizeof(int64_t));
 
     int64_t* const diag_zero[] = {
         hs.perf_task_publish_ts, hs.perf_task_pop_start_ts, hs.perf_task_pop_done_ts,

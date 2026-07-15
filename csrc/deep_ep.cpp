@@ -2311,7 +2311,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     //   NVL   combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
     {
         void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
-        internode::cached_notify_mk(hidden_int4,
+        internode::mk_cached_notfy(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
                                  num_topk,   // num_topk_weights
@@ -2610,17 +2610,12 @@ Buffer::megakernel_debug_backward(
     auto scratch_dgu_backing = torch::empty(
         {(int64_t)scratch_slots + compute_batch_size, two_i}, bf16_options);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, scratch_slots);
-    auto W_gateup_T = torch::empty(
-        {num_local_experts, hidden, two_i}, bf16_options);
-    auto W_down_T = torch::empty(
-        {num_local_experts, intermediate, hidden}, bf16_options);
     auto stream = at::cuda::getCurrentCUDAStream();
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
         scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
-        scratch_dgu_backing.data_ptr(), W_gateup_T.data_ptr(), W_down_T.data_ptr(),
-        total_sms, stream);
+        scratch_dgu_backing.data_ptr(), total_sms, stream);
     megakernel_debug::prepare_megakernel_backward_communication_replay(
         backward_state, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);

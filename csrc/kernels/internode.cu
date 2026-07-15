@@ -986,7 +986,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 // #endif
                 if (lane_id == src_rdma_rank) {
                     auto cached_head = is_in_dst_nvl_rank ? rdma_nvl_token_idx : -1;
-                    int rdma_nvl_before = rdma_nvl_token_idx;
+                    // int rdma_nvl_before = rdma_nvl_token_idx;
                     rdma_nvl_token_idx += is_in_dst_nvl_rank;
                     if (not kCachedMode) {
                         send_nvl_head[i * NUM_MAX_NVL_PEERS] = cached_head;
@@ -1444,21 +1444,11 @@ __global__ void cached_notify(const int rdma_clean_offset,
             int last_head = 1 << 25;
             for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
                 auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
-                int last_before = last_head;
-                int normalized_head;
                 if (current_head < 0) {
-                    normalized_head = -last_head - 1;
-                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = normalized_head;
+                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
                 } else {
-                    normalized_head = current_head;
                     last_head = current_head;
                 }
-// #ifdef MK_TOKEN_TRACE
-//                 printf("[DEEPEP-DIAG][COMBINE-RDMA-HEAD-NORM] rank=%d rdma_rank=%d nvl_rank=%d ch=%d src_rdma_lane=%d token=%d raw=%d norm=%d stored=%d last_before=%d last_after=%d token_range=[%d,%d)\n",
-//                        rank, rdma_rank, nvl_rank, warp_id, lane_id, token_idx, current_head, normalized_head,
-//                        __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id), last_before, last_head,
-//                        token_start_idx, token_end_idx);
-// #endif
             }
         }
     } else {
@@ -1492,16 +1482,6 @@ __global__ void cached_notify(const int rdma_clean_offset,
                 int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
                 int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
                 token_start_idx += shift, token_end_idx += shift;
-// #ifdef MK_TOKEN_TRACE
-//                 if (lane_id == 0 && (token_start_idx < 0 || token_end_idx < token_start_idx ||
-//                                      token_end_idx > num_combined_tokens)) {
-//                     printf("[DEEPEP-DIAG][COMBINE-NVL-NORM-RANGE-INVALID] rank=%d rdma_rank=%d nvl_rank=%d sm=%d ch=%d dst_rdma=%d prefix_start=%d prefix_end=%d shift=%d shifted_start=%d shifted_end=%d num_combined_tokens=%d num_channels=%d rdma_prefix=%p rdma_sum=%p combined_nvl_head=%p\n",
-//                            rank, rdma_rank, nvl_rank, sm_id, warp_id, dst_rdma_rank,
-//                            token_start_idx - shift, token_end_idx - shift, shift,
-//                            token_start_idx, token_end_idx, num_combined_tokens, num_channels,
-//                            rdma_channel_prefix_matrix, rdma_rank_prefix_sum, combined_nvl_head);
-//                 }
-// #endif
 
                 // NOTES: `1 << 25` is a heuristic large number
                 int last_head = 1 << 25;
@@ -1522,32 +1502,12 @@ __global__ void cached_notify(const int rdma_clean_offset,
                         if (lane_id < NUM_MAX_NVL_PEERS) {
                             auto current_head =
                                 reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
-                            int last_before = last_head;
-                            int normalized_head;
                             if (current_head < 0) {
-                                normalized_head = -last_head - 1;
                                 reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
-                                    normalized_head;
+                                    -last_head - 1;
                             } else {
-                                normalized_head = current_head;
                                 last_head = current_head;
                             }
-// #ifdef MK_TOKEN_TRACE
-//                             if (token_idx < 0 || token_idx >= num_combined_tokens) {
-//                                 printf("[DEEPEP-DIAG][COMBINE-NVL-NORM-HEAD-SUSPICIOUS] rank=%d rdma_rank=%d nvl_rank=%d sm=%d ch=%d dst_rdma=%d token=%d lane_nvl=%d raw=%d norm=%d last_before=%d last_after=%d num_combined_tokens=%d shifted_range=[%d,%d) batch_range=[%d,%d) tma_buffer=%p head_addr=%p\n",
-//                                        rank, rdma_rank, nvl_rank, sm_id, warp_id, dst_rdma_rank,
-//                                        token_idx, lane_id, current_head, normalized_head, last_before, last_head,
-//                                        num_combined_tokens, token_start_idx, token_end_idx,
-//                                        batch_start_idx, batch_end_idx, tma_buffer,
-//                                        combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
-//                             }
-//                             printf("[DEEPEP-DIAG][COMBINE-NVL-HEAD-NORM] rank=%d rdma_rank=%d nvl_rank=%d ch=%d dst_rdma=%d token=%d lane_nvl=%d raw=%d norm=%d stored=%d last_before=%d last_after=%d shifted_range=[%d,%d) batch_range=[%d,%d) head_ptr=%p\n",
-//                                    rank, rdma_rank, nvl_rank, warp_id, dst_rdma_rank, token_idx, lane_id,
-//                                    current_head, normalized_head,
-//                                    reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id],
-//                                    last_before, last_head, token_start_idx, token_end_idx, batch_start_idx, batch_end_idx,
-//                                    combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
-// #endif
                         }
                     }
                     tma_store_fence();
@@ -1636,52 +1596,38 @@ void cached_notify(int hidden_int4,
                   cpu_rdma_team);
 }
 
-// Megakernel-specific launcher for the cached_notify kernel (above). The stock cached_notify
-// host sizes num_threads = 32 * num_channels and dynamic smem = 8192 * num_warps, which exceeds
-// the 1024 threads/block and per-block shared-memory limits once logical channels expand
-// (num_channels = num_physical_channels * stage, stage>1) — this is exactly the
-// cudaFuncSetAttribute failure at stage>1.
-//
-// The megakernel only uses cached_notify in clean+barrier mode (is_cached_dispatch=true,
-// num_combined_tokens=0, null head/prefix pointers): the sm_id>=1 head-normalization warps
-// return early (see the kernel), so they never touch the per-channel TMA shared memory nor the
-// `num_warps >= num_channels` device assert, and only sm_id==0 (RDMA/NVL clean + cross-rank
-// barrier) runs. That path works with any thread count and needs no dynamic shared memory.
-// So we launch the SAME kernel with a fixed geometry that is independent of num_channels.
-// The original DeepEP cached_notify (kernel and host) is left untouched.
-void cached_notify_mk(int hidden_int4,
-                      int num_scales,
-                      int num_topk_idx,
-                      int num_topk_weights,
-                      int num_ranks,
-                      int num_channels,
-                      int num_combined_tokens,
-                      int* combined_rdma_head,
-                      const int* rdma_channel_prefix_matrix,
-                      const int* rdma_rank_prefix_sum,
-                      int* combined_nvl_head,
-                      void* rdma_buffer_ptr,
-                      int num_max_rdma_chunked_recv_tokens,
-                      void** buffer_ptrs,
-                      int num_max_nvl_chunked_recv_tokens,
-                      int** barrier_signal_ptrs,
-                      int rank,
-                      cudaStream_t stream,
-                      int64_t num_rdma_bytes,
-                      int64_t num_nvl_bytes,
-                      bool is_cached_dispatch,
-                      bool low_latency_mode) {
-    // This variant only supports the clean+barrier path used by the megakernel.
-    EP_HOST_ASSERT(is_cached_dispatch && "cached_notify_mk only supports clean+barrier (is_cached_dispatch=true)");
+// Megakernel-specific cached notify launcher. Keep the stock cached_notify host path
+// reserved for original DeepEP. Clean-only megakernel replays use fixed geometry to avoid
+// logical-channel expansion exceeding per-block limits; head-normalization replays use the
+// standard geometry but still go through this separate megakernel entry point.
+void mk_cached_notfy(int hidden_int4,
+                     int num_scales,
+                     int num_topk_idx,
+                     int num_topk_weights,
+                     int num_ranks,
+                     int num_channels,
+                     int num_combined_tokens,
+                     int* combined_rdma_head,
+                     const int* rdma_channel_prefix_matrix,
+                     const int* rdma_rank_prefix_sum,
+                     int* combined_nvl_head,
+                     void* rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens,
+                     void** buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens,
+                     int** barrier_signal_ptrs,
+                     int rank,
+                     cudaStream_t stream,
+                     int64_t num_rdma_bytes,
+                     int64_t num_nvl_bytes,
+                     bool is_cached_dispatch,
+                     bool low_latency_mode) {
     const int kNumTMABytesPerWarp = 8192;
-    // Fixed, num_channels-independent geometry. 512 threads is ample for the sm_id==0 clean
-    // loops (strided over the clean range) and the barrier (uses thread 0/32 and <=NUM_MAX_NVL_PEERS);
-    // the head-normalization TMA shared memory is unused in clean+barrier mode, so request none.
-    const int num_threads = 512;
-    const int smem_size = 0;
+    const int num_threads = is_cached_dispatch ? 512 : std::max(128, 32 * num_channels);
+    const int num_warps = num_threads / 32;
+    const int smem_size = is_cached_dispatch ? 0 : kNumTMABytesPerWarp * num_warps;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
-    // Get clean meta (identical to cached_notify)
     auto rdma_clean_meta = get_rdma_clean_meta(
         hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4,
@@ -1699,7 +1645,6 @@ void cached_notify_mk(int hidden_int4,
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
-    // Launch the same kernel with fixed geometry (no dynamic smem).
     auto cached_notify_func = low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp> : cached_notify<false, kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(cached_notify_func);

@@ -186,6 +186,11 @@ inline CUtensorMap dg_make_b_desc(const __nv_bfloat16* b, int N, int K) {
     return dg_make_tma_2d(b, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, K, N,
                           kDgBlockK, kDgLoadBlockN, K, sizeof(__nv_bfloat16), kDgSwizzleB);
 }
+// B: [K,N] MN-major. inner=N outer=K. smem inner=LOAD_BLOCK_N outer=BLOCK_K.
+inline CUtensorMap dg_make_b_mn_desc(const __nv_bfloat16* b, int N, int K) {
+    return dg_make_tma_2d(b, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, N, K,
+                          kDgLoadBlockN, kDgBlockK, N, sizeof(__nv_bfloat16), kDgSwizzleB);
+}
 // CD: [M,N] row-major BF16. inner=N outer=M, smem inner=STORE_BLOCK_N outer=STORE_BLOCK_M.
 inline CUtensorMap dg_make_cd_desc(const __nv_bfloat16* d, int M, int N) {
     return dg_make_tma_2d(d, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, N, M,
@@ -473,7 +478,8 @@ __device__ void dg_dealloc_tmem(char* cluster_smem) {
     else __syncthreads();
 }
 
-template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1, bool kFuseSwiGLUInterleaved = false>
+template <bool kFuseSwiGLU, uint32_t kNumMulticast = 1, bool kFuseSwiGLUInterleaved = false,
+          cute::UMMA::Major kMajorB = cute::UMMA::Major::K>
 __device__ void dg_gemm_tile(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
     int m_block, int n_block,
@@ -651,8 +657,13 @@ __device__ void dg_gemm_tile(
             tma::copy<BLOCK_K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
                 desc_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
             MK_DG_DBG("TMA: k=%u before copy B k_idx=%u n_idx=%u smem=%p", k_block_idx, k_idx, load_n_idx, (void*)smem_b[stage_idx]);
-            tma::copy<BLOCK_K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
-                desc_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+            if constexpr (kMajorB == cute::UMMA::Major::K) {
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                    desc_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+            } else {
+                tma::copy<LOAD_BLOCK_N, BLOCK_K, kDgSwizzleB, cutlass::bfloat16_t>(
+                    desc_b, full_barriers[stage_idx], smem_b[stage_idx], load_n_idx, k_idx, kNumMulticast);
+            }
             MK_DG_DBG("TMA: k=%u after copy AB, arrive_tx", k_block_idx);
             constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
             if (is_leader_cta)
@@ -668,15 +679,15 @@ __device__ void dg_gemm_tile(
         // Condition: kNumStages >= 8 and Normal GEMM and K-major A and B. For our
         // kNumStages=4 this is always false, so kNumStagesPerMerge=1 and BLOCK_ATOM_K=BLOCK_K.
         // We keep the full structure so future kNumStages_ >= 8 configs work correctly.
-        constexpr bool kDoMergeStages = (kNumStages >= 8);
+        constexpr bool kDoMergeStages = (kNumStages >= 8 && kMajorB == cute::UMMA::Major::K);
         constexpr uint32_t kNumMinStages = 8;
         constexpr uint32_t kNumStagesPerMerge = kDoMergeStages ? kNumStages / kNumMinStages : 1;
         constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
 
         auto instr_desc = cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
-                                                      UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+                                                      UMMA_M, UMMA_N, cute::UMMA::Major::K, kMajorB>();
         auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_ATOM_K, kDgSwizzleA>(smem_a[0], 0, 0);
-        auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_ATOM_K, kDgSwizzleB>(smem_b[0], 0, 0);
+        auto b_desc = mma::sm100::make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_ATOM_K, kDgSwizzleB>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -722,7 +733,7 @@ __device__ void dg_gemm_tile(
                     constexpr uint32_t kInnerKIdx = kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
                     a_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
                                     a_base, kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K, kInnerKIdx);
-                    b_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                    b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
                                     b_base, kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K, kInnerKIdx);
                     mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
                                kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
@@ -822,7 +833,8 @@ __device__ void dg_gemm_tile(
 //                gate->up passes (caller threads it through both calls).
 //   A closing block_or_cluster_sync() ensures all warps finish before return.
 // ===========================================================================
-template <bool kFuseSwiGLU, uint32_t kNumMulticast, bool kFuseSwiGLUInterleaved = false>
+template <bool kFuseSwiGLU, uint32_t kNumMulticast, bool kFuseSwiGLUInterleaved = false,
+          cute::UMMA::Major kMajorB = cute::UMMA::Major::K>
 __device__ void dg_gemm_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b, const CUtensorMap* desc_cd,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -912,8 +924,13 @@ __device__ void dg_gemm_persistent(
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
                     desc_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
-                    desc_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+                if constexpr (kMajorB == cute::UMMA::Major::K) {
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                        desc_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+                } else {
+                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kDgSwizzleB, cutlass::bfloat16_t>(
+                        desc_b, full_barriers[stage_idx], smem_b[stage_idx], load_n_idx, k_idx, kNumMulticast);
+                }
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
                 if (is_leader_cta)
                     full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
@@ -923,15 +940,15 @@ __device__ void dg_gemm_persistent(
         }
     } else if (warp_idx == 1 and is_leader_cta) {
         // ================= MMA issue warp (leader CTA) =================
-        constexpr bool kDoMergeStages = (kNumStages >= 8);
+        constexpr bool kDoMergeStages = (kNumStages >= 8 && kMajorB == cute::UMMA::Major::K);
         constexpr uint32_t kNumMinStages = 8;
         constexpr uint32_t kNumStagesPerMerge = kDoMergeStages ? kNumStages / kNumMinStages : 1;
         constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
 
         auto instr_desc = cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
-                                                      UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+                                                      UMMA_M, UMMA_N, cute::UMMA::Major::K, kMajorB>();
         auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_ATOM_K, kDgSwizzleA>(smem_a[0], 0, 0);
-        auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_ATOM_K, kDgSwizzleB>(smem_b[0], 0, 0);
+        auto b_desc = mma::sm100::make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_ATOM_K, kDgSwizzleB>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
         const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
@@ -965,7 +982,7 @@ __device__ void dg_gemm_persistent(
                         constexpr uint32_t kInnerKIdx = kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
                         a_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_M, kDgSwizzleA, cutlass::bfloat16_t>(
                                         a_base, kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K, kInnerKIdx);
-                        b_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
+                        b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kDgSwizzleB, cutlass::bfloat16_t>(
                                         b_base, kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K, kInnerKIdx);
                         mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
                                    kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
@@ -1197,6 +1214,21 @@ __device__ inline void umma_down_persistent(
         nullptr, nullptr, 0);
 }
 
+// Backward dgrad consumes original weights in [K,N] row-major form and asks the
+// DeepGEMM mainloop to treat B as MN-major instead of materializing W^T.
+__device__ inline void umma_dgrad_mn_persistent(
+    const CUtensorMap* desc_a, const CUtensorMap* desc_b_mn, const CUtensorMap* desc_cd,
+    int M, int N, int K,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter) {
+
+    dg_gemm_persistent<false, kDgRunMulticast, false, cute::UMMA::Major::MN>(
+        desc_a, desc_b_mn, desc_cd,
+        (uint32_t)M, (uint32_t)N, (uint32_t)K,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        nullptr, nullptr, 0);
+}
+
 // DeepGEMM down-proj for one (m_block, n_block) tile: D = act @ W_down^T.
 // Pure GEMM (no SwiGLU); reuses dg_gemm_tile<false>. Shares the same TMEM
 // accum pipeline / accum_iter as the gate/up passes so the single
@@ -1240,31 +1272,29 @@ inline void build_compute_down_tma_atoms(ComputeDownTmaAtoms& atoms,
     }
 }
 
-// Per-expert backward weight descriptors. These point at the transposed BF16
-// weights built for the saved-preact backward path:
-//   W_down_T   [E, I, hidden]  => GEMM2:  dY[M,hidden]  x W_down_T[I,hidden]^T
-//   W_gateup_T [E, hidden, 2I] => GEMM3: dGU[M,2I]     x W_gateup_T[hidden,2I]^T
+// Per-expert backward dgrad descriptors over the original BF16 weights. B is
+// passed as MN-major [K,N], so no physical W_down_T/W_gateup_T copy is needed.
 struct ComputeBackwardTmaAtoms {
     int num_experts;
     int hidden;
     int intermediate;
-    CUtensorMap wdown_t[kMaxLocalExperts];
-    CUtensorMap wgateup_t[kMaxLocalExperts];
+    CUtensorMap wdown[kMaxLocalExperts];
+    CUtensorMap wgateup[kMaxLocalExperts];
 };
 
 inline void build_compute_backward_tma_atoms(ComputeBackwardTmaAtoms& atoms,
-                                             const __nv_bfloat16* W_down_T,
-                                             const __nv_bfloat16* W_gateup_T,
+                                             const __nv_bfloat16* W_down,
+                                             const __nv_bfloat16* W_gateup,
                                              int E, int hidden, int intermediate) {
     EP_HOST_ASSERT(E <= kMaxLocalExperts);
     atoms.num_experts = E;
     atoms.hidden = hidden;
     atoms.intermediate = intermediate;
     for (int e = 0; e < E; ++e) {
-        const __nv_bfloat16* wd_t_e = W_down_T + (size_t)e * intermediate * hidden;
-        const __nv_bfloat16* wgu_t_e = W_gateup_T + (size_t)e * hidden * (2 * intermediate);
-        atoms.wdown_t[e] = dg_make_b_desc(wd_t_e, intermediate, hidden);       // [N=I, K=hidden]
-        atoms.wgateup_t[e] = dg_make_b_desc(wgu_t_e, hidden, 2 * intermediate); // [N=hidden, K=2I]
+        const __nv_bfloat16* wd_e = W_down + (size_t)e * hidden * intermediate;              // [K=hidden, N=I]
+        const __nv_bfloat16* wgu_e = W_gateup + (size_t)e * (2 * intermediate) * hidden;     // [K=2I, N=hidden]
+        atoms.wdown[e] = dg_make_b_mn_desc(wd_e, intermediate, hidden);
+        atoms.wgateup[e] = dg_make_b_mn_desc(wgu_e, hidden, 2 * intermediate);
     }
 }
 
