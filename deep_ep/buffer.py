@@ -722,8 +722,36 @@ class Buffer:
         @staticmethod
         @torch.autograd.function.once_differentiable
         def backward(ctx, grad_output):
-            grad_x, grad_w_gateup, grad_w_down, grad_topk_weights = ctx.runtime.megakernel_debug_backward(
-                ctx.handle, grad_output.contiguous(), ctx.total_sms, ctx.stage)
+            (grad_x, grad_w_gateup, grad_w_down, grad_topk_weights,
+             scratch_x, scratch_act, scratch_dz, scratch_dgu, expert_counts) = (
+                ctx.runtime.megakernel_debug_backward(
+                    ctx.handle, grad_output.contiguous(), ctx.total_sms, ctx.stage))
+            try:
+                from quack.gemm_interface import gemm as _quack_gemm
+            except Exception as exc:
+                raise RuntimeError(
+                    "QuACK is required for megakernel debug backward wgrad") from exc
+            counts = expert_counts.to(device=grad_output.device, dtype=torch.int32)
+            # torch.cumsum promotes int32 to int64; QuACK varlen-K requires int32
+            # for both cu_seqlens_k and A_idx, so cast the prefix sum back explicitly.
+            cu_seqlens_k = torch.cat((
+                torch.zeros(1, device=counts.device, dtype=torch.int32),
+                torch.cumsum(counts, dim=0).to(torch.int32)))
+            total_slots = int(scratch_x.shape[0])
+            A_idx = torch.arange(total_slots, device=counts.device, dtype=torch.int32)
+            if int(counts.sum()) > 0:
+                _quack_gemm(
+                    scratch_dgu.transpose(0, 1), scratch_x,
+                    out=grad_w_gateup,
+                    cu_seqlens_k=cu_seqlens_k,
+                    A_idx=A_idx,
+                    tuned=False)
+                _quack_gemm(
+                    scratch_dz.transpose(0, 1), scratch_act,
+                    out=grad_w_down,
+                    cu_seqlens_k=cu_seqlens_k,
+                    A_idx=A_idx,
+                    tuned=False)
             return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
                     None, None, None, None, None, None, None)
 

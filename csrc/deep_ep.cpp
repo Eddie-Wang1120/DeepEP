@@ -1601,7 +1601,7 @@ void Buffer::dump_deepep_perf_trace() {
                 notify_us, dispatch_us, rank);
         fprintf(f, "]\n");
         fclose(f);
-        printf("[DEEPEP-PERF] dispatch trace written to %s (notify %.3f us, dispatch %.3f us)\n", filename, notify_us, dispatch_us);
+        // printf("[DEEPEP-PERF] dispatch trace written to %s (notify %.3f us, dispatch %.3f us)\n", filename, notify_us, dispatch_us);
 
         // Combine in a separate file
         snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine_iter%d.json", rank, trace_iter);
@@ -1615,7 +1615,7 @@ void Buffer::dump_deepep_perf_trace() {
                     combine_us, rank);
             fprintf(f, "]\n");
             fclose(f);
-            printf("[DEEPEP-PERF] combine trace written to %s (%.3f us)\n", filename, combine_us);
+            // printf("[DEEPEP-PERF] combine trace written to %s (%.3f us)\n", filename, combine_us);
         }
     } else {
         printf("[DEEPEP-PERF] Failed to open %s\n", filename);
@@ -2165,20 +2165,20 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // Both cleans zero only the head/tail metadata (KB), not the MB-scale data payload, and they
     // run every iteration (including the first), so we no longer memset the whole symmetric buffer.
 
-    printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d dispatch_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) combine_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
-           rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
-           num_tokens, hidden_int4, num_topk, num_experts, num_local_experts,
-           dispatch_num_max_nvl_chunked_send_tokens, dispatch_num_max_nvl_chunked_recv_tokens,
-           dispatch_num_max_rdma_chunked_send_tokens, dispatch_num_max_rdma_chunked_recv_tokens,
-           combine_num_max_nvl_chunked_send_tokens, combine_num_max_nvl_chunked_recv_tokens,
-           combine_num_max_rdma_chunked_send_tokens, combine_num_max_rdma_chunked_recv_tokens,
-           rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
-           moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
-    printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p logical_rdma_cpm=%p recv_rdma_prefix=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
-           rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
-           num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
-           rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
-           gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
+    // printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d dispatch_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) combine_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
+    //        rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
+    //        num_tokens, hidden_int4, num_topk, num_experts, num_local_experts,
+    //        dispatch_num_max_nvl_chunked_send_tokens, dispatch_num_max_nvl_chunked_recv_tokens,
+    //        dispatch_num_max_rdma_chunked_send_tokens, dispatch_num_max_rdma_chunked_recv_tokens,
+    //        combine_num_max_nvl_chunked_send_tokens, combine_num_max_nvl_chunked_recv_tokens,
+    //        combine_num_max_rdma_chunked_send_tokens, combine_num_max_rdma_chunked_recv_tokens,
+    //        rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
+    //        moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
+    // printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p logical_rdma_cpm=%p recv_rdma_prefix=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
+    //        rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
+    //        num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
+    //        rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
+    //        gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
 
     // Keep notify_dispatch's buffer cleanup aligned with the megakernel logical-channel layout.
     // The prefix matrices are regenerated below for logical channels, but the cleanup range must
@@ -2250,8 +2250,8 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     EP_HOST_ASSERT(get_nvl_bytes(num_topk + 1, num_topk, dispatch_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
     EP_HOST_ASSERT(get_nvl_bytes(0, num_topk, combine_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
 
-    printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
-           rank, *moe_recv_counter, *moe_recv_rdma_counter);
+    // printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
+    //        rank, *moe_recv_counter, *moe_recv_rdma_counter);
 
     // Busy-wait for metadata exchange to complete
     auto wait_start = std::chrono::steady_clock::now();
@@ -2266,11 +2266,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         EP_HOST_ASSERT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 30);
     }
 
-    printf("[MK-HOST][NOTIFY-DISPATCH][DONE] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d local_expert_counts=[",
-           rank, *moe_recv_counter, *moe_recv_rdma_counter);
-    for (int i = 0; i < num_local_experts; ++i)
-        printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
-    printf("]\n");
+    // printf("[MK-HOST][NOTIFY-DISPATCH][DONE] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d local_expert_counts=[",
+        //    rank, *moe_recv_counter, *moe_recv_rdma_counter);
+    // for (int i = 0; i < num_local_experts; ++i)
+        // printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
+    // printf("]\n");
 
 #if MK_PERF_TRACE_ENABLED
     // Emit the megakernel-path notify_dispatch cost as its own Perfetto track so it can be
@@ -2298,7 +2298,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
                     notify_us, rank);
             fprintf(nf, "]\n");
             fclose(nf);
-            printf("[MK-PERF] rank=%d notify_dispatch trace -> %s (%.3f us)\n", rank, notify_fn, notify_us);
+            // printf("[MK-PERF] rank=%d notify_dispatch trace -> %s (%.3f us)\n", rank, notify_fn, notify_us);
         } else {
             printf("[MK-PERF] rank=%d failed to open %s\n", rank, notify_fn);
         }
@@ -2356,14 +2356,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // remains as a safety net.
     const int max_tokens_per_expert = std::max(1, max_total_recv_tokens);
 
-    printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d scheduler_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
-           rank, max_total_recv_tokens, max_tokens_per_expert,
-           static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
-           num_dispatch_sms, num_combine_sms, compute_scheduler_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
+    // printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d scheduler_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
+    //        rank, max_total_recv_tokens, max_tokens_per_expert,
+    //        static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
+    //        num_dispatch_sms, num_combine_sms, compute_scheduler_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
 
     AT_CUDA_CHECK(cudaGetLastError());
 
-    printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
+    // printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
 
     // Per-local-expert received-token counts for compact slot packing (P0 forward path).
     // moe_recv_expert_counter was populated by notify_dispatch above and equals each local
@@ -2430,7 +2430,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
 
-    printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
+    // printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
 
     AT_CUDA_CHECK(cudaGetLastError());
 
@@ -2566,7 +2566,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         dispatch_config, combine_config, none, none, none, none, none, true);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Buffer::megakernel_debug_backward(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+Buffer::megakernel_debug_backward(
     const std::shared_ptr<MegaKernelAutogradContext>& context,
     const torch::Tensor& grad_output,
     int total_sms,
@@ -2601,11 +2603,34 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Buffer::m
     megakernel_debug::launch_megakernel_debug_backward(
         backward_state, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);
+
+    // Export the compact per-expert operands. The Python layer consumes these
+    // buffers with QuACK's varlen-K grouped GEMM after this megakernel returns.
+    std::vector<int> expert_token_counts(num_local_experts);
+    megakernel_debug::get_megakernel_expert_counts(
+        context->state(), expert_token_counts.data(), num_local_experts);
+    size_t total_slots = 0;
+    for (int e = 0; e < num_local_experts; ++e)
+        total_slots += (size_t)expert_token_counts[e];
+    const size_t scratch_slots = std::max<size_t>(total_slots, 1);
+    const int two_i = 2 * intermediate;
+    auto scratch_x = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
+    auto scratch_act = torch::empty({(int64_t)scratch_slots, intermediate}, bf16_options);
+    auto scratch_dz = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
+    auto scratch_dgu = torch::empty({(int64_t)scratch_slots, two_i}, bf16_options);
+    megakernel_debug::copy_megakernel_wgrad_scratch(
+        backward_state, scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
+        scratch_dgu.data_ptr(), scratch_slots, hidden, intermediate, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     megakernel_debug::free_megakernel_backward_state(backward_state);
-    return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights};
+    auto count_options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto expert_counts = torch::tensor(expert_token_counts, count_options);
+    return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights,
+            scratch_x, scratch_act, scratch_dz, scratch_dgu, expert_counts};
 #else
     EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
-    return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+            torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
 #endif
 }
 

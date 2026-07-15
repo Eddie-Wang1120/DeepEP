@@ -362,7 +362,8 @@ public:
         const Config& dispatch_config,
         const Config& combine_config);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
         const std::shared_ptr<MegaKernelAutogradContext>& context,
         const torch::Tensor& grad_output,
         int total_sms,

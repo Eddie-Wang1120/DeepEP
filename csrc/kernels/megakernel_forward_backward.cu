@@ -4234,9 +4234,9 @@ __device__ void combine_worker_v2(
     constexpr int kNumRDMARanks_C = kNumRDMARanks;
     const int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
 
-    if (threadIdx.x == 0 && combine_sm_idx == 0) {
-        printf("rank: %d, combine_sm_idx: %d num_channels: %d num_logical_channels: %d \n", state->rank, combine_sm_idx, num_channels, num_logical_channels);
-    }
+    // if (threadIdx.x == 0 && combine_sm_idx == 0) {
+    //     printf("rank: %d, combine_sm_idx: %d num_channels: %d num_logical_channels: %d \n", state->rank, combine_sm_idx, num_channels, num_logical_channels);
+    // }
 
     // ---- Overlap design (v2: per-channel compute-combine overlap) ----
     // Per-channel pipeline: dispatch(ch) -> normalize(ch) -> combine(ch)
@@ -7207,13 +7207,13 @@ static void launch_megakernel_v7_case(
     constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
     const int num_ranks = host_state.num_ranks;
 
-    printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d kNumRDMARanks=%d stage=%d compute_dtype=%d block_threads=%d smem_size=%d stream=%p\n",
-           device_state, total_sms, num_ranks, kNumRDMARanks, kStage, static_cast<int>(kComputeDType), kThreads, smem_size, stream);
+    // printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d kNumRDMARanks=%d stage=%d compute_dtype=%d block_threads=%d smem_size=%d stream=%p\n",
+        //    device_state, total_sms, num_ranks, kNumRDMARanks, kStage, static_cast<int>(kComputeDType), kThreads, smem_size, stream);
     if (smem_size > 48 * 1024) {
         CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7<kNumRDMARanks, kStage, kComputeDType>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
-        printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
+        // printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
     }
 
     constexpr int num_gather_sms = 2;
@@ -7374,7 +7374,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     FILE* f = fopen(filename, "w");
 
     if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
-    printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
+    // printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
 
     fprintf(f, "[\n");
     bool first = true;
@@ -7517,7 +7517,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     fprintf(f, "\n]\n");
     fclose(f);
-    printf("[MK-PERF] Perfetto trace written to %s (%d logical channels, block events only)\n", filename, num_logical_channels);
+    // printf("[MK-PERF] Perfetto trace written to %s (%d logical channels, block events only)\n", filename, num_logical_channels);
     return;
 #else
     constexpr bool emit_perf_args = MK_PERF_TRACE_ARGS;
@@ -7862,7 +7862,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
     if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
 
     // Also write raw base_ts so post-processing can re-align ranks
-    printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
+    // printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
 
     fprintf(f, "[\n");
     bool first = true;
@@ -9016,7 +9016,7 @@ static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sm
 
     fprintf(f, "\n]\n");
     fclose(f);
-    printf("[MK-PERF] Perfetto trace written to %s (%d logical channels)\n", filename, num_logical_channels);
+    // printf("[MK-PERF] Perfetto trace written to %s (%d logical channels)\n", filename, num_logical_channels);
 #endif
 }
 #endif
@@ -9559,8 +9559,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT(num_combine_channels == num_physical_channels);
     EP_HOST_ASSERT(num_logical_channels >= num_physical_channels);
 
-    printf("num_tokens: %d, um_rdma_ranks: %d, num_physical_channels: %d, num_logical_channels: %d\n",
-           num_tokens, kNumRDMARanks, num_physical_channels, num_logical_channels);
+    // printf("num_tokens: %d, um_rdma_ranks: %d, num_physical_channels: %d, num_logical_channels: %d\n",
+    //        num_tokens, kNumRDMARanks, num_physical_channels, num_logical_channels);
 
     // Per-logical-channel overlap signaling
     int* channel_dispatch_done;
@@ -10652,6 +10652,17 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
 #undef cudaFree
 }
 
+void get_megakernel_expert_counts(
+    MegaKernelState* device_state,
+    int* expert_counts,
+    int num_local_experts
+) {
+    MegaKernelState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(expert_counts, host_state.expert_count,
+                          (size_t)num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
+}
+
 void get_megakernel_backward_dimensions(
     MegaKernelState* device_state,
     int* num_tokens,
@@ -11651,6 +11662,31 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     return device_bs;
 }
 
+void copy_megakernel_wgrad_scratch(
+    MegaKernelBackwardState* device_bs,
+    void* dst_x,
+    void* dst_act,
+    void* dst_dz,
+    void* dst_dgu,
+    size_t slots,
+    int hidden,
+    int intermediate,
+    cudaStream_t stream
+) {
+    MegaKernelBackwardState hs;
+    CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    const size_t bf16_bytes = sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMemcpyAsync(dst_x, hs.wgrad_x_slot,
+                               slots * hidden * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_act, hs.wgrad_act_slot,
+                               slots * intermediate * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_dz, hs.wgrad_dz_slot,
+                               slots * hidden * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_dgu, hs.wgrad_dgu_slot,
+                               slots * (2 * intermediate) * bf16_bytes,
+                               cudaMemcpyDeviceToDevice, stream));
+}
+
 void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     if (device_bs == nullptr)
         return;
@@ -12006,35 +12042,6 @@ void prepare_megakernel_backward_communication_replay(
         combine_barrier_signal_ptrs, stream);
 }
 
-static void launch_backward_wgrad_gemm(
-    const __nv_bfloat16* x,
-    const __nv_bfloat16* d,
-    __nv_bfloat16* dw,
-    int m,
-    int n,
-    int k,
-    cudaStream_t stream
-) {
-    if (m <= 0)
-        return;
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-    EP_HOST_ASSERT(cublasSetStream(handle, stream) == CUBLAS_STATUS_SUCCESS);
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    // Column-major view computes X^T[K,M] @ D[M,N] -> C[K,N]. C has the
-    // same memory layout as the requested row-major dW[N,K].
-    EP_HOST_ASSERT(cublasGemmEx(
-        handle, CUBLAS_OP_N, CUBLAS_OP_T,
-        k, n, m,
-        &alpha,
-        x, CUDA_R_16BF, k,
-        d, CUDA_R_16BF, n,
-        &beta,
-        dw, CUDA_R_16BF, k,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS);
-}
-
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
     int total_sms,
@@ -12098,34 +12105,8 @@ void launch_megakernel_debug_backward(
     dump_perf_trace_perfetto(hbs.bwd_device_state, active_total_sms, "backward");
 #endif
 
-    std::vector<int> expert_token_counts(hstate.num_local_experts);
-    CUDA_CHECK(cudaMemcpy(
-        expert_token_counts.data(), hstate.expert_token_offsets,
-        (size_t)hstate.num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
-    std::vector<int> expert_slot_base_host(hstate.num_local_experts);
-    CUDA_CHECK(cudaMemcpy(
-        expert_slot_base_host.data(), hstate.expert_slot_base,
-        (size_t)hstate.num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
-    const int hidden = hstate.hidden_dim;
-    const int intermediate = hstate.intermediate_dim;
-    const int two_i = 2 * intermediate;
-    for (int expert = 0; expert < hstate.num_local_experts; ++expert) {
-        const int tokens = expert_token_counts[expert];
-        if (tokens <= 0)
-            continue;
-        const int64_t slot_base = (int64_t)expert_slot_base_host[expert];
-        launch_backward_wgrad_gemm(
-            hbs.wgrad_x_slot + slot_base * hidden,
-            hbs.wgrad_dgu_slot + slot_base * two_i,
-            hbs.grad_w_gateup + (int64_t)expert * two_i * hidden,
-            tokens, two_i, hidden, stream);
-        launch_backward_wgrad_gemm(
-            hbs.wgrad_act_slot + slot_base * intermediate,
-            hbs.wgrad_dz_slot + slot_base * hidden,
-            hbs.grad_w_down + (int64_t)expert * hidden * intermediate,
-            tokens, hidden, intermediate, stream);
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Weight-gradient operands are consumed by the host-side QuACK grouped GEMMs.
+    // Keep this CUDA entry point limited to the megakernel backward itself.
 
 #undef MEGAKERNEL_BWD_CASE
 #undef MEGAKERNEL_BWD_CASE_WITH_DTYPE

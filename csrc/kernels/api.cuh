@@ -456,6 +456,10 @@ void get_megakernel_backward_dimensions(
     int* intermediate,
     int* num_topk,
     int* num_local_experts);
+void get_megakernel_expert_counts(
+    MegaKernelState* device_state,
+    int* expert_counts,
+    int num_local_experts);
 float* get_output_accum_ptr(MegaKernelState* device_state);
 void* get_combined_x_ptr(MegaKernelState* device_state);
 void launch_megakernel_debug_forward(
@@ -475,6 +479,16 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     int total_sms,
     cudaStream_t stream);
 void free_megakernel_backward_state(MegaKernelBackwardState* backward_state);
+void copy_megakernel_wgrad_scratch(
+    MegaKernelBackwardState* backward_state,
+    void* dst_x,
+    void* dst_act,
+    void* dst_dz,
+    void* dst_dgu,
+    size_t slots,
+    int hidden,
+    int intermediate,
+    cudaStream_t stream);
 void prepare_megakernel_communication_replay(
     MegaKernelState* device_state,
     int** dispatch_barrier_signal_ptrs,
