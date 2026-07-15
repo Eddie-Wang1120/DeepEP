@@ -2599,21 +2599,6 @@ Buffer::megakernel_debug_backward(
     auto grad_w_down = torch::zeros(
         {num_local_experts, hidden, intermediate}, bf16_options);
     auto grad_topk_weights = torch::zeros({num_tokens, num_topk}, fp32_options);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
-        context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
-        grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
-        total_sms, stream);
-    megakernel_debug::prepare_megakernel_backward_communication_replay(
-        backward_state, barrier_signal_ptrs_gpu,
-        combine_barrier_signal_ptrs_gpu, stream);
-    const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
-    megakernel_debug::launch_megakernel_debug_backward(
-        backward_state, total_sms, smem_size, stage,
-        megakernel_debug::ComputeDType::kBF16, stream);
-
-    // Export the compact per-expert operands. The Python layer consumes these
-    // buffers with QuACK's varlen-K grouped GEMM after this megakernel returns.
     std::vector<int> expert_token_counts(num_local_experts);
     megakernel_debug::get_megakernel_expert_counts(
         context->state(), expert_token_counts.data(), num_local_experts);
@@ -2622,13 +2607,29 @@ Buffer::megakernel_debug_backward(
         total_slots += (size_t)expert_token_counts[e];
     const size_t scratch_slots = std::max<size_t>(total_slots, 1);
     const int two_i = 2 * intermediate;
+    const int compute_batch_size = megakernel_debug::get_megakernel_compute_batch_size();
     auto scratch_x = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
     auto scratch_act = torch::empty({(int64_t)scratch_slots, intermediate}, bf16_options);
     auto scratch_dz = torch::empty({(int64_t)scratch_slots, hidden}, bf16_options);
-    auto scratch_dgu = torch::empty({(int64_t)scratch_slots, two_i}, bf16_options);
-    megakernel_debug::copy_megakernel_wgrad_scratch(
-        backward_state, scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
-        scratch_dgu.data_ptr(), scratch_slots, hidden, intermediate, stream);
+    auto scratch_dgu_backing = torch::empty(
+        {(int64_t)scratch_slots + compute_batch_size, two_i}, bf16_options);
+    auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, scratch_slots);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
+        context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
+        grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
+        scratch_x.data_ptr(), scratch_act.data_ptr(), scratch_dz.data_ptr(),
+        scratch_dgu_backing.data_ptr(), total_sms, stream);
+    megakernel_debug::prepare_megakernel_backward_communication_replay(
+        backward_state, barrier_signal_ptrs_gpu,
+        combine_barrier_signal_ptrs_gpu, stream);
+    const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
+    megakernel_debug::launch_megakernel_debug_backward(
+        backward_state, total_sms, smem_size, stage,
+        megakernel_debug::ComputeDType::kBF16, stream);
+
+    // The backward wrote the compact wgrad operands directly into torch-owned tensors.
+    // Synchronize before destroying the borrowed-pointer state and returning them to Python/QuACK.
     CUDA_CHECK(cudaStreamSynchronize(stream));
     megakernel_debug::free_megakernel_backward_state(backward_state);
     auto count_options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);

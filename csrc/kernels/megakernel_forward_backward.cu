@@ -10717,6 +10717,10 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
     CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
 }
 
+int get_megakernel_compute_batch_size() {
+    return COMPUTE_BATCH_SIZE;
+}
+
 void get_megakernel_expert_counts(
     MegaKernelState* device_state,
     int* expert_counts,
@@ -11576,6 +11580,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     void* grad_w_gateup,
     void* grad_w_down,
     void* grad_topk_weights,
+    void* wgrad_x_slot,
+    void* wgrad_act_slot,
+    void* wgrad_dz_slot,
+    void* wgrad_dgu_slot,
     int total_sms,
     cudaStream_t stream
 ) {
@@ -11688,14 +11696,12 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     const size_t num_expert_slots = total_bwd_slots;
     const size_t num_dgu_batch_tmas =
         (size_t)fs.num_local_experts * fs.max_batches_per_expert;
-    CUDA_CHECK(cudaMalloc(&hs.wgrad_x_slot,
-                          num_expert_slots * hidden * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMalloc(&hs.wgrad_act_slot,
-                          num_expert_slots * intermediate * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMalloc(&hs.wgrad_dz_slot,
-                          num_expert_slots * hidden * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMalloc(&hs.wgrad_dgu_slot,
-                          (num_expert_slots + COMPUTE_BATCH_SIZE) * twoI * sizeof(__nv_bfloat16)));
+    EP_HOST_ASSERT(wgrad_x_slot != nullptr && wgrad_act_slot != nullptr);
+    EP_HOST_ASSERT(wgrad_dz_slot != nullptr && wgrad_dgu_slot != nullptr);
+    hs.wgrad_x_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_x_slot);
+    hs.wgrad_act_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_act_slot);
+    hs.wgrad_dz_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dz_slot);
+    hs.wgrad_dgu_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dgu_slot);
     std::vector<CUtensorMap> h_wgrad_dgu_a_tma(num_dgu_batch_tmas);
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
         const int ebase = h_bwd_expert_slot_base[expert];
@@ -11727,31 +11733,6 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     return device_bs;
 }
 
-void copy_megakernel_wgrad_scratch(
-    MegaKernelBackwardState* device_bs,
-    void* dst_x,
-    void* dst_act,
-    void* dst_dz,
-    void* dst_dgu,
-    size_t slots,
-    int hidden,
-    int intermediate,
-    cudaStream_t stream
-) {
-    MegaKernelBackwardState hs;
-    CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
-    const size_t bf16_bytes = sizeof(__nv_bfloat16);
-    CUDA_CHECK(cudaMemcpyAsync(dst_x, hs.wgrad_x_slot,
-                               slots * hidden * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_act, hs.wgrad_act_slot,
-                               slots * intermediate * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_dz, hs.wgrad_dz_slot,
-                               slots * hidden * bf16_bytes, cudaMemcpyDeviceToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_dgu, hs.wgrad_dgu_slot,
-                               slots * (2 * intermediate) * bf16_bytes,
-                               cudaMemcpyDeviceToDevice, stream));
-}
-
 void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     if (device_bs == nullptr)
         return;
@@ -11763,10 +11744,7 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     CUDA_CHECK(cudaFree(const_cast<__nv_bfloat16*>(hs.W_down_T)));
     CUDA_CHECK(cudaFree(hs.compute_bwd_tma));
     CUDA_CHECK(cudaFree(hs.wgrad_dgu_a_tma));
-    CUDA_CHECK(cudaFree(hs.wgrad_x_slot));
-    CUDA_CHECK(cudaFree(hs.wgrad_act_slot));
-    CUDA_CHECK(cudaFree(hs.wgrad_dz_slot));
-    CUDA_CHECK(cudaFree(hs.wgrad_dgu_slot));
+    // wgrad_* buffers are borrowed from torch tensors owned by the caller.
     MegaKernelState bwd_state;
     CUDA_CHECK(cudaMemcpy(
         &bwd_state, hs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
