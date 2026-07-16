@@ -445,6 +445,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     // num_local_experts * max_tokens_per_expert layout.
     const int* host_expert_count = nullptr,
     // Optional caller-owned buffers. Non-null pointers are borrowed by the state.
+    __nv_bfloat16* external_bwd_fc1_input = nullptr,
     __nv_bfloat16* external_bwd_preact = nullptr,
     int* external_fwd_slot_map = nullptr,
     int4* external_combined_x = nullptr,
@@ -496,17 +497,6 @@ void prepare_megakernel_backward_communication_replay(
     MegaKernelBackwardState* backward_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
-    cudaStream_t stream);
-void prepare_megakernel_backward_dispatch_replay(
-    MegaKernelBackwardState* backward_state,
-    int** dispatch_barrier_signal_ptrs,
-    cudaStream_t stream);
-void launch_megakernel_debug_capture_x(
-    MegaKernelBackwardState* backward_state,
-    int total_sms,
-    int smem_size,
-    int stage,
-    ComputeDType compute_dtype,
     cudaStream_t stream);
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,

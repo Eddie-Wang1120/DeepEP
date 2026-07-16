@@ -683,7 +683,7 @@ def parse_args():
     parser.add_argument('--perf-trace-dir', default='.',
                         help='Directory where *perf_trace_rank*.json files are emitted')
     parser.add_argument('--stage', type=int, default=1)
-    parser.add_argument('--baseline-sms', type=int, default=24)
+    parser.add_argument('--baseline-sms', type=int, default=48)
     parser.add_argument('--megakernel-comm-sms', type=int, default=48)
     parser.add_argument(
         '--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'],
