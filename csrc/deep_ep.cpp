@@ -1970,7 +1970,20 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state) : state_(state) {}
+MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state,
+                                                     int num_tokens,
+                                                     int hidden_dim,
+                                                     int intermediate_dim,
+                                                     int num_topk,
+                                                     int num_local_experts,
+                                                     std::vector<int> expert_counts)
+    : state_(state),
+      num_tokens_(num_tokens),
+      hidden_dim_(hidden_dim),
+      intermediate_dim_(intermediate_dim),
+      num_topk_(num_topk),
+      num_local_experts_(num_local_experts),
+      expert_counts_(std::move(expert_counts)) {}
 
 MegaKernelAutogradContext::~MegaKernelAutogradContext() {
 #ifndef DISABLE_NVSHMEM
@@ -1980,6 +1993,30 @@ MegaKernelAutogradContext::~MegaKernelAutogradContext() {
 
 megakernel_debug::MegaKernelState* MegaKernelAutogradContext::state() const {
     return state_;
+}
+
+int MegaKernelAutogradContext::num_tokens() const {
+    return num_tokens_;
+}
+
+int MegaKernelAutogradContext::hidden_dim() const {
+    return hidden_dim_;
+}
+
+int MegaKernelAutogradContext::intermediate_dim() const {
+    return intermediate_dim_;
+}
+
+int MegaKernelAutogradContext::num_topk() const {
+    return num_topk_;
+}
+
+int MegaKernelAutogradContext::num_local_experts() const {
+    return num_local_experts_;
+}
+
+const std::vector<int>& MegaKernelAutogradContext::expert_counts() const {
+    return expert_counts_;
 }
 
 void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
@@ -2438,6 +2475,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         nullptr,
         nullptr,
         reinterpret_cast<int4*>(result.data_ptr()),
+        nullptr,
         nullptr);
     };
 
@@ -2497,7 +2535,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     if (retain_state) {
         EP_HOST_ASSERT(!use_fp8_compute && "training state currently requires debug BF16 mode");
         context = std::make_shared<MegaKernelAutogradContext>(
-            static_cast<megakernel_debug::MegaKernelState*>(state));
+            static_cast<megakernel_debug::MegaKernelState*>(state),
+            num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
+            mk_expert_counts);
         // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
         // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
         // they outlive this forward call (otherwise the backward reads dangling/zeroed memory —
@@ -2590,9 +2630,11 @@ Buffer::megakernel_debug_backward(
     EP_HOST_ASSERT(stage >= 1 && stage <= 2);
 
     pybind11::gil_scoped_release release;
-    int num_tokens, hidden, intermediate, num_topk, num_local_experts;
-    megakernel_debug::get_megakernel_backward_dimensions(
-        context->state(), &num_tokens, &hidden, &intermediate, &num_topk, &num_local_experts);
+    const int num_tokens = context->num_tokens();
+    const int hidden = context->hidden_dim();
+    const int intermediate = context->intermediate_dim();
+    const int num_topk = context->num_topk();
+    const int num_local_experts = context->num_local_experts();
     auto grad_input = torch::empty_like(grad_output);
     auto bf16_options = grad_output.options();
     auto fp32_options = grad_output.options().dtype(torch::kFloat32);
@@ -2601,9 +2643,8 @@ Buffer::megakernel_debug_backward(
     auto grad_w_down = torch::zeros(
         {num_local_experts, hidden, intermediate}, bf16_options);
     auto grad_topk_weights = torch::zeros({num_tokens, num_topk}, fp32_options);
-    std::vector<int> expert_token_counts(num_local_experts);
-    megakernel_debug::get_megakernel_expert_counts(
-        context->state(), expert_token_counts.data(), num_local_experts);
+    const std::vector<int>& expert_token_counts = context->expert_counts();
+    EP_HOST_ASSERT(static_cast<int>(expert_token_counts.size()) == num_local_experts);
     std::vector<int> h_cu_seqlens_k(num_local_experts + 1, 0);
     size_t total_slots = 0;
     for (int e = 0; e < num_local_experts; ++e) {
@@ -2628,23 +2669,26 @@ Buffer::megakernel_debug_backward(
     auto scratch_act = scratch_act_backing.narrow(0, 0, total_slots);
     auto scratch_dz = scratch_dz_backing.narrow(0, 0, total_slots);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, total_slots);
+    megakernel_debug::MegaKernelBackwardHostContext* backward_host_context = nullptr;
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
-        scratch_dgu_backing.data_ptr(), total_sms, stream);
+        scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
+        &backward_host_context, stream);
     megakernel_debug::prepare_megakernel_backward_communication_replay(
-        backward_state, barrier_signal_ptrs_gpu,
+        backward_host_context, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
     megakernel_debug::launch_megakernel_debug_backward(
-        backward_state, total_sms, smem_size, stage,
+        backward_state, backward_host_context, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);
 
     // The backward wrote the compact wgrad operands directly into torch-owned tensors.
     // Synchronize before destroying the borrowed-pointer state and returning them to Python/QuACK.
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    megakernel_debug::free_megakernel_backward_state(backward_state);
+    megakernel_debug::free_megakernel_backward_state(backward_state, backward_host_context);
+    megakernel_debug::free_megakernel_backward_host_context(backward_host_context);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights,
             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
 #else

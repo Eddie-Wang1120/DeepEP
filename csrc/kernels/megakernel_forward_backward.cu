@@ -9241,6 +9241,8 @@ struct FusedFillDesc {
     uint32_t word;
 };
 
+// Simple parallel fill: one block per desc, all threads stride over words.
+// Host splits large buffers into <=CHUNK_SIZE descs so blocks are balanced.
 __global__ void fused_fill_kernel(const FusedFillDesc* descs, int ndescs) {
     const int desc_idx = blockIdx.x;
     if (desc_idx >= ndescs)
@@ -9250,12 +9252,6 @@ __global__ void fused_fill_kernel(const FusedFillDesc* descs, int ndescs) {
     const size_t nwords = desc.bytes / sizeof(uint32_t);
     for (size_t i = threadIdx.x; i < nwords; i += blockDim.x)
         words[i] = desc.word;
-    const size_t tail_start = nwords * sizeof(uint32_t);
-    if (tail_start < desc.bytes) {
-        const uint8_t bval = static_cast<uint8_t>(desc.word & 0xffu);
-        for (size_t i = tail_start + threadIdx.x; i < desc.bytes; i += blockDim.x)
-            reinterpret_cast<uint8_t*>(desc.ptr)[i] = bval;
-    }
 }
 
 static void initialize_megakernel_launch_state(const MegaKernelState& state, cudaStream_t stream);
@@ -9324,7 +9320,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     __nv_bfloat16* external_bwd_preact,
     int* external_fwd_slot_map,
     int4* external_combined_x,
-    float* external_combined_topk_weights
+    float* external_combined_topk_weights,
+    MegaKernelState* host_state_out
 ) {
 #define cudaMalloc(pp, n) mk_caching_alloc(reinterpret_cast<void**>(pp), (n))
     struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
@@ -10580,30 +10577,51 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     const int mk_num_fills = static_cast<int>(mk_fill_recs.size());
     void* fill_desc_buf = nullptr;
+    int mk_num_descs = 0;  // after chunking
+    std::vector<FusedFillDesc> host_descs;
     if (mk_num_fills > 0) {
-        std::vector<FusedFillDesc> host_descs(mk_num_fills);
+        // Split large buffers into chunks so each block has roughly equal work.
+        // Target: each chunk is at most CHUNK_WORDS uint32s (~256KB).
+        constexpr size_t CHUNK_WORDS = 64 * 1024;  // 256KB per chunk
+        host_descs.reserve(mk_num_fills * 2);
         for (int i = 0; i < mk_num_fills; ++i) {
             const uint32_t bval = static_cast<uint32_t>(mk_fill_recs[i].byte_value & 0xff);
-            host_descs[i] = FusedFillDesc{mk_fill_recs[i].ptr, mk_fill_recs[i].bytes,
-                                          bval * 0x01010101u};
+            const uint32_t word = bval * 0x01010101u;
+            size_t total_bytes = mk_fill_recs[i].bytes;
+            uint8_t* base = reinterpret_cast<uint8_t*>(mk_fill_recs[i].ptr);
+            size_t offset = 0;
+            while (offset < total_bytes) {
+                size_t chunk_bytes = min(total_bytes - offset, CHUNK_WORDS * sizeof(uint32_t));
+                // Align chunk_bytes down to uint32 boundary (all allocs are 128B aligned).
+                chunk_bytes = (chunk_bytes / sizeof(uint32_t)) * sizeof(uint32_t);
+                if (chunk_bytes == 0) chunk_bytes = total_bytes - offset;
+                host_descs.push_back(FusedFillDesc{base + offset, chunk_bytes, word});
+                offset += chunk_bytes;
+            }
         }
-        CUDA_CHECK(cudaMalloc(&fill_desc_buf, static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc)));
-        CUDA_CHECK(cudaMemcpy(fill_desc_buf, host_descs.data(),
-                              static_cast<size_t>(mk_num_fills) * sizeof(FusedFillDesc),
-                              cudaMemcpyHostToDevice));
+        mk_num_descs = static_cast<int>(host_descs.size());
+        CUDA_CHECK(cudaMalloc(&fill_desc_buf, static_cast<size_t>(mk_num_descs) * sizeof(FusedFillDesc)));
     }
     host_state.fused_fill_desc_buf = fill_desc_buf;
 
-    // Copy to device
+    // Copy state + fill descs to device in one async batch on the current stream.
+    if (host_state_out != nullptr)
+        *host_state_out = host_state;
+    cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
     MegaKernelState* device_state;
     CUDA_CHECK(cudaMalloc(&device_state, sizeof(MegaKernelState)));
-    CUDA_CHECK(cudaMemcpy(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
-    if (mk_num_fills > 0) {
-        cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
-        fused_fill_kernel<<<mk_num_fills, 256, 0, init_stream>>>(
-            static_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_fills);
+    CUDA_CHECK(cudaMemcpyAsync(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice, init_stream));
+    if (mk_num_descs > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(fill_desc_buf, host_descs.data(),
+                              static_cast<size_t>(mk_num_descs) * sizeof(FusedFillDesc),
+                              cudaMemcpyHostToDevice, init_stream));
+        fused_fill_kernel<<<mk_num_descs, 512, 0, init_stream>>>(
+            static_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_descs);
         CUDA_CHECK(cudaGetLastError());
     }
+    // Sync to ensure host_state (stack) and host_descs (vector) remain valid
+    // until the async copies complete. This is a single sync for both H2Ds + kernel.
+    CUDA_CHECK(cudaStreamSynchronize(init_stream));
 #undef cudaMemset
 #undef cudaMalloc
 
@@ -11059,6 +11077,13 @@ struct MegaKernelBackwardState {
     __nv_bfloat16* wgrad_act_slot;         // [expert_slots, intermediate], route-weighted
     __nv_bfloat16* wgrad_dz_slot;          // [expert_slots, hidden]
     __nv_bfloat16* wgrad_dgu_slot;         // [expert_slots, 2 * intermediate]
+};
+
+struct MegaKernelBackwardHostContext {
+    MegaKernelBackwardState backward_state;
+    MegaKernelState bwd_state;
+    umma::ComputeBackwardTmaAtoms compute_bwd_tma_atoms;
+    std::vector<CUtensorMap> wgrad_dgu_a_tma;
 };
 
 __device__ __forceinline__ void trace_backward_values(
@@ -11794,7 +11819,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
+    const int* host_expert_count,
     int total_sms,
+    MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream
 ) {
     MegaKernelState fs;
@@ -11807,12 +11834,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     EP_HOST_ASSERT(fs.num_compute_groups > 0);
     EP_HOST_ASSERT(total_sms >= fs.num_compute_groups * COMPUTE_GROUP_SIZE);
 
-    // Compact backward slot layout: reuse the forward per-expert counts (routing is
-    // deterministic across the dispatch re-run, so counts are identical) so the backward
-    // state and its wgrad_* scratch pack by Σ count instead of num_local_experts*max_tpe.
-    std::vector<int> h_bwd_expert_count(num_local_experts);
-    CUDA_CHECK(cudaMemcpy(h_bwd_expert_count.data(), fs.expert_count,
-                          (size_t)num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
+    EP_HOST_ASSERT(host_expert_count != nullptr);
+    EP_HOST_ASSERT(host_context != nullptr);
+    std::vector<int> h_bwd_expert_count(host_expert_count, host_expert_count + num_local_experts);
     std::vector<int> h_bwd_expert_slot_base(num_local_experts);
     size_t total_bwd_slots = 0;
     for (int e = 0; e < num_local_experts; ++e) {
@@ -11821,14 +11845,15 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     }
     if (total_bwd_slots == 0) total_bwd_slots = 1;
 
+    auto* host_ctx = new MegaKernelBackwardHostContext{};
     umma::ComputeBackwardTmaAtoms* d_compute_bwd_tma = nullptr;
     if (num_local_experts <= umma::kMaxLocalExperts) {
-        umma::ComputeBackwardTmaAtoms h_bwd_atoms;
         umma::build_compute_backward_tma_atoms(
-            h_bwd_atoms, fs.W_down, fs.W_gateup, num_local_experts, hidden, intermediate);
+            host_ctx->compute_bwd_tma_atoms, fs.W_down, fs.W_gateup,
+            num_local_experts, hidden, intermediate);
         CUDA_CHECK(mk_caching_alloc(
             reinterpret_cast<void**>(&d_compute_bwd_tma), sizeof(umma::ComputeBackwardTmaAtoms)));
-        CUDA_CHECK(cudaMemcpyAsync(d_compute_bwd_tma, &h_bwd_atoms,
+        CUDA_CHECK(cudaMemcpyAsync(d_compute_bwd_tma, &host_ctx->compute_bwd_tma_atoms,
                                    sizeof(umma::ComputeBackwardTmaAtoms),
                                    cudaMemcpyHostToDevice, stream));
     }
@@ -11861,9 +11886,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         const_cast<__nv_bfloat16*>(fs.bwd_preact),
         fs.fwd_slot_map,
         reinterpret_cast<int4*>(grad_input),
-        reinterpret_cast<float*>(grad_topk_weights));
+        reinterpret_cast<float*>(grad_topk_weights),
+        &host_ctx->bwd_state);
 
-    MegaKernelBackwardState hs{};
+    MegaKernelBackwardState& hs = host_ctx->backward_state;
     hs.fwd = fwd_device_state;
     hs.bwd_device_state = bwd_device_state;
     hs.bwd_fc1_input = fs.bwd_fc1_input;
@@ -11877,7 +11903,6 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     // Compact Family B (wgrad) scratch: Σ count, same per-expert slot layout as the backward
     // state. wgrad_dgu_slot gets one extra COMPUTE_BATCH_SIZE of padding so the last batch's
     // CBS-row TMA descriptor tile stays within the allocation.
-    const size_t num_expert_slots = total_bwd_slots;
     const size_t num_dgu_batch_tmas =
         (size_t)fs.num_local_experts * fs.max_batches_per_expert;
     EP_HOST_ASSERT(wgrad_x_slot != nullptr && wgrad_act_slot != nullptr);
@@ -11886,7 +11911,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.wgrad_act_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_act_slot);
     hs.wgrad_dz_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dz_slot);
     hs.wgrad_dgu_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dgu_slot);
-    std::vector<CUtensorMap> h_wgrad_dgu_a_tma(num_dgu_batch_tmas);
+    host_ctx->wgrad_dgu_a_tma.resize(num_dgu_batch_tmas);
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
         const int ebase = h_bwd_expert_slot_base[expert];
         const int ecnt = h_bwd_expert_count[expert];
@@ -11896,7 +11921,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
             const int row = (batch * COMPUTE_BATCH_SIZE < ecnt)
                 ? (ebase + batch * COMPUTE_BATCH_SIZE) : ebase;
             const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot + (size_t)row * twoI;
-            h_wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
+            host_ctx->wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
                 umma::dg_make_a_desc(dgu_batch, COMPUTE_BATCH_SIZE, twoI);
         }
     }
@@ -11904,7 +11929,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     CUDA_CHECK(mk_caching_alloc(
         reinterpret_cast<void**>(&d_wgrad_dgu_a_tma),
         num_dgu_batch_tmas * sizeof(CUtensorMap)));
-    CUDA_CHECK(cudaMemcpyAsync(d_wgrad_dgu_a_tma, h_wgrad_dgu_a_tma.data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_wgrad_dgu_a_tma, host_ctx->wgrad_dgu_a_tma.data(),
                                num_dgu_batch_tmas * sizeof(CUtensorMap),
                                cudaMemcpyHostToDevice, stream));
     hs.wgrad_dgu_a_tma = d_wgrad_dgu_a_tma;
@@ -11914,17 +11939,25 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         reinterpret_cast<void**>(&device_bs), sizeof(MegaKernelBackwardState)));
     CUDA_CHECK(cudaMemcpyAsync(device_bs, &hs, sizeof(MegaKernelBackwardState),
                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    EP_HOST_ASSERT(host_context != nullptr);
+    *host_context = host_ctx;
     return device_bs;
 }
 
-void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
+void free_megakernel_backward_state(
+    MegaKernelBackwardState* device_bs,
+    const MegaKernelBackwardHostContext* host_context
+) {
     if (device_bs == nullptr)
         return;
 
     EP_HOST_ASSERT(device_bs != nullptr);
     MegaKernelBackwardState hs;
-    CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    if (host_context != nullptr) {
+        hs = host_context->backward_state;
+    } else {
+        CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
+    }
     // wgrad_* buffers are borrowed from caller-owned Torch tensors.
     CUDA_CHECK(mk_caching_free(hs.compute_bwd_tma));
     CUDA_CHECK(mk_caching_free(hs.wgrad_dgu_a_tma));
@@ -11932,16 +11965,18 @@ void free_megakernel_backward_state(MegaKernelBackwardState* device_bs) {
     CUDA_CHECK(mk_caching_free(device_bs));
 }
 
+void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_context) {
+    delete host_context;
+}
+
 // Establish the post-allocation state for every launch. Routing inputs, weights and the
 // saved forward activation are immutable across replay and are intentionally preserved.
-void prepare_megakernel_communication_replay(
-    MegaKernelState* device_state,
+static void prepare_megakernel_communication_replay_host(
+    const MegaKernelState& hs,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream
 ) {
-    MegaKernelState hs;
-    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
     const int combine_hidden_int4 = hs.combine_hidden / (sizeof(int4) / sizeof(__nv_bfloat16));
 
     // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
@@ -11961,6 +11996,18 @@ void prepare_megakernel_communication_replay(
         hs.combine_buffer_ptrs, hs.num_max_combine_nvl_chunked_recv_tokens,
         combine_barrier_signal_ptrs, hs.rank, stream, hs.num_rdma_bytes,
         hs.num_nvl_bytes, false, false);
+}
+
+void prepare_megakernel_communication_replay(
+    MegaKernelState* device_state,
+    int** dispatch_barrier_signal_ptrs,
+    int** combine_barrier_signal_ptrs,
+    cudaStream_t stream
+) {
+    MegaKernelState hs;
+    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    prepare_megakernel_communication_replay_host(
+        hs, dispatch_barrier_signal_ptrs, combine_barrier_signal_ptrs, stream);
 }
 
 #if MK_PERF_TRACE_ENABLED
@@ -12217,6 +12264,21 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
 #endif
 }
 
+static void reset_megakernel_post_notify_state(const MegaKernelState& hs, cudaStream_t stream) {
+    const int kRDMA = hs.num_ranks / NUM_MAX_NVL_PEERS;
+    const int NLC = hs.num_logical_channels;
+    const int TK = hs.num_topk;
+    const int combine_rdma_head_stride = hs.num_tokens * kRDMA;
+    const int combine_nvl_head_stride = (hs.num_tokens * TK) * NUM_MAX_NVL_PEERS;
+    auto f = [&](void* p, size_t bytes) { CUDA_CHECK(cudaMemsetAsync(p, 0xff, bytes, stream)); };
+
+    // Backward allocates a fresh state whose ordinary queues/barriers/slot buffers were already
+    // initialized by allocate_megakernel_state_v7. The cached_notify replay can write the combine
+    // send heads, so restore only those before launching the persistent kernel.
+    f(hs.send_rdma_head, (size_t)NLC * combine_rdma_head_stride * sizeof(int));
+    f(hs.send_nvl_head, (size_t)NLC * combine_nvl_head_stride * sizeof(int));
+}
+
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 static void launch_megakernel_v7_backward_case(
     MegaKernelBackwardState* device_bs,
@@ -12252,27 +12314,24 @@ static void launch_megakernel_v7_backward_case(
     moe_megakernel_v7_backward<kNumRDMARanks, kStage, kComputeDType><<<launch_total_sms, kThreads, smem_size, stream>>>(device_bs);
 #endif
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void prepare_megakernel_backward_communication_replay(
-    MegaKernelBackwardState* backward_state,
+    const MegaKernelBackwardHostContext* host_context,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream
 ) {
-    EP_HOST_ASSERT(backward_state != nullptr);
-    MegaKernelBackwardState hs;
-    CUDA_CHECK(cudaMemcpy(
-        &hs, backward_state, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
-    EP_HOST_ASSERT(hs.bwd_device_state != nullptr);
-    prepare_megakernel_communication_replay(
-        hs.bwd_device_state, dispatch_barrier_signal_ptrs,
+    EP_HOST_ASSERT(host_context != nullptr);
+    EP_HOST_ASSERT(host_context->backward_state.bwd_device_state != nullptr);
+    prepare_megakernel_communication_replay_host(
+        host_context->bwd_state, dispatch_barrier_signal_ptrs,
         combine_barrier_signal_ptrs, stream);
 }
 
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
+    const MegaKernelBackwardHostContext* host_context,
     int total_sms,
     int smem_size,
     int stage,
@@ -12280,23 +12339,20 @@ void launch_megakernel_debug_backward(
     cudaStream_t stream
 ) {
     EP_HOST_ASSERT(backward_state != nullptr);
+    EP_HOST_ASSERT(host_context != nullptr);
     EP_HOST_ASSERT(compute_dtype == ComputeDType::kBF16 &&
                    "megakernel debug backward currently supports BF16 only");
 
-    // Fetch the patched forward state to (1) reset transient counters for the re-run and
-    // (2) zero the dX output, then launch the backward megakernel with the same RDMA-rank /
-    // stage specialization as the forward.
-    MegaKernelBackwardState hbs;
-    CUDA_CHECK(cudaMemcpy(&hbs, backward_state, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
-    MegaKernelState hstate;
-    CUDA_CHECK(cudaMemcpy(&hstate, hbs.bwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    // Restore post-notify state and zero the dX output, then launch the backward megakernel with
+    // the same RDMA-rank / stage specialization as the forward.
+    const MegaKernelBackwardState& hbs = host_context->backward_state;
+    const MegaKernelState& hstate = host_context->bwd_state;
 
-    initialize_megakernel_launch_state(hstate, stream);
+    reset_megakernel_post_notify_state(hstate, stream);
     CUDA_CHECK(cudaMemsetAsync(hbs.grad_input, 0,
                                (size_t)hstate.num_tokens * hstate.hidden_dim * sizeof(__nv_bfloat16), stream));
     // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 0);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int num_ranks = hstate.num_ranks;
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
@@ -12328,9 +12384,9 @@ void launch_megakernel_debug_backward(
 
     // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 1);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
 #if MK_PERF_TRACE_ENABLED
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     dump_perf_trace_perfetto(hbs.bwd_device_state, active_total_sms, "backward");
 #endif
 

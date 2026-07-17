@@ -389,6 +389,7 @@ namespace megakernel_debug {
 using ComputeDType = megakernel::ComputeDType;
 struct MegaKernelState;
 struct MegaKernelBackwardState;
+struct MegaKernelBackwardHostContext;
 
 MegaKernelState* allocate_megakernel_state_v7(
     const int4* x,
@@ -449,7 +450,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     __nv_bfloat16* external_bwd_preact = nullptr,
     int* external_fwd_slot_map = nullptr,
     int4* external_combined_x = nullptr,
-    float* external_combined_topk_weights = nullptr);
+    float* external_combined_topk_weights = nullptr,
+    MegaKernelState* host_state_out = nullptr);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
 void free_megakernel_forward_transient(MegaKernelState* device_state);
@@ -485,21 +487,27 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
+    const int* host_expert_count,
     int total_sms,
+    MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream);
-void free_megakernel_backward_state(MegaKernelBackwardState* backward_state);
+void free_megakernel_backward_state(
+    MegaKernelBackwardState* backward_state,
+    const MegaKernelBackwardHostContext* host_context = nullptr);
+void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_context);
 void prepare_megakernel_communication_replay(
     MegaKernelState* device_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
 void prepare_megakernel_backward_communication_replay(
-    MegaKernelBackwardState* backward_state,
+    const MegaKernelBackwardHostContext* host_context,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
 void launch_megakernel_debug_backward(
     MegaKernelBackwardState* backward_state,
+    const MegaKernelBackwardHostContext* host_context,
     int total_sms,
     int smem_size,
     int stage,

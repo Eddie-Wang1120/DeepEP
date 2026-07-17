@@ -58,10 +58,22 @@ struct MegaKernelState;
 
 class MegaKernelAutogradContext {
 public:
-    explicit MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state);
+    MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state,
+                              int num_tokens,
+                              int hidden_dim,
+                              int intermediate_dim,
+                              int num_topk,
+                              int num_local_experts,
+                              std::vector<int> expert_counts);
     ~MegaKernelAutogradContext();
 
     megakernel_debug::MegaKernelState* state() const;
+    int num_tokens() const;
+    int hidden_dim() const;
+    int intermediate_dim() const;
+    int num_topk() const;
+    int num_local_experts() const;
+    const std::vector<int>& expert_counts() const;
 
     // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
     // training state. The MegaKernelState stores only raw data_ptr()s into these tensors, and
@@ -73,6 +85,12 @@ public:
 
 private:
     megakernel_debug::MegaKernelState* state_;
+    int num_tokens_;
+    int hidden_dim_;
+    int intermediate_dim_;
+    int num_topk_;
+    int num_local_experts_;
+    std::vector<int> expert_counts_;
     std::vector<torch::Tensor> retained_layout_tensors_;
 };
 

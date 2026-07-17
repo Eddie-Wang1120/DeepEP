@@ -1,12 +1,11 @@
-"""Megakernel forward/backward alignment against Megatron's fused TE MoE path.
+"""Megakernel forward/backward alignment against high-performance MoE baselines.
 
-The baseline follows Megatron's high-performance routed-expert path:
+The default baseline follows Megatron's fused TE path:
 DeepEP dispatch -> fused permutation -> TE GroupedLinear/ScaledSwiGLU/GroupedLinear
 -> fused unpermutation -> DeepEP combine.
 
-The current megakernel backward only produces dX, so this test compares forward output
-and input gradients. Router-probability and expert-weight gradients are intentionally out
-of scope until the CUDA backward implements them.
+The optional SonicMoE baseline keeps the same DeepEP routing semantics and uses
+SonicMoE's external-routing QuACK path directly between dispatch and combine.
 """
 import argparse
 import os
@@ -26,7 +25,14 @@ if 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:
         os.environ['CUDA_VISIBLE_DEVICES'] = _local_rank
 
 import re
+import sys
 from pathlib import Path
+
+# Running from the DeepEP-PFCC root otherwise resolves ``quack/`` as a namespace
+# package instead of the bundled ``quack/quack`` Python package.
+_LOCAL_QUACK_ROOT = Path(__file__).resolve().parents[1] / 'quack'
+if (_LOCAL_QUACK_ROOT / 'quack' / '__init__.py').is_file():
+    sys.path.insert(0, str(_LOCAL_QUACK_ROOT))
 
 import torch
 import torch.distributed as dist
@@ -78,6 +84,28 @@ def _load_quack_gemm():
 def quack_available():
     return _load_quack_gemm() is not None
 
+
+_sonicmoe_general_routing = None
+_SONICMOE_ACTIVATION_TYPE = None
+_SONICMOE_IMPORT_ERROR = None
+_SONICMOE_LOADED = False
+
+
+def _load_sonicmoe():
+    global _sonicmoe_general_routing, _SONICMOE_ACTIVATION_TYPE
+    global _SONICMOE_IMPORT_ERROR, _SONICMOE_LOADED
+    if not _SONICMOE_LOADED:
+        _SONICMOE_LOADED = True
+        try:
+            from sonicmoe import moe_general_routing_inputs
+            from sonicmoe.enums import ActivationType
+            _sonicmoe_general_routing = moe_general_routing_inputs
+            _SONICMOE_ACTIVATION_TYPE = ActivationType
+        except Exception as exc:  # pragma: no cover - environment dependent
+            _sonicmoe_general_routing = None
+            _SONICMOE_ACTIVATION_TYPE = None
+            _SONICMOE_IMPORT_ERROR = exc
+    return _sonicmoe_general_routing
 
 
 def quack_grouped_wgrad(A_src, B_packed, cu_seqlens_k, A_idx, *, out=None):
@@ -162,7 +190,6 @@ import argparse
 import contextlib
 import math
 import os
-import sys
 from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
@@ -322,6 +349,49 @@ def run_megatron_fused_baseline(x, topk_idx, topk_weights, num_experts,
     return MegatronFusedCombine.apply(local_output, buffer, handle)
 
 
+def sonicmoe_routing_from_deepep(recv_idx, recv_probs, experts_per_rank):
+    """Flatten valid DeepEP local routes without CPU synchronization."""
+    if recv_idx.shape != recv_probs.shape:
+        raise ValueError(
+            f'DeepEP route index/probability shape mismatch: '
+            f'{tuple(recv_idx.shape)} vs {tuple(recv_probs.shape)}')
+    valid = (recv_idx >= 0) & (recv_idx < experts_per_rank)
+    token_indices = torch.arange(
+        recv_idx.shape[0], device=recv_idx.device, dtype=torch.int32,
+    ).unsqueeze(1).expand_as(recv_idx)[valid].contiguous()
+    expert_indices = recv_idx[valid].to(torch.int32).contiguous()
+    router_scores = recv_probs[valid].float().contiguous()
+    return router_scores, token_indices, expert_indices
+
+
+def run_deepep_sonicmoe_baseline(x, topk_idx, topk_weights, num_experts,
+                                  experts_per_rank, buffer, W_gateup, W_down):
+    sonicmoe_general_routing = _load_sonicmoe()
+    if sonicmoe_general_routing is None:
+        raise RuntimeError(f'SonicMoE is not importable: {_SONICMOE_IMPORT_ERROR!r}')
+
+    recv_x, recv_idx, recv_probs, _tokens_per_expert, handle = MegatronFusedDispatch.apply(
+        x, topk_idx, topk_weights, num_experts, buffer)
+    router_scores, token_indices, expert_indices = sonicmoe_routing_from_deepep(
+        recv_idx, recv_probs, experts_per_rank)
+    local_output, _expert_frequency = sonicmoe_general_routing(
+        recv_x,
+        router_scores,
+        token_indices,
+        expert_indices,
+        W_gateup.permute(1, 2, 0),
+        None,
+        W_down.permute(1, 2, 0),
+        None,
+        experts_per_rank,
+        None,
+        _SONICMOE_ACTIVATION_TYPE.SWIGLU,
+        False,
+        concat_layout=False,
+    )
+    return MegatronFusedCombine.apply(local_output, buffer, handle)
+
+
 def compare_tensor(name, baseline, actual, rank, max_abs_tol, calc_diff_tol, cos_tol):
     baseline = baseline.to(device=actual.device)
     diff = calc_diff(baseline, actual)
@@ -389,10 +459,10 @@ def finish_memory_measurement(start_allocated, activation_retained, phase):
     return activation_retained, peak_allocated, peak_reserved
 
 
-def report_memory_comparison(baseline_memory, megakernel_memory):
-    """Print megakernel minus DeepEP+TE memory for the same test case."""
+def report_memory_comparison(baseline_memory, megakernel_memory, baseline_name):
+    """Print megakernel minus baseline memory for the same test case."""
     names = ('forward activation retained', 'peak allocated increment (fwd+bwd)', 'peak reserved')
-    print('  [Memory comparison] Megakernel - DeepEP + TE:', flush=True)
+    print(f'  [Memory comparison] Megakernel - {baseline_name}:', flush=True)
     for name, baseline_value, megakernel_value in zip(
         names, baseline_memory, megakernel_memory):
         delta = megakernel_value - baseline_value
@@ -443,10 +513,21 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     W_gateup[:, 1::2, :] = W_up
     W_gateup = W_gateup.contiguous()
 
-    te_experts = build_te_grouped_experts(
-        W_gate.detach(), W_up.detach(), W_down.detach(), case.experts_per_rank)
-    for parameter in te_experts.parameters():
-        parameter.requires_grad_(True)
+    baseline_name = 'DeepEP + TE' if args.baseline_backend == 'te' else 'DeepEP + SonicMoE'
+    te_experts = None
+    sonicmoe_w_gateup = None
+    sonicmoe_w_down = None
+    if not args.skip_baseline:
+        if args.baseline_backend == 'te':
+            te_experts = build_te_grouped_experts(
+                W_gate.detach(), W_up.detach(), W_down.detach(), case.experts_per_rank)
+            for parameter in te_experts.parameters():
+                parameter.requires_grad_(True)
+        else:
+            if _load_sonicmoe() is None:
+                raise RuntimeError(f'SonicMoE is not importable: {_SONICMOE_IMPORT_ERROR!r}')
+            sonicmoe_w_gateup = W_gateup.detach().clone().requires_grad_(True)
+            sonicmoe_w_down = W_down.detach().clone().requires_grad_(True)
     buffer.set_num_sms(args.baseline_sms)
 
     if rank == 0:
@@ -454,98 +535,140 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         print(f'=== Forward/backward case {case_idx + 1} ===', flush=True)
         print(
             f'  tokens={case.num_tokens}, hidden={case.hidden}, intermediate={case.intermediate}, '
-            f'experts_per_rank={case.experts_per_rank}, topk={case.num_topk}, ranks={num_ranks}',
+            f'experts_per_rank={case.experts_per_rank}, topk={case.num_topk}, ranks={num_ranks}, '
+            f'baseline={baseline_name}',
             flush=True,
         )
 
     torch.manual_seed(2000 + rank + case_idx * 1000003)
     grad_output = torch.randn_like(x)
 
-    # Megatron high-performance baseline with the complete training gradients used by
-    # the real fused MoE path: dX, expert weight gradients, and route-prob gradients.
+    # Both baselines expose the complete training gradients used by the real routed
+    # expert path: dX, expert weight gradients, and route-probability gradients.
     if not args.skip_baseline:
         for w in range(10):
             if local_rank == 0:
-                print(f'[Rank {rank}] Baseline warmup {w + 1}/{args.warmup}', flush=True)
-            clear_parameter_grads(te_experts)
+                print(
+                    f'[Rank {rank}] {baseline_name} warmup {w + 1}/{args.warmup}',
+                    flush=True,
+                )
+            if args.baseline_backend == 'te':
+                clear_parameter_grads(te_experts)
+            else:
+                sonicmoe_w_gateup.grad = None
+                sonicmoe_w_down.grad = None
             warmup_x = x.detach().clone().requires_grad_(True)
             warmup_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-            with nvtx_range(f'DeepEP+TE forward iter={w} rank={rank}'):
-                warmup_output = run_megatron_fused_baseline(
-                    warmup_x, topk_idx, warmup_topk_weights, num_experts,
-                    case.experts_per_rank, buffer, te_experts,
-                )
+            with nvtx_range(f'{baseline_name} forward iter={w} rank={rank}'):
+                if args.baseline_backend == 'te':
+                    warmup_output = run_megatron_fused_baseline(
+                        warmup_x, topk_idx, warmup_topk_weights, num_experts,
+                        case.experts_per_rank, buffer, te_experts,
+                    )
+                else:
+                    warmup_output = run_deepep_sonicmoe_baseline(
+                        warmup_x, topk_idx, warmup_topk_weights, num_experts,
+                        case.experts_per_rank, buffer,
+                        sonicmoe_w_gateup, sonicmoe_w_down,
+                    )
             if not warmup_output.requires_grad:
-                raise AssertionError('Megatron fused baseline output is not connected to autograd')
-            with nvtx_range(f'DeepEP+TE backward iter={w} rank={rank}'):
+                raise AssertionError(f'{baseline_name} output is not connected to autograd')
+            with nvtx_range(f'{baseline_name} backward iter={w} rank={rank}'):
                 warmup_output.backward(grad_output)
         if args.warmup > 0:
-            clear_parameter_grads(te_experts)
+            if args.baseline_backend == 'te':
+                clear_parameter_grads(te_experts)
+            else:
+                sonicmoe_w_gateup.grad = None
+                sonicmoe_w_down.grad = None
             dist.barrier(group=group)
             torch.cuda.synchronize()
 
-        clear_parameter_grads(te_experts)
+        if args.baseline_backend == 'te':
+            clear_parameter_grads(te_experts)
+        else:
+            sonicmoe_w_gateup.grad = None
+            sonicmoe_w_down.grad = None
         dist.barrier(group=group)
         baseline_mem_start = start_memory_measurement()
         baseline_x = x.detach().clone().requires_grad_(True)
         baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-        baseline_output = run_megatron_fused_baseline(
-            baseline_x, topk_idx, baseline_topk_weights, num_experts,
-            case.experts_per_rank, buffer, te_experts,
-        )
+        if args.baseline_backend == 'te':
+            baseline_output = run_megatron_fused_baseline(
+                baseline_x, topk_idx, baseline_topk_weights, num_experts,
+                case.experts_per_rank, buffer, te_experts,
+            )
+        else:
+            baseline_output = run_deepep_sonicmoe_baseline(
+                baseline_x, topk_idx, baseline_topk_weights, num_experts,
+                case.experts_per_rank, buffer,
+                sonicmoe_w_gateup, sonicmoe_w_down,
+            )
         if not baseline_output.requires_grad:
-            raise AssertionError('Megatron fused baseline output is not connected to autograd')
+            raise AssertionError(f'{baseline_name} output is not connected to autograd')
         baseline_activation_retained = record_forward_memory(baseline_mem_start)
         baseline_output.backward(grad_output)
         baseline_memory = finish_memory_measurement(
-            baseline_mem_start, baseline_activation_retained, 'DeepEP + TE')
+            baseline_mem_start, baseline_activation_retained, baseline_name)
         baseline_grad_x = baseline_x.grad.detach()
         baseline_grad_topk_weights = baseline_topk_weights.grad.detach()
 
-        expert_weight_grads = [
-            parameter.grad.detach()
-            for parameter in te_experts.parameters()
-            if parameter.grad is not None
-        ]
-        if len(expert_weight_grads) != 2:
-            raise AssertionError(
-                f'Expected TE FC1/FC2 weight gradients, got {len(expert_weight_grads)} tensors')
-        baseline_fc1_grad, baseline_grad_w_down = expert_weight_grads
-        expected_fc1_shape = (case.experts_per_rank, 2 * case.intermediate, case.hidden)
-        expected_fc2_shape = (case.experts_per_rank, case.hidden, case.intermediate)
-        if tuple(baseline_fc1_grad.shape) != expected_fc1_shape:
-            raise AssertionError(
-                f'Unexpected TE FC1 grad shape {tuple(baseline_fc1_grad.shape)}, '
-                f'expected {expected_fc1_shape}')
-        if tuple(baseline_grad_w_down.shape) != expected_fc2_shape:
-            raise AssertionError(
-                f'Unexpected TE FC2 grad shape {tuple(baseline_grad_w_down.shape)}, '
-                f'expected {expected_fc2_shape}')
+        if args.baseline_backend == 'te':
+            expert_weight_grads = [
+                parameter.grad.detach()
+                for parameter in te_experts.parameters()
+                if parameter.grad is not None
+            ]
+            if len(expert_weight_grads) != 2:
+                raise AssertionError(
+                    f'Expected TE FC1/FC2 weight gradients, got {len(expert_weight_grads)} tensors')
+            baseline_fc1_grad, baseline_grad_w_down = expert_weight_grads
+            expected_fc1_shape = (case.experts_per_rank, 2 * case.intermediate, case.hidden)
+            expected_fc2_shape = (case.experts_per_rank, case.hidden, case.intermediate)
+            if tuple(baseline_fc1_grad.shape) != expected_fc1_shape:
+                raise AssertionError(
+                    f'Unexpected TE FC1 grad shape {tuple(baseline_fc1_grad.shape)}, '
+                    f'expected {expected_fc1_shape}')
+            if tuple(baseline_grad_w_down.shape) != expected_fc2_shape:
+                raise AssertionError(
+                    f'Unexpected TE FC2 grad shape {tuple(baseline_grad_w_down.shape)}, '
+                    f'expected {expected_fc2_shape}')
 
-        baseline_grad_w_gate = torch.empty_like(W_gate)
-        baseline_grad_w_up = torch.empty_like(W_up)
-        chunk_base = 0
-        for start in range(0, case.intermediate, 32):
-            rows = min(32, case.intermediate - start)
-            baseline_grad_w_gate[:, start:start + rows, :] = baseline_fc1_grad[
-                :, chunk_base:chunk_base + rows, :]
-            baseline_grad_w_up[:, start:start + rows, :] = baseline_fc1_grad[
-                :, chunk_base + rows:chunk_base + 2 * rows, :]
-            chunk_base += 2 * rows
-        baseline_grad_w_gateup = torch.empty_like(W_gateup)
-        baseline_grad_w_gateup[:, 0::2, :] = baseline_grad_w_gate
-        baseline_grad_w_gateup[:, 1::2, :] = baseline_grad_w_up
-        baseline_grad_w_gateup = baseline_grad_w_gateup.contiguous().cpu()
+            baseline_grad_w_gate = torch.empty_like(W_gate)
+            baseline_grad_w_up = torch.empty_like(W_up)
+            chunk_base = 0
+            for start in range(0, case.intermediate, 32):
+                rows = min(32, case.intermediate - start)
+                baseline_grad_w_gate[:, start:start + rows, :] = baseline_fc1_grad[
+                    :, chunk_base:chunk_base + rows, :]
+                baseline_grad_w_up[:, start:start + rows, :] = baseline_fc1_grad[
+                    :, chunk_base + rows:chunk_base + 2 * rows, :]
+                chunk_base += 2 * rows
+            baseline_grad_w_gateup = torch.empty_like(W_gateup)
+            baseline_grad_w_gateup[:, 0::2, :] = baseline_grad_w_gate
+            baseline_grad_w_gateup[:, 1::2, :] = baseline_grad_w_up
+            baseline_grad_w_gateup = baseline_grad_w_gateup.contiguous()
+        else:
+            if sonicmoe_w_gateup.grad is None or sonicmoe_w_down.grad is None:
+                raise AssertionError('SonicMoE backward did not return expert weight gradients')
+            baseline_grad_w_gateup = sonicmoe_w_gateup.grad.detach()
+            baseline_grad_w_down = sonicmoe_w_down.grad.detach()
+
+        baseline_grad_w_gateup = baseline_grad_w_gateup.cpu()
         baseline_output_reference = baseline_output.detach().cpu()
         baseline_grad_x = baseline_grad_x.cpu()
         baseline_grad_topk_weights = baseline_grad_topk_weights.cpu()
         baseline_grad_w_down = baseline_grad_w_down.cpu()
-        clear_parameter_grads(te_experts)
+        if args.baseline_backend == 'te':
+            clear_parameter_grads(te_experts)
+        else:
+            sonicmoe_w_gateup.grad = None
+            sonicmoe_w_down.grad = None
         del baseline_x, baseline_topk_weights, baseline_output
         torch.cuda.empty_cache()
     else:
         if rank == 0:
-            print('[skip-baseline] Skipping DeepEP + TE warmup and measured run', flush=True)
+            print(f'[skip-baseline] Skipping {baseline_name} warmup and measured run', flush=True)
         baseline_memory = None
 
     # Fused debug megakernel path connected through torch.autograd.Function.
@@ -597,7 +720,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     megakernel_memory = finish_memory_measurement(
         megakernel_mem_start, megakernel_activation_retained, 'Megakernel')
     if not args.skip_baseline:
-        report_memory_comparison(baseline_memory, megakernel_memory)
+        report_memory_comparison(baseline_memory, megakernel_memory, baseline_name)
     print("Megakernel backward complete.")
 
     megakernel_grad_x = megakernel_x.grad.detach()
@@ -705,13 +828,15 @@ def run_mpirun(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Compare megakernel forward/dX with Megatron fused TE MoE')
+        description='Compare megakernel forward/backward with DeepEP + TE or SonicMoE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
-    parser.add_argument('--warmup', type=int, default=10,
+    parser.add_argument('--warmup', type=int, default=10000,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--skip-baseline', action='store_true',
-                        help='Skip the DeepEP + TE baseline warmup and measured run (and the precision comparisons against it); only run the megakernel path')
+                        help='Skip the selected baseline warmup and measured run (and its precision comparisons); only run the megakernel path')
+    parser.add_argument('--baseline-backend', choices=['te', 'sonicmoe'], default='te',
+                        help='Expert compute backend between DeepEP dispatch and combine')
     parser.add_argument('--perf-trace-retention', choices=['last', 'all'], default='last',
                         help='With MK_PERF_TRACE, keep only the last iter traces by default; use all to keep every iter')
     parser.add_argument('--perf-trace-dir', default='.',
@@ -742,9 +867,9 @@ def parse_args():
     if args.quack_wgrad_selftest:
         # Standalone QuACK precision check does not need the TE baseline.
         return args
-    if te_ops_unavailable():
+    if not args.skip_baseline and args.baseline_backend == 'te' and te_ops_unavailable():
         raise RuntimeError(
-            'This test requires Transformer Engine ops for the Megatron high-performance baseline')
+            'The DeepEP + TE baseline requires Transformer Engine MoE ops')
     if args.num_cases <= 0 or args.num_cases > len(TEST_CASES):
         raise ValueError(f'--num-cases must be in [1, {len(TEST_CASES)}]')
     return args
