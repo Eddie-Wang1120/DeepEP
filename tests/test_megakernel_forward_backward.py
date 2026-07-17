@@ -17,9 +17,13 @@ import os
 # initialize CUDA on physical device 0 for every local rank, which later makes
 # NCCL raise "Duplicate GPU detected". Pin CUDA_VISIBLE_DEVICES from the MPI
 # local-rank here, before those imports run.
+# NOTE: use unconditional assignment (not setdefault) because mpirun may
+# propagate an empty-string CUDA_VISIBLE_DEVICES from the launch shell,
+# and setdefault treats any existing key (even '') as already set.
 if 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ:
-    os.environ.setdefault(
-        'CUDA_VISIBLE_DEVICES', os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+    _local_rank = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
+    if not os.environ.get('CUDA_VISIBLE_DEVICES'):
+        os.environ['CUDA_VISIBLE_DEVICES'] = _local_rank
 
 import re
 from pathlib import Path
@@ -191,6 +195,15 @@ TEST_CASES = [
 ]
 
 
+@contextlib.contextmanager
+def nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 TRACE_RE = re.compile(
     r"(mk|deepep)_perf_trace_rank(\d+)(?:_(forward|backward|dispatch|combine|notify))?(?:_iter(\d+))?\.json$"
 )
@@ -353,15 +366,23 @@ def record_forward_memory(start_allocated):
 
 
 def finish_memory_measurement(start_allocated, activation_retained, phase):
-    """Report peak allocator usage for one complete forward/backward pair."""
+    """Report peak allocator usage for one complete forward/backward pair.
+
+    peak allocated is the increment over the resident set that already existed
+    when the window started (max_memory_allocated - start_allocated). Reporting
+    the increment instead of the absolute peak keeps persistent tensors that are
+    alive before the window (expert weights, weight clones, te_experts, inputs)
+    from contaminating the baseline-vs-megakernel delta, since those differ
+    between the two phases. peak reserved stays absolute as a pool diagnostic.
+    """
     torch.cuda.synchronize()
-    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_allocated = max(0, torch.cuda.max_memory_allocated() - start_allocated)
     peak_reserved = torch.cuda.max_memory_reserved()
     print(
         f'  [{phase} memory] forward activation retained: '
         f'{activation_retained / 1024 ** 2:.2f} MiB, '
-        f'peak allocated (fwd+bwd): {peak_allocated / 1024 ** 2:.2f} MiB, '
-        f'peak reserved: {peak_reserved / 1024 ** 2:.2f} MiB, '
+        f'peak allocated increment (fwd+bwd): {peak_allocated / 1024 ** 2:.2f} MiB, '
+        f'peak reserved (absolute): {peak_reserved / 1024 ** 2:.2f} MiB, '
         f'allocated before forward: {start_allocated / 1024 ** 2:.2f} MiB',
         flush=True,
     )
@@ -370,7 +391,7 @@ def finish_memory_measurement(start_allocated, activation_retained, phase):
 
 def report_memory_comparison(baseline_memory, megakernel_memory):
     """Print megakernel minus DeepEP+TE memory for the same test case."""
-    names = ('forward activation retained', 'peak allocated (fwd+bwd)', 'peak reserved')
+    names = ('forward activation retained', 'peak allocated increment (fwd+bwd)', 'peak reserved')
     print('  [Memory comparison] Megakernel - DeepEP + TE:', flush=True)
     for name, baseline_value, megakernel_value in zip(
         names, baseline_memory, megakernel_memory):
@@ -442,83 +463,90 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     # Megatron high-performance baseline with the complete training gradients used by
     # the real fused MoE path: dX, expert weight gradients, and route-prob gradients.
-    for w in range(args.warmup):
-        if local_rank == 0:
-            print(f'[Rank {rank}] Baseline warmup {w + 1}/{args.warmup}', flush=True)
-        clear_parameter_grads(te_experts)
-        warmup_x = x.detach().clone().requires_grad_(True)
-        warmup_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-        warmup_output = run_megatron_fused_baseline(
-            warmup_x, topk_idx, warmup_topk_weights, num_experts,
-            case.experts_per_rank, buffer, te_experts,
-        )
-        if not warmup_output.requires_grad:
-            raise AssertionError('Megatron fused baseline output is not connected to autograd')
-        warmup_output.backward(grad_output)
-    if args.warmup > 0:
+    if not args.skip_baseline:
+        for w in range(10):
+            if local_rank == 0:
+                print(f'[Rank {rank}] Baseline warmup {w + 1}/{args.warmup}', flush=True)
+            clear_parameter_grads(te_experts)
+            warmup_x = x.detach().clone().requires_grad_(True)
+            warmup_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+            with nvtx_range(f'DeepEP+TE forward iter={w} rank={rank}'):
+                warmup_output = run_megatron_fused_baseline(
+                    warmup_x, topk_idx, warmup_topk_weights, num_experts,
+                    case.experts_per_rank, buffer, te_experts,
+                )
+            if not warmup_output.requires_grad:
+                raise AssertionError('Megatron fused baseline output is not connected to autograd')
+            with nvtx_range(f'DeepEP+TE backward iter={w} rank={rank}'):
+                warmup_output.backward(grad_output)
+        if args.warmup > 0:
+            clear_parameter_grads(te_experts)
+            dist.barrier(group=group)
+            torch.cuda.synchronize()
+
         clear_parameter_grads(te_experts)
         dist.barrier(group=group)
-        torch.cuda.synchronize()
+        baseline_mem_start = start_memory_measurement()
+        baseline_x = x.detach().clone().requires_grad_(True)
+        baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+        baseline_output = run_megatron_fused_baseline(
+            baseline_x, topk_idx, baseline_topk_weights, num_experts,
+            case.experts_per_rank, buffer, te_experts,
+        )
+        if not baseline_output.requires_grad:
+            raise AssertionError('Megatron fused baseline output is not connected to autograd')
+        baseline_activation_retained = record_forward_memory(baseline_mem_start)
+        baseline_output.backward(grad_output)
+        baseline_memory = finish_memory_measurement(
+            baseline_mem_start, baseline_activation_retained, 'DeepEP + TE')
+        baseline_grad_x = baseline_x.grad.detach()
+        baseline_grad_topk_weights = baseline_topk_weights.grad.detach()
 
-    clear_parameter_grads(te_experts)
-    dist.barrier(group=group)
-    baseline_mem_start = start_memory_measurement()
-    baseline_x = x.detach().clone().requires_grad_(True)
-    baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-    baseline_output = run_megatron_fused_baseline(
-        baseline_x, topk_idx, baseline_topk_weights, num_experts,
-        case.experts_per_rank, buffer, te_experts,
-    )
-    if not baseline_output.requires_grad:
-        raise AssertionError('Megatron fused baseline output is not connected to autograd')
-    baseline_activation_retained = record_forward_memory(baseline_mem_start)
-    baseline_output.backward(grad_output)
-    baseline_memory = finish_memory_measurement(
-        baseline_mem_start, baseline_activation_retained, 'DeepEP + TE')
-    baseline_grad_x = baseline_x.grad.detach()
-    baseline_grad_topk_weights = baseline_topk_weights.grad.detach()
+        expert_weight_grads = [
+            parameter.grad.detach()
+            for parameter in te_experts.parameters()
+            if parameter.grad is not None
+        ]
+        if len(expert_weight_grads) != 2:
+            raise AssertionError(
+                f'Expected TE FC1/FC2 weight gradients, got {len(expert_weight_grads)} tensors')
+        baseline_fc1_grad, baseline_grad_w_down = expert_weight_grads
+        expected_fc1_shape = (case.experts_per_rank, 2 * case.intermediate, case.hidden)
+        expected_fc2_shape = (case.experts_per_rank, case.hidden, case.intermediate)
+        if tuple(baseline_fc1_grad.shape) != expected_fc1_shape:
+            raise AssertionError(
+                f'Unexpected TE FC1 grad shape {tuple(baseline_fc1_grad.shape)}, '
+                f'expected {expected_fc1_shape}')
+        if tuple(baseline_grad_w_down.shape) != expected_fc2_shape:
+            raise AssertionError(
+                f'Unexpected TE FC2 grad shape {tuple(baseline_grad_w_down.shape)}, '
+                f'expected {expected_fc2_shape}')
 
-    expert_weight_grads = [
-        parameter.grad.detach()
-        for parameter in te_experts.parameters()
-        if parameter.grad is not None
-    ]
-    if len(expert_weight_grads) != 2:
-        raise AssertionError(
-            f'Expected TE FC1/FC2 weight gradients, got {len(expert_weight_grads)} tensors')
-    baseline_fc1_grad, baseline_grad_w_down = expert_weight_grads
-    expected_fc1_shape = (case.experts_per_rank, 2 * case.intermediate, case.hidden)
-    expected_fc2_shape = (case.experts_per_rank, case.hidden, case.intermediate)
-    if tuple(baseline_fc1_grad.shape) != expected_fc1_shape:
-        raise AssertionError(
-            f'Unexpected TE FC1 grad shape {tuple(baseline_fc1_grad.shape)}, '
-            f'expected {expected_fc1_shape}')
-    if tuple(baseline_grad_w_down.shape) != expected_fc2_shape:
-        raise AssertionError(
-            f'Unexpected TE FC2 grad shape {tuple(baseline_grad_w_down.shape)}, '
-            f'expected {expected_fc2_shape}')
-
-    baseline_grad_w_gate = torch.empty_like(W_gate)
-    baseline_grad_w_up = torch.empty_like(W_up)
-    chunk_base = 0
-    for start in range(0, case.intermediate, 32):
-        rows = min(32, case.intermediate - start)
-        baseline_grad_w_gate[:, start:start + rows, :] = baseline_fc1_grad[
-            :, chunk_base:chunk_base + rows, :]
-        baseline_grad_w_up[:, start:start + rows, :] = baseline_fc1_grad[
-            :, chunk_base + rows:chunk_base + 2 * rows, :]
-        chunk_base += 2 * rows
-    baseline_grad_w_gateup = torch.empty_like(W_gateup)
-    baseline_grad_w_gateup[:, 0::2, :] = baseline_grad_w_gate
-    baseline_grad_w_gateup[:, 1::2, :] = baseline_grad_w_up
-    baseline_grad_w_gateup = baseline_grad_w_gateup.contiguous().cpu()
-    baseline_output_reference = baseline_output.detach().cpu()
-    baseline_grad_x = baseline_grad_x.cpu()
-    baseline_grad_topk_weights = baseline_grad_topk_weights.cpu()
-    baseline_grad_w_down = baseline_grad_w_down.cpu()
-    clear_parameter_grads(te_experts)
-    del baseline_x, baseline_topk_weights, baseline_output
-    torch.cuda.empty_cache()
+        baseline_grad_w_gate = torch.empty_like(W_gate)
+        baseline_grad_w_up = torch.empty_like(W_up)
+        chunk_base = 0
+        for start in range(0, case.intermediate, 32):
+            rows = min(32, case.intermediate - start)
+            baseline_grad_w_gate[:, start:start + rows, :] = baseline_fc1_grad[
+                :, chunk_base:chunk_base + rows, :]
+            baseline_grad_w_up[:, start:start + rows, :] = baseline_fc1_grad[
+                :, chunk_base + rows:chunk_base + 2 * rows, :]
+            chunk_base += 2 * rows
+        baseline_grad_w_gateup = torch.empty_like(W_gateup)
+        baseline_grad_w_gateup[:, 0::2, :] = baseline_grad_w_gate
+        baseline_grad_w_gateup[:, 1::2, :] = baseline_grad_w_up
+        baseline_grad_w_gateup = baseline_grad_w_gateup.contiguous().cpu()
+        baseline_output_reference = baseline_output.detach().cpu()
+        baseline_grad_x = baseline_grad_x.cpu()
+        baseline_grad_topk_weights = baseline_grad_topk_weights.cpu()
+        baseline_grad_w_down = baseline_grad_w_down.cpu()
+        clear_parameter_grads(te_experts)
+        del baseline_x, baseline_topk_weights, baseline_output
+        torch.cuda.empty_cache()
+    else:
+        if rank == 0:
+            print('[skip-baseline] Skipping DeepEP + TE warmup and measured run', flush=True)
+        baseline_memory = None
 
     # Fused debug megakernel path connected through torch.autograd.Function.
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -529,15 +557,17 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         warmup_mk_topk_weights = topk_weights.detach().clone().requires_grad_(True)
         warmup_mk_w_gateup = W_gateup.detach().clone().requires_grad_(True)
         warmup_mk_w_down = W_down.detach().clone().requires_grad_(True)
-        warmup_mk_output = buffer.megakernel_debug_autograd(
-            warmup_mk_x, topk_idx, warmup_mk_topk_weights,
-            warmup_mk_w_gateup, warmup_mk_w_down, num_experts,
-            num_dispatch_sms=args.megakernel_comm_sms,
-            num_combine_sms=args.megakernel_comm_sms,
-            total_sms=num_sms,
-            stage=args.stage,
-        )
-        warmup_mk_output.backward(grad_output)
+        with nvtx_range(f'Megakernel forward iter={w} rank={rank}'):
+            warmup_mk_output = buffer.megakernel_debug_autograd(
+                warmup_mk_x, topk_idx, warmup_mk_topk_weights,
+                warmup_mk_w_gateup, warmup_mk_w_down, num_experts,
+                num_dispatch_sms=args.megakernel_comm_sms,
+                num_combine_sms=args.megakernel_comm_sms,
+                total_sms=num_sms,
+                stage=args.stage,
+            )
+        with nvtx_range(f'Megakernel backward iter={w} rank={rank}'):
+            warmup_mk_output.backward(grad_output)
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
@@ -566,7 +596,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     megakernel_memory = finish_memory_measurement(
         megakernel_mem_start, megakernel_activation_retained, 'Megakernel')
-    report_memory_comparison(baseline_memory, megakernel_memory)
+    if not args.skip_baseline:
+        report_memory_comparison(baseline_memory, megakernel_memory)
     print("Megakernel backward complete.")
 
     megakernel_grad_x = megakernel_x.grad.detach()
@@ -575,27 +606,28 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     if megakernel_topk_weights.grad is None:
         raise AssertionError('Megakernel backward did not return dTopKWeights')
 
-    compare_tensor(
-        'forward', baseline_output_reference, megakernel_output.detach(), rank,
-        args.forward_max_abs_tol, args.forward_calc_diff_tol, args.forward_cos_tol,
-    )
-    compare_tensor(
-        'Backward dX', baseline_grad_x, megakernel_grad_x, rank,
-        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
-    )
-    compare_tensor(
-        'Backward dW_gateup', baseline_grad_w_gateup, megakernel_w_gateup.grad.detach(), rank,
-        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
-    )
-    compare_tensor(
-        'Backward dW_down', baseline_grad_w_down, megakernel_w_down.grad.detach(), rank,
-        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
-    )
-    compare_tensor(
-        'Backward dTopKWeights', baseline_grad_topk_weights,
-        megakernel_topk_weights.grad.detach(), rank,
-        args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
-    )
+    if not args.skip_baseline:
+        compare_tensor(
+            'forward', baseline_output_reference, megakernel_output.detach(), rank,
+            args.forward_max_abs_tol, args.forward_calc_diff_tol, args.forward_cos_tol,
+        )
+        compare_tensor(
+            'Backward dX', baseline_grad_x, megakernel_grad_x, rank,
+            args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+        )
+        compare_tensor(
+            'Backward dW_gateup', baseline_grad_w_gateup, megakernel_w_gateup.grad.detach(), rank,
+            args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+        )
+        compare_tensor(
+            'Backward dW_down', baseline_grad_w_down, megakernel_w_down.grad.detach(), rank,
+            args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+        )
+        compare_tensor(
+            'Backward dTopKWeights', baseline_grad_topk_weights,
+            megakernel_topk_weights.grad.detach(), rank,
+            args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+        )
 
     dist.barrier(group=group)
     torch.cuda.synchronize()
@@ -676,8 +708,10 @@ def parse_args():
         description='Compare megakernel forward/dX with Megatron fused TE MoE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
-    parser.add_argument('--warmup', type=int, default=20,
+    parser.add_argument('--warmup', type=int, default=10,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
+    parser.add_argument('--skip-baseline', action='store_true',
+                        help='Skip the DeepEP + TE baseline warmup and measured run (and the precision comparisons against it); only run the megakernel path')
     parser.add_argument('--perf-trace-retention', choices=['last', 'all'], default='last',
                         help='With MK_PERF_TRACE, keep only the last iter traces by default; use all to keep every iter')
     parser.add_argument('--perf-trace-dir', default='.',
@@ -720,7 +754,7 @@ def te_ops_unavailable():
     try:
         import transformer_engine.pytorch.ops  # noqa: F401
         from transformer_engine.pytorch import moe_permute_with_probs, moe_unpermute  # noqa: F401
-    except ImportError:
+    except Exception:
         return True
     return False
 
