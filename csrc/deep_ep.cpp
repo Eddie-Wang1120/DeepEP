@@ -2092,12 +2092,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         EP_HOST_ASSERT(W_down_fp8_sf.size(0) == num_local_experts && W_down_fp8_sf.size(1) == hidden_dim && W_down_fp8_sf.size(2) == fp8_intermediate_scale_k_packed);
     }
 
-    // SM allocation: dispatch -> combine -> scheduler -> compute groups, leaving any remainder reserved.
+    // SM allocation: dispatch -> combine -> scheduler -> compute groups -> gather, leaving any remainder reserved.
     constexpr int compute_group_size = megakernel_config::kComputeGroupSize;
     constexpr int compute_cluster_dim = megakernel_config::kComputeClusterDim;
-    // Scheduler region keeps fixed SMs for layout compatibility; only scheduler SM #0
-    // does work today, #1 idles (see compute_scheduler_worker gating in the debug kernel).
     constexpr int compute_scheduler_sms = megakernel_config::kComputeSchedulerSms;
+    constexpr int gather_sms = megakernel_config::kGatherSms;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;

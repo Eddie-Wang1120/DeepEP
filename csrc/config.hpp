@@ -9,7 +9,8 @@ namespace megakernel_config {
 
 constexpr int kComputeBatchSize = 1024;  // Tokens per expert batch before triggering GEMM.
 constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
-constexpr int kComputeSchedulerSms = 2;
+constexpr int kComputeSchedulerSms = 1;
+constexpr int kGatherSms = 3;
 constexpr int kPrioritySchedTidBegin = 576;
 constexpr int kGatherSchedTidBegin = 608;
 constexpr int kNormalSchedThreads = kPrioritySchedTidBegin;

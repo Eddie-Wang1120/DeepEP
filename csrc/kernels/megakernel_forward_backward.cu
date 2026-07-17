@@ -64,6 +64,7 @@ namespace umma_fp8 = ::deep_ep::megakernel::umma_fp8;
 constexpr int COMPUTE_BATCH_SIZE = megakernel_config::kComputeBatchSize;
 constexpr int COMPUTE_GROUP_SIZE = megakernel_config::kComputeGroupSize;
 constexpr int COMPUTE_SCHEDULER_SMS = megakernel_config::kComputeSchedulerSms;
+constexpr int GATHER_SMS = megakernel_config::kGatherSms;
 constexpr int PRIORITY_SCHED_TID_BEGIN = megakernel_config::kPrioritySchedTidBegin;
 constexpr int GATHER_SCHED_TID_BEGIN = megakernel_config::kGatherSchedTidBegin;
 constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
@@ -1018,7 +1019,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             if (num_hits > num_topk) {
                 printf("MK publish token hit overflow, rank=%d recv_token=%d num_hits=%d num_topk=%d\n",
                        state->rank, recv_token_idx, num_hits, num_topk);
-                trap();
+                __threadfence_system(); trap();
             }
             st_na_global(&state->token_nhits[recv_token_idx], num_hits);
             st_na_global(&state->token_compute_expected[recv_token_idx], num_hits);
@@ -1037,7 +1038,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
                 if (group_base_slot + group_count > state->expert_count[local_expert_id]) {
                     printf("MK publish expert slot overflow, rank=%d recv_token=%d expert=%d slot=%d count=%d max_tpe=%d\n",
                            state->rank, recv_token_idx, expert_id, group_base_slot, group_count, state->max_tokens_per_expert);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
             group_base_slot = __shfl_sync(same_expert_mask, group_base_slot, leader_lane);
@@ -1701,7 +1702,7 @@ __device__ void dispatch_worker_v2(
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
                     printf("MK dispatch RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, cached_rdma_channel_head, rdma_tail_idx);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
 #if MK_PERF_TRACE_ARGS
@@ -1843,7 +1844,7 @@ __device__ void dispatch_worker_v2(
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                 printf("MK RDMA coordinator timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, tail: %d, remaining: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, last_issued_tail, num_tokens_to_send);
-                trap();
+                __threadfence_system(); trap();
             }
 
             for (int i = 0, synced_num_tokens_to_send; i < kNumRDMARanks; ++i) {
@@ -2013,7 +2014,7 @@ __device__ void dispatch_worker_v2(
                            state->rank, static_cast<int>(blockIdx.x), thread_id, channel_id, logical_channel_id,
                            rdma_rank, nvl_rank, lane_id, dst_nvl_rank,
                            meta_0, meta_1, meta_2, meta_3);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
         }
@@ -2074,7 +2075,7 @@ __device__ void dispatch_worker_v2(
                     printf("MK dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank,
                            ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
 #if MK_PERF_TRACE_ARGS
@@ -2107,7 +2108,7 @@ __device__ void dispatch_worker_v2(
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     printf("MK dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src RDMA: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
 #if MK_PERF_TRACE_ARGS
@@ -2291,7 +2292,7 @@ __device__ void dispatch_worker_v2(
                        nvl_channel_prefix_end.buffer() + lane_id,
                        raw_start_now, raw_end_now,
                        target_rank, warp_id, rs_wr_rank, ws_rr_rank);
-                trap();
+                __threadfence_system(); trap();
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
@@ -2401,7 +2402,7 @@ __device__ void dispatch_worker_v2(
                 if (elect_one_sync() and clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("MK dispatch NVL receiver timeout (data), channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
 #if MK_PERF_TRACE_ARGS
@@ -2514,7 +2515,7 @@ __device__ void dispatch_worker_v2(
                         if (slot >= state->expert_count[local_expert_id]) {
                             printf("MK dispatch expert slot overflow, rank=%d recv_token=%lld expert=%d slot=%d max_tpe=%d\n",
                                    state->rank, (long long)recv_token_idx, expert_id, slot, state->max_tokens_per_expert);
-                            trap();
+                            __threadfence_system(); trap();
                         }
                         int dest_offset = state->expert_slot_base[local_expert_id] + slot;
                         int* dst_ptr = &state->recv_token_source_info[dest_offset * 2];
@@ -2536,7 +2537,7 @@ __device__ void dispatch_worker_v2(
                         if (hit_base + num_hits > num_topk) {
                             printf("MK dispatch token hit overflow, rank=%d recv_token=%lld hit_base=%d num_hits=%d num_topk=%d\n",
                                    state->rank, (long long)recv_token_idx, hit_base, num_hits, num_topk);
-                            trap();
+                            __threadfence_system(); trap();
                         }
                         for (int h = 0; h < num_hits; ++h)
                             state->token_slot_list[recv_token_idx * num_topk + hit_base + h] = hit_abs_slot[h];
@@ -2720,7 +2721,7 @@ __device__ void dispatch_worker_v2(
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                 printf("MK dispatch logical-channel barrier timeout, physical_ch=%d logical_ch=%d count=%d\n",
                        channel_id, logical_channel_id, ld_acquire_sys_global(&state->dispatch_channel_barrier[logical_channel_id]));
-                trap();
+                __threadfence_system(); trap();
             }
             __nanosleep(32);
         }
@@ -2765,7 +2766,7 @@ __device__ void dispatch_worker_v2(
                 printf("MK dispatch round barrier timeout, physical_ch=%d logical_ch=%d round=%d count=%d need=%d\n",
                        channel_id, logical_channel_id, round_idx,
                        ld_acquire_sys_global(&state->dispatch_round_barrier[round_idx]), num_channels);
-                trap();
+                __threadfence_system(); trap();
             }
             __nanosleep(32);
         }
@@ -2899,7 +2900,7 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
     int tail = atomicAdd(state->compute_task_reserve_tail, 1);
     if (tail >= state->max_compute_tasks) {
         printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
-        trap();
+        __threadfence_system(); trap();
     }
     state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens, is_flush};
     __threadfence();
@@ -2948,7 +2949,7 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     if (batch_id < 0 || batch_id >= state->max_batches_per_expert) {
         printf("MK scheduler batch id overflow, rank=%d expert=%d batch=%d max=%d\n",
                state->rank, expert_id, batch_id, state->max_batches_per_expert);
-        trap();
+        __threadfence_system(); trap();
     }
     int idx = expert_id * state->max_batches_per_expert + batch_id;
 #if MK_PERF_TRACE_ARGS
@@ -3301,7 +3302,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     if (token_base + batch_count > state->max_total_recv_tokens) {
         printf("MK gather task token queue overflow, rank=%d base=%d count=%d max=%d\n",
                state->rank, token_base, batch_count, state->max_total_recv_tokens);
-        trap();
+        __threadfence_system(); trap();
     }
     for (int i = 0; i < batch_count; ++i)
         state->gather_ready_queue[token_base + i] = s_gather_batch_tokens[gather_warp_idx][i];
@@ -3310,7 +3311,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     if (task_idx >= state->max_total_recv_tokens) {
         printf("MK gather task queue overflow, rank=%d task=%d max=%d\n",
                state->rank, task_idx, state->max_total_recv_tokens);
-        trap();
+        __threadfence_system(); trap();
     }
     state->gather_task_tokens[task_idx] = token_base;
     state->gather_task_nhits[task_idx] = batch_count;
@@ -3350,6 +3351,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     __shared__ int s_normal_enqueued_count;
     __shared__ int s_dispatch_done;
     __shared__ int s_compute_all_result;
+
 
 #if MK_PERF_TRACE_ENABLED
     if (tid == 0 && scheduler_id == 0)
@@ -3414,10 +3416,11 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             sched_scan_start = globaltimer_ns();
 #endif
 
-            // === Multi-threaded ready prefix scan ===
-            // Each thread scans a chunk of the slot-ready array for each expert.
-            // Thread 0 reads the current recv_count, then all threads cooperatively
-            // scan forward from that point in parallel chunks.
+            // === Multi-thread cooperative scan + atomicMin + fused enqueue ===
+            // All threads cooperatively scan one expert at a time (parallel ld_acquire).
+            // all_ready → advance full wave.  !all_ready → atomicMin finds prefix boundary.
+            // Fused enqueue immediately follows scan for each expert (no separate phase).
+            // tid0 does recv_count publish + enqueue; other threads only help with scan.
             for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
 #if MK_ASYNC_PUBLISH
                 if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
@@ -3433,22 +3436,18 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 int old_count;
                 if (tid == 0) {
                     old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    s_priority_alloc_count = old_count;  // reuse shared var to broadcast old_count
+                    s_priority_alloc_count = old_count;
                 }
                 scheduler_compute_sync(num_threads);
                 old_count = s_priority_alloc_count;
 
-                // Cooperative scan: each thread checks a contiguous chunk of slots starting from old_count.
-                // We scan in waves of num_threads slots at a time, finding the contiguous prefix.
                 int count = old_count;
                 while (count < state->expert_count[expert_id]) {
-                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
+                    int my_slot = count + tid;
                     int my_ready = 0;
-                    if (my_slot < state->expert_count[expert_id]) {
+                    if (my_slot < state->expert_count[expert_id])
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-                    }
-                    // Reuse the existing cooperative barriers to broadcast a lane-0
-                    // publish_all_done load; no extra CTA synchronization is added.
+
 #if MK_ASYNC_PUBLISH
                     int all_ready = scheduler_compute_all_until_publish_done(
                         my_ready || (my_slot >= state->expert_count[expert_id]),
@@ -3461,40 +3460,20 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         &s_compute_all_result, num_threads);
 #endif
                     if (!all_ready) {
-                        // Find the first non-ready slot in this wave.
-                        // Same invariant as the original single-thread scan: tid 0 is the ONLY
-                        // thread that acquires expert_slot_ready and the ONLY thread that releases
-                        // expert_recv_count, so the ready-acquire -> recv_count-release hand-off
-                        // never crosses threads (any cross-thread split proved unreliable here).
-                        // Speedup is via instruction-level parallelism only: tid 0 issues a batch
-                        // of independent ld.acquire loads (overlapping their latency) and then finds
-                        // the first not-ready slot, instead of one dependent load per slot.
-                        if (tid == 0) {
-                            constexpr int kScanIlp = 8;
-                            const int slot_base = state->expert_slot_base[expert_id];
-                            const int scan_limit = min(count + num_threads, state->expert_count[expert_id]);
-                            int s = count;
-                            while (s < scan_limit) {
-                                int batch = min(kScanIlp, scan_limit - s);
-                                int r[kScanIlp];
-                                for (int j = 0; j < batch; ++j)
-                                    r[j] = ld_acquire_global(&state->expert_slot_ready[slot_base + s + j]);
-                                int adv = 0;
-                                while (adv < batch && r[adv] == 1)
-                                    ++adv;
-                                s += adv;
-                                if (adv < batch)
-                                    break;
-                            }
-                            count = s;
-                            s_priority_alloc_count = count;  // broadcast final count
-                        }
+                        // atomicMin reduction: find the first not-ready tid offset.
+                        // Each thread that is in-range and not ready reports its tid.
+                        if (tid == 0)
+                            s_priority_alloc_count = num_threads;
                         scheduler_compute_sync(num_threads);
-                        count = s_priority_alloc_count;
+                        if (my_slot < state->expert_count[expert_id] && !my_ready)
+                            atomicMin(&s_priority_alloc_count, tid);
+                        scheduler_compute_sync(num_threads);
+                        count += s_priority_alloc_count;
                         break;
                     }
                     count += num_threads;
-                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
+                    if (count > state->expert_count[expert_id])
+                        count = state->expert_count[expert_id];
                 }
 #if MK_ASYNC_PUBLISH
                 if (s_dispatch_done != 0)
@@ -3502,6 +3481,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #endif
 
                 if (tid == 0 && count != old_count) {
+                    // Publish recv_count for tail flush / priority scheduler.
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
 #if MK_PERF_TRACE_ARGS
@@ -3512,6 +3492,18 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         st_na_global(state->perf_sched_first_recv_count_advance_new, static_cast<int64_t>(count));
                     }
 #endif
+
+                    // Fused enqueue: tid0 immediately enqueues full batches.
+                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                    while (count - cursor >= COMPUTE_BATCH_SIZE) {
+                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                        scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
+                        cursor += COMPUTE_BATCH_SIZE;
+                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+#if MK_PERF_TRACE_ARGS
+                        normal_full_batch_enqueues += 1;
+#endif
+                    }
                 }
 #if MK_PERF_TRACE_ARGS
                 if (tid == 0) {
@@ -3537,54 +3529,8 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #if MK_PERF_TRACE_ARGS
             sched_scan_acc += globaltimer_ns() - sched_scan_start;
             sched_enqueue_start = globaltimer_ns();
-#endif
-
-#if MK_PERF_TRACE_ARGS
-            int64_t sched_normal_start = globaltimer_ns();
-#endif
-
-            // === Normal enqueue ===
-            int task_head_for_fill = 0;
-            int task_tail_for_fill = 0;
-            int queue_depth_for_fill = 0;
-            int queue_low_watermark = state->num_compute_groups * 2;
-            if (tid == 0) {
-                task_head_for_fill = ld_acquire_global(state->compute_task_head);
-                task_tail_for_fill = ld_acquire_global(state->compute_task_tail);
-                queue_depth_for_fill = task_tail_for_fill - task_head_for_fill;
-                s_priority_alloc_count = (queue_depth_for_fill < queue_low_watermark) ? 1 : 0;
-            }
-            scheduler_compute_sync(num_threads);
-            int do_normal_enqueue = s_priority_alloc_count;
-            if (tid == 0)
-                s_normal_enqueued_count = 0;
-            scheduler_compute_sync(num_threads);
-            if (do_normal_enqueue) {
-                for (int expert_id = scheduler_id + tid * num_schedulers;
-                     expert_id < num_local_experts;
-                     expert_id += num_threads * num_schedulers) {
-                    int count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    while (count - cursor >= COMPUTE_BATCH_SIZE) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
-                        cursor += COMPUTE_BATCH_SIZE;
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            atomicAdd(&s_normal_enqueued_count, 1);
-#endif
-                    }
-                }
-            }
-            scheduler_compute_sync(num_threads);
-#if MK_PERF_TRACE_ARGS
-            if (tid == 0)
-                normal_full_batch_enqueues += s_normal_enqueued_count;
-#endif
-#if MK_PERF_TRACE_ARGS
-            sched_normal_acc += globaltimer_ns() - sched_normal_start;
-            sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
+            sched_enqueue_acc += 0;
+            sched_normal_acc += 0;
 #endif
         }
 
@@ -3881,7 +3827,7 @@ __device__ __forceinline__ void compute_worker(
     if constexpr (kComputeDType == ComputeDType::kFP8E4M3) {
         if (threadIdx.x == 0 && compute_sm_idx == 0)
             printf("MK FP8 compute worker is instantiated but FP8 UMMA mainloop is not wired yet.\n");
-        trap();
+        __threadfence_system(); trap();
         return;
     }
     const int thread_id = threadIdx.x;
@@ -4533,7 +4479,7 @@ __device__ void combine_worker_v2(
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("MK combine normalizer timeout waiting for channel_dispatch_done[%d] (physical_ch=%d), got %d\n",
                            logical_channel_id, channel_id, ld_acquire_sys_global(&state->channel_dispatch_done[logical_channel_id]));
-                    trap();
+                    __threadfence_system(); trap();
                 }
                 __nanosleep(32);
             }
@@ -4685,7 +4631,7 @@ __device__ void combine_worker_v2(
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf("MK combine warp timeout waiting for channel_normalized[%d] (physical_ch=%d), role=%d\n",
                            logical_channel_id, channel_id, (int)warp_role);
-                    trap();
+                    __threadfence_system(); trap();
                 }
                 __nanosleep(32);
             }
@@ -4797,7 +4743,7 @@ __device__ void combine_worker_v2(
                            next_send_token, blocked_head_token, last_sent_token,
                            (void*)(nvl_channel_head.buffer() + lane_id), (void*)(nvl_channel_tail.buffer() + lane_id),
                            ld_acquire_sys_global(&state->channel_normalized[logical_channel_id]));
-                    trap();
+                    __threadfence_system(); trap();
                 }
             }
 
@@ -4888,7 +4834,7 @@ __device__ void combine_worker_v2(
                                 printf("MK combine gather-semaphore timeout, rank=%d token=%lld nh=%d expected=%d done=%d ready=%d\n",
                                        state->rank, (long long)token_idx, nh, expected, done, ready_snapshot);
                             }
-                            trap();
+                            __threadfence_system(); trap();
                         }
                         __nanosleep(32);
                     }
@@ -5176,7 +5122,7 @@ __device__ void combine_worker_v2(
                                "logical_token_start=%d, rdma_token_start=%d, cur_head=%d, capacity=%d, needed=%d\n",
                                channel_id, dst_rdma_rank,
                                token_start_idx, token_start_idx, cur_head, num_max_rdma_chunked_recv_tokens, num_chunked_tokens);
-                        trap();
+                        __threadfence_system(); trap();
                     }
                 }
                 sync_large_warp();
@@ -5223,7 +5169,7 @@ __device__ void combine_worker_v2(
                                    local_dst_prefix_idx, local_dst_token, local_dst_base, local_dst_base + local_dst_count, local_dst_count,
                                    (void*)nvl_channel_tail.buffer(lane_id), (void*)nvl_channel_x.buffer(lane_id), sub_warp_id,
                                    num_tokens_prefix, num_tokens_to_combine);
-                            trap();
+                            __threadfence_system(); trap();
                         }
                     }
 
@@ -5482,7 +5428,7 @@ __device__ void combine_worker_v2(
                                    rdma_channel_data.recv_buffer(lane_id),
                                    combined_rdma_head + token_idx * kNumRDMARanks_C + lane_id);
                         }
-                        trap();
+                        __threadfence_system(); trap();
                     }
 
                 }
@@ -5597,7 +5543,7 @@ __device__ void combine_worker_v2(
                 printf("MK combine logical-channel barrier timeout, rank=%d combine_sm_idx=%d physical_ch=%d logical_ch=%d is_forwarder_sm=%d count=%d\n",
                        state->rank, combine_sm_idx, channel_id, logical_channel_id,
                        static_cast<int>(is_forwarder_sm), ld_acquire_sys_global(&state->combine_channel_barrier[logical_channel_id]));
-                trap();
+                __threadfence_system(); trap();
             }
             __nanosleep(32);
         }
@@ -5645,7 +5591,7 @@ __device__ void combine_precompute_worker(
     if constexpr (kComputeDType == ComputeDType::kFP8E4M3) {
         if (threadIdx.x == 0 && combine_sm_idx == 0)
             printf("MK FP8 compute worker is instantiated but FP8 UMMA mainloop is not wired yet.\n");
-        trap();
+        __threadfence_system(); trap();
         return;
     }
     const int thread_id = threadIdx.x;
@@ -6382,7 +6328,7 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
     int tail = atomicAdd(state->compute_task_reserve_tail, 1);
     if (tail >= state->max_compute_tasks) {
         printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
-        trap();
+        __threadfence_system(); trap();
     }
     state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens, is_flush};
     __threadfence();
@@ -6423,7 +6369,7 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     if (batch_id < 0 || batch_id >= state->max_batches_per_expert) {
         printf("MK scheduler batch id overflow, rank=%d expert=%d batch=%d max=%d\n",
                state->rank, expert_id, batch_id, state->max_batches_per_expert);
-        trap();
+        __threadfence_system(); trap();
     }
     int idx = expert_id * state->max_batches_per_expert + batch_id;
 #if MK_PERF_TRACE_ARGS
@@ -6776,7 +6722,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     if (token_base + batch_count > state->max_total_recv_tokens) {
         printf("MK gather task token queue overflow, rank=%d base=%d count=%d max=%d\n",
                state->rank, token_base, batch_count, state->max_total_recv_tokens);
-        trap();
+        __threadfence_system(); trap();
     }
     for (int i = 0; i < batch_count; ++i)
         state->gather_ready_queue[token_base + i] = s_gather_batch_tokens[gather_warp_idx][i];
@@ -6785,7 +6731,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     if (task_idx >= state->max_total_recv_tokens) {
         printf("MK gather task queue overflow, rank=%d task=%d max=%d\n",
                state->rank, task_idx, state->max_total_recv_tokens);
-        trap();
+        __threadfence_system(); trap();
     }
     state->gather_task_tokens[task_idx] = token_base;
     state->gather_task_nhits[task_idx] = batch_count;
@@ -6825,6 +6771,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     __shared__ int s_normal_enqueued_count;
     __shared__ int s_dispatch_done;
     __shared__ int s_compute_all_result;
+
 
 #if MK_PERF_TRACE_ENABLED
     if (tid == 0 && scheduler_id == 0)
@@ -6889,10 +6836,11 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             sched_scan_start = globaltimer_ns();
 #endif
 
-            // === Multi-threaded ready prefix scan ===
-            // Each thread scans a chunk of the slot-ready array for each expert.
-            // Thread 0 reads the current recv_count, then all threads cooperatively
-            // scan forward from that point in parallel chunks.
+            // === Multi-thread cooperative scan + atomicMin + fused enqueue ===
+            // All threads cooperatively scan one expert at a time (parallel ld_acquire).
+            // all_ready → advance full wave.  !all_ready → atomicMin finds prefix boundary.
+            // Fused enqueue immediately follows scan for each expert (no separate phase).
+            // tid0 does recv_count publish + enqueue; other threads only help with scan.
             for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
 #if MK_ASYNC_PUBLISH
                 if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
@@ -6908,22 +6856,18 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                 int old_count;
                 if (tid == 0) {
                     old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    s_priority_alloc_count = old_count;  // reuse shared var to broadcast old_count
+                    s_priority_alloc_count = old_count;
                 }
                 scheduler_compute_sync(num_threads);
                 old_count = s_priority_alloc_count;
 
-                // Cooperative scan: each thread checks a contiguous chunk of slots starting from old_count.
-                // We scan in waves of num_threads slots at a time, finding the contiguous prefix.
                 int count = old_count;
                 while (count < state->expert_count[expert_id]) {
-                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
+                    int my_slot = count + tid;
                     int my_ready = 0;
-                    if (my_slot < state->expert_count[expert_id]) {
+                    if (my_slot < state->expert_count[expert_id])
                         my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-                    }
-                    // Reuse the existing cooperative barriers to broadcast a lane-0
-                    // publish_all_done load; no extra CTA synchronization is added.
+
 #if MK_ASYNC_PUBLISH
                     int all_ready = scheduler_compute_all_until_publish_done(
                         my_ready || (my_slot >= state->expert_count[expert_id]),
@@ -6936,40 +6880,20 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         &s_compute_all_result, num_threads);
 #endif
                     if (!all_ready) {
-                        // Find the first non-ready slot in this wave.
-                        // Same invariant as the original single-thread scan: tid 0 is the ONLY
-                        // thread that acquires expert_slot_ready and the ONLY thread that releases
-                        // expert_recv_count, so the ready-acquire -> recv_count-release hand-off
-                        // never crosses threads (any cross-thread split proved unreliable here).
-                        // Speedup is via instruction-level parallelism only: tid 0 issues a batch
-                        // of independent ld.acquire loads (overlapping their latency) and then finds
-                        // the first not-ready slot, instead of one dependent load per slot.
-                        if (tid == 0) {
-                            constexpr int kScanIlp = 8;
-                            const int slot_base = state->expert_slot_base[expert_id];
-                            const int scan_limit = min(count + num_threads, state->expert_count[expert_id]);
-                            int s = count;
-                            while (s < scan_limit) {
-                                int batch = min(kScanIlp, scan_limit - s);
-                                int r[kScanIlp];
-                                for (int j = 0; j < batch; ++j)
-                                    r[j] = ld_acquire_global(&state->expert_slot_ready[slot_base + s + j]);
-                                int adv = 0;
-                                while (adv < batch && r[adv] == 1)
-                                    ++adv;
-                                s += adv;
-                                if (adv < batch)
-                                    break;
-                            }
-                            count = s;
-                            s_priority_alloc_count = count;  // broadcast final count
-                        }
+                        // atomicMin reduction: find the first not-ready tid offset.
+                        // Each thread that is in-range and not ready reports its tid.
+                        if (tid == 0)
+                            s_priority_alloc_count = num_threads;
                         scheduler_compute_sync(num_threads);
-                        count = s_priority_alloc_count;
+                        if (my_slot < state->expert_count[expert_id] && !my_ready)
+                            atomicMin(&s_priority_alloc_count, tid);
+                        scheduler_compute_sync(num_threads);
+                        count += s_priority_alloc_count;
                         break;
                     }
                     count += num_threads;
-                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
+                    if (count > state->expert_count[expert_id])
+                        count = state->expert_count[expert_id];
                 }
 #if MK_ASYNC_PUBLISH
                 if (s_dispatch_done != 0)
@@ -6977,6 +6901,7 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #endif
 
                 if (tid == 0 && count != old_count) {
+                    // Publish recv_count for tail flush / priority scheduler.
                     __threadfence();
                     st_na_release(&state->expert_recv_count[expert_id], count);
 #if MK_PERF_TRACE_ARGS
@@ -6987,6 +6912,18 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
                         st_na_global(state->perf_sched_first_recv_count_advance_new, static_cast<int64_t>(count));
                     }
 #endif
+
+                    // Fused enqueue: tid0 immediately enqueues full batches.
+                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                    while (count - cursor >= COMPUTE_BATCH_SIZE) {
+                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
+                        scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
+                        cursor += COMPUTE_BATCH_SIZE;
+                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+#if MK_PERF_TRACE_ARGS
+                        normal_full_batch_enqueues += 1;
+#endif
+                    }
                 }
 #if MK_PERF_TRACE_ARGS
                 if (tid == 0) {
@@ -7012,54 +6949,8 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #if MK_PERF_TRACE_ARGS
             sched_scan_acc += globaltimer_ns() - sched_scan_start;
             sched_enqueue_start = globaltimer_ns();
-#endif
-
-#if MK_PERF_TRACE_ARGS
-            int64_t sched_normal_start = globaltimer_ns();
-#endif
-
-            // === Normal enqueue ===
-            int task_head_for_fill = 0;
-            int task_tail_for_fill = 0;
-            int queue_depth_for_fill = 0;
-            int queue_low_watermark = state->num_compute_groups * 2;
-            if (tid == 0) {
-                task_head_for_fill = ld_acquire_global(state->compute_task_head);
-                task_tail_for_fill = ld_acquire_global(state->compute_task_tail);
-                queue_depth_for_fill = task_tail_for_fill - task_head_for_fill;
-                s_priority_alloc_count = (queue_depth_for_fill < queue_low_watermark) ? 1 : 0;
-            }
-            scheduler_compute_sync(num_threads);
-            int do_normal_enqueue = s_priority_alloc_count;
-            if (tid == 0)
-                s_normal_enqueued_count = 0;
-            scheduler_compute_sync(num_threads);
-            if (do_normal_enqueue) {
-                for (int expert_id = scheduler_id + tid * num_schedulers;
-                     expert_id < num_local_experts;
-                     expert_id += num_threads * num_schedulers) {
-                    int count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    while (count - cursor >= COMPUTE_BATCH_SIZE) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
-                        cursor += COMPUTE_BATCH_SIZE;
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            atomicAdd(&s_normal_enqueued_count, 1);
-#endif
-                    }
-                }
-            }
-            scheduler_compute_sync(num_threads);
-#if MK_PERF_TRACE_ARGS
-            if (tid == 0)
-                normal_full_batch_enqueues += s_normal_enqueued_count;
-#endif
-#if MK_PERF_TRACE_ARGS
-            sched_normal_acc += globaltimer_ns() - sched_normal_start;
-            sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
+            sched_enqueue_acc += 0;
+            sched_normal_acc += 0;
 #endif
         }
 
@@ -7452,7 +7343,7 @@ static void launch_megakernel_v7_case(
         // printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
     }
 
-    constexpr int num_gather_sms = 2;
+    constexpr int num_gather_sms = GATHER_SMS;
     const int launch_total_sms = total_sms + num_gather_sms;
     EP_HOST_ASSERT(MK_COMPUTE_CLUSTER_DIM == 1 || (launch_total_sms % 2 == 0 && "launch_total_sms must be even for MK_COMPUTE_KERNEL=2 cluster_dim=2"));
     EP_HOST_ASSERT(host_state.num_combine_sms % 2 == 0);
@@ -11261,7 +11152,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
     if constexpr (kComputeDType == ComputeDType::kFP8E4M3) {
         if (threadIdx.x == 0 && compute_sm_idx == 0)
             printf("MK backward FP8 path is not implemented.\n");
-        trap();
+        __threadfence_system(); trap();
         return;
     }
     MegaKernelState* state = bs->bwd_device_state;
@@ -12326,7 +12217,7 @@ static void launch_megakernel_v7_backward_case(
         CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7_backward<kNumRDMARanks, kStage, kComputeDType>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
-    constexpr int num_gather_sms = 2;
+    constexpr int num_gather_sms = GATHER_SMS;
     const int launch_total_sms = total_sms + num_gather_sms;
 #ifndef DISABLE_SM90_FEATURES
     cudaLaunchConfig_t cfg = {};
