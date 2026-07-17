@@ -70,6 +70,7 @@ constexpr int GATHER_SCHED_TID_BEGIN = megakernel_config::kGatherSchedTidBegin;
 constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
 constexpr int GATHER_SCHED_MAX_WARPS = megakernel_config::kGatherSchedMaxWarps;
 constexpr int MK_COMPUTE_CLUSTER_DIM = megakernel_config::kComputeClusterDim;
+constexpr int COMBINE_START_HEAD_PERCENT = megakernel_config::kCombineStartHeadPercent;
 constexpr int WMMA_M = megakernel_config::kWmmaM;
 constexpr int WMMA_N = megakernel_config::kWmmaN;
 constexpr int WMMA_K = megakernel_config::kWmmaK;
@@ -5690,11 +5691,17 @@ __device__ void combine_precompute_worker(
             pop_start_ns = globaltimer_ns();
 #endif
             while (true) {
-                // Temporary combine compute stops claiming only at a task boundary.
-                // A CAS that already succeeded below owns the task and completes it fully.
-                if (ld_acquire_global(state->dispatch_done_count) == state->expected_dispatch_done_count) {
-                    task_idx = -3;
-                    break;
+                // Check if compute progress has reached the threshold to switch to combine.
+                {
+                    int enqueue_done = ld_acquire_global(state->compute_enqueue_done);
+                    if (enqueue_done) {
+                        int tail = ld_acquire_global(state->compute_task_tail);
+                        int head = ld_acquire_global(state->compute_task_head);
+                        if (tail == 0 || head * 100 >= tail * COMBINE_START_HEAD_PERCENT) {
+                            task_idx = -3;
+                            break;
+                        }
+                    }
                 }
                 int head = ld_acquire_global(state->compute_task_head);
                 int tail = ld_acquire_global(state->compute_task_tail);
@@ -11249,9 +11256,15 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
             while (true) {
                 if constexpr (kStopAtDispatchDone) {
-                    if (ld_acquire_global(state->dispatch_done_count) == state->expected_dispatch_done_count) {
-                        task_idx = -3;
-                        break;
+                    // Check if compute progress has reached the threshold to switch to combine.
+                    int enqueue_done = ld_acquire_global(state->compute_enqueue_done);
+                    if (enqueue_done) {
+                        int tail = ld_acquire_global(state->compute_task_tail);
+                        int head = ld_acquire_global(state->compute_task_head);
+                        if (tail == 0 || head * 100 >= tail * COMBINE_START_HEAD_PERCENT) {
+                            task_idx = -3;
+                            break;
+                        }
                     }
                 }
                 int head = ld_acquire_global(state->compute_task_head);

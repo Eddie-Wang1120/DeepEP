@@ -2270,8 +2270,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
 #if MK_PERF_TRACE_ENABLED
     // Emit the megakernel-path notify_dispatch cost as its own Perfetto track so it can be
-    // compared against the DeepEP baseline notify_dispatch. The per-process iteration counter
-    // stays in lockstep with dump_perf_trace_perfetto (both advance once per megakernel_forward).
+    // compared against the DeepEP baseline notify_dispatch. When retention is `all`, each
+    // megakernel forward emits an iteration-tagged file; otherwise the latest file overwrites
+    // the prior one, matching forward/backward trace retention.
     {
         AT_CUDA_CHECK(cudaEventSynchronize(mk_notify_end_ev));
         float mk_notify_ms = 0.0f;
@@ -2281,8 +2282,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
         static int mk_notify_trace_iter = 0;
         const int notify_iter = mk_notify_trace_iter++;
+        const char* trace_retention = std::getenv("MK_PERF_TRACE_RETENTION");
+        const bool keep_all_trace_iters = trace_retention != nullptr && trace_retention[0] == 'a';
         char notify_fn[256];
-        snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify_iter%d.json", rank, notify_iter);
+        if (keep_all_trace_iters) {
+            snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify_iter%d.json", rank, notify_iter);
+        } else {
+            snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify.json", rank);
+        }
         FILE* nf = fopen(notify_fn, "w");
         if (nf) {
             const double notify_us = mk_notify_ms * 1000.0;
