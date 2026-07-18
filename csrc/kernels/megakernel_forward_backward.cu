@@ -41,6 +41,7 @@
 #include <mma.h>
 #include <limits>
 #include <vector>
+#include <cstring>
 #include <cstdlib>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
@@ -9256,6 +9257,39 @@ __global__ void fused_fill_kernel(const FusedFillDesc* descs, int ndescs) {
 
 static void initialize_megakernel_launch_state(const MegaKernelState& state, cudaStream_t stream);
 
+// --- TMA descriptor cache (persistent across iterations; the cache is the SOLE owner
+// of these device buffers — no MegaKernelState ever frees them). A small bounded,
+// round-robin set of entries lets the forward key and backward key coexist so both
+// paths hit across iterations. Buffers are only freed when an entry slot is evicted,
+// which is safe because the kernel that used them has already completed (synchronous
+// launch) before the slot can be reused. ---
+namespace {
+struct TmaCacheKey {
+    const void* w_gateup;
+    const void* w_down;
+    const void* gemm_ws;
+    const void* w_gateup_fp8;
+    const void* w_down_fp8;
+    int num_local_experts;
+    int hidden_dim;
+    int intermediate_dim;
+    int num_compute_groups;
+};
+struct TmaCacheEntry {
+    TmaCacheKey key{};
+    bool valid = false;
+    umma::ComputeTmaAtoms* compute_tma = nullptr;
+    umma::InputTmaAtom_t* group_input_tma = nullptr;
+    umma::ComputeDownTmaAtoms* compute_down_tma = nullptr;
+    umma_fp8::ComputeFp8TmaAtoms* compute_fp8_tma = nullptr;
+    umma_fp8::InputFp8TmaAtom_t* group_input_fp8_tma = nullptr;
+    umma_fp8::ComputeFp8DownTmaAtoms* compute_fp8_down_tma = nullptr;
+};
+constexpr int kTmaCacheCap = 8;
+static thread_local TmaCacheEntry s_tma_cache[kTmaCacheCap];
+static thread_local int s_tma_cache_next = 0;
+}  // anonymous namespace
+
 MegaKernelState* allocate_megakernel_state_v7(
     // --- Dispatch input data (from PyTorch tensors) ---
     const int4* x,
@@ -9433,10 +9467,13 @@ MegaKernelState* allocate_megakernel_state_v7(
         total_expert_slots += static_cast<size_t>(cnt);
     }
     if (total_expert_slots == 0) total_expert_slots = 1;  // avoid zero-size allocations
-    CUDA_CHECK(cudaMemcpy(expert_slot_base, h_expert_slot_base.data(),
-                          num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(expert_count, h_expert_count.data(),
-                          num_local_experts * sizeof(int), cudaMemcpyHostToDevice));
+    {
+        cudaStream_t s = c10::cuda::getCurrentCUDAStream().stream();
+        CUDA_CHECK(cudaMemcpyAsync(expert_slot_base, h_expert_slot_base.data(),
+                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(expert_count, h_expert_count.data(),
+                              num_local_experts * sizeof(int), cudaMemcpyHostToDevice, s));
+    }
 
     int* expert_slot_ready;
     CUDA_CHECK(cudaMalloc(&expert_slot_ready, total_expert_slots * sizeof(int)));
@@ -9673,24 +9710,47 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Gate/up uses A[M, hidden] x interleaved Wgu[2 * intermediate, hidden]^T,
     // with the SwiGLU epilogue storing act[M, intermediate] directly.
     // Down uses act[M, intermediate] x W_down[hidden, intermediate]^T.
+    //
+    // TMA descriptors only depend on weight pointers, workspace pointer, and shape.
+    // Look up a bounded, persistent cache so repeated iterations skip the H2D copies.
+
+    TmaCacheKey cur_key{W_gateup, W_down, gemm_workspace, W_gateup_fp8,
+                        W_down_fp8, num_local_experts, hidden_dim, intermediate_dim, num_compute_groups};
+
     umma::ComputeTmaAtoms* d_compute_tma = nullptr;
     umma::InputTmaAtom_t* d_group_input_tma = nullptr;
     umma::ComputeDownTmaAtoms* d_compute_down_tma = nullptr;
     umma_fp8::ComputeFp8TmaAtoms* d_compute_fp8_tma = nullptr;
     umma_fp8::InputFp8TmaAtom_t* d_group_input_fp8_tma = nullptr;
     umma_fp8::ComputeFp8DownTmaAtoms* d_compute_fp8_down_tma = nullptr;
+
+    int hit_idx = -1;
+    for (int i = 0; i < kTmaCacheCap; ++i) {
+        if (s_tma_cache[i].valid && std::memcmp(&s_tma_cache[i].key, &cur_key, sizeof(TmaCacheKey)) == 0) {
+            hit_idx = i;
+            break;
+        }
+    }
+
+    if (hit_idx >= 0) {
+        // Reuse cached device TMA descriptors — no H2D needed.
+        const TmaCacheEntry& e = s_tma_cache[hit_idx];
+        d_compute_tma = e.compute_tma;
+        d_group_input_tma = e.group_input_tma;
+        d_compute_down_tma = e.compute_down_tma;
+        d_compute_fp8_tma = e.compute_fp8_tma;
+        d_group_input_fp8_tma = e.group_input_fp8_tma;
+        d_compute_fp8_down_tma = e.compute_fp8_down_tma;
+    } else {
+
     if (W_gateup != nullptr && W_down != nullptr &&
         num_local_experts <= umma::kMaxLocalExperts) {
-        // Per-expert weight atoms. W_gateup is already interleaved by the Python test
-        // as [E,2I,d] with rows [2j]=Wg[j], [2j+1]=Wu[j].
         umma::ComputeTmaAtoms h_atoms;
         umma::build_compute_tma_atoms(h_atoms, W_gateup, num_local_experts,
                                       intermediate_dim, hidden_dim);
         CUDA_CHECK(cudaMalloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_tma, &h_atoms, sizeof(umma::ComputeTmaAtoms), cudaMemcpyHostToDevice));
 
-        // Per-group A(input_buf) + GU/act/down workspace atoms. Layout per group:
-        //   [input_buf (M*hidden)] [GU scratch (M*2I)] [act (M*I)] [down_buf (M*hidden)]
         std::vector<umma::InputTmaAtom_t> h_in;
         h_in.reserve(num_compute_groups);
         for (int g = 0; g < num_compute_groups; ++g) {
@@ -9698,7 +9758,6 @@ MegaKernelState* allocate_megakernel_state_v7(
             const __nv_bfloat16* gu_g   = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
             const __nv_bfloat16* act_g  = gu_g + (size_t)COMPUTE_BATCH_SIZE * (2 * intermediate_dim);
             const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
-            // gate_buf_ptr keeps the reserved GU scratch descriptor; act_buf_ptr is the interleaved epilogue output and down A.
             h_in.push_back(umma::make_input_group_atoms(in_g, gu_g, act_g, down_g,
                                                         COMPUTE_BATCH_SIZE, hidden_dim,
                                                         intermediate_dim, hidden_dim));
@@ -9707,7 +9766,6 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMemcpy(d_group_input_tma, h_in.data(),
                               num_compute_groups * sizeof(umma::InputTmaAtom_t), cudaMemcpyHostToDevice));
 
-        // Per-expert W_down raw TMA descriptors (DeepGEMM path; A/CD live in InputTmaAtom_t).
         umma::ComputeDownTmaAtoms h_down;
         umma::build_compute_down_tma_atoms(h_down, W_down, num_local_experts, hidden_dim, intermediate_dim);
         CUDA_CHECK(cudaMalloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
@@ -9748,6 +9806,28 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMemcpy(d_group_input_fp8_tma, h_fp8_in.data(),
                               num_compute_groups * sizeof(umma_fp8::InputFp8TmaAtom_t), cudaMemcpyHostToDevice));
     }
+
+        // Insert into cache (round-robin). Evicting a slot frees its buffers; safe because
+        // the kernel that used them completed before this slot can be reused.
+        TmaCacheEntry& slot = s_tma_cache[s_tma_cache_next];
+        if (slot.valid) {
+            if (slot.compute_tma) mk_caching_free(slot.compute_tma);
+            if (slot.group_input_tma) mk_caching_free(slot.group_input_tma);
+            if (slot.compute_down_tma) mk_caching_free(slot.compute_down_tma);
+            if (slot.compute_fp8_tma) mk_caching_free(slot.compute_fp8_tma);
+            if (slot.group_input_fp8_tma) mk_caching_free(slot.group_input_fp8_tma);
+            if (slot.compute_fp8_down_tma) mk_caching_free(slot.compute_fp8_down_tma);
+        }
+        slot.key = cur_key;
+        slot.valid = true;
+        slot.compute_tma = d_compute_tma;
+        slot.group_input_tma = d_group_input_tma;
+        slot.compute_down_tma = d_compute_down_tma;
+        slot.compute_fp8_tma = d_compute_fp8_tma;
+        slot.group_input_fp8_tma = d_group_input_fp8_tma;
+        slot.compute_fp8_down_tma = d_compute_fp8_down_tma;
+        s_tma_cache_next = (s_tma_cache_next + 1) % kTmaCacheCap;
+    } // end cache miss
 
     // Output accumulator [num_tokens, hidden_dim] in float32
     CUDA_CHECK(cudaMalloc(&output_accum, (size_t)num_tokens * hidden_dim * sizeof(float)));
@@ -10703,18 +10783,16 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.combine_rdma_head_work));
     CUDA_CHECK(cudaFree(host_state.combine_nvl_head_work));
     CUDA_CHECK(cudaFree(host_state.gemm_workspace));
-    CUDA_CHECK(cudaFree(host_state.compute_tma));
-    CUDA_CHECK(cudaFree(host_state.compute_down_tma));
-    CUDA_CHECK(cudaFree(host_state.group_input_tma));
+    // TMA descriptors are owned by the persistent thread-local cache (see
+    // allocate_megakernel_state_v7). The state only holds borrowed pointers, so it
+    // must NOT free them here — the cache frees them on eviction.
     CUDA_CHECK(cudaFree(host_state.recv_tokens_fp8));
     CUDA_CHECK(cudaFree(host_state.recv_tokens_fp8_sf));
     CUDA_CHECK(cudaFree(host_state.input_fp8_workspace));
     CUDA_CHECK(cudaFree(host_state.input_fp8_sf_workspace));
     CUDA_CHECK(cudaFree(host_state.act_fp8_workspace));
     CUDA_CHECK(cudaFree(host_state.act_fp8_sf_workspace));
-    CUDA_CHECK(cudaFree(host_state.compute_fp8_tma));
-    CUDA_CHECK(cudaFree(host_state.compute_fp8_down_tma));
-    CUDA_CHECK(cudaFree(host_state.group_input_fp8_tma));
+    // FP8 TMA descriptors are also owned by the persistent cache; do not free here.
     CUDA_CHECK(cudaFree(host_state.output_accum));
     CUDA_CHECK(cudaFree(host_state.send_rdma_head));
     CUDA_CHECK(cudaFree(host_state.send_nvl_head));
@@ -12343,14 +12421,54 @@ void launch_megakernel_debug_backward(
     EP_HOST_ASSERT(compute_dtype == ComputeDType::kBF16 &&
                    "megakernel debug backward currently supports BF16 only");
 
-    // Restore post-notify state and zero the dX output, then launch the backward megakernel with
-    // the same RDMA-rank / stage specialization as the forward.
+    // Restore post-notify state and zero the dX output in a single fused kernel launch.
     const MegaKernelBackwardState& hbs = host_context->backward_state;
     const MegaKernelState& hstate = host_context->bwd_state;
 
-    reset_megakernel_post_notify_state(hstate, stream);
-    CUDA_CHECK(cudaMemsetAsync(hbs.grad_input, 0,
-                               (size_t)hstate.num_tokens * hstate.hidden_dim * sizeof(__nv_bfloat16), stream));
+    {
+        const int kRDMA = hstate.num_ranks / NUM_MAX_NVL_PEERS;
+        const int NLC = hstate.num_logical_channels;
+        const int TK = hstate.num_topk;
+        const int combine_rdma_head_stride = hstate.num_tokens * kRDMA;
+        const int combine_nvl_head_stride = (hstate.num_tokens * TK) * NUM_MAX_NVL_PEERS;
+        const size_t rdma_head_bytes = (size_t)NLC * combine_rdma_head_stride * sizeof(int);
+        const size_t nvl_head_bytes = (size_t)NLC * combine_nvl_head_stride * sizeof(int);
+        const size_t grad_input_bytes = (size_t)hstate.num_tokens * hstate.hidden_dim * sizeof(__nv_bfloat16);
+
+        // Build descs: 0xff fills + zero fill, chunked for parallelism.
+        constexpr size_t CHUNK_WORDS = 64 * 1024;
+        struct BwdFillEntry { void* ptr; size_t bytes; uint32_t word; };
+        BwdFillEntry entries[] = {
+            {hstate.send_rdma_head, rdma_head_bytes, 0xffffffffu},
+            {hstate.send_nvl_head,  nvl_head_bytes,  0xffffffffu},
+            {hbs.grad_input,        grad_input_bytes, 0x00000000u},
+        };
+        std::vector<FusedFillDesc> descs;
+        for (auto& e : entries) {
+            uint8_t* base = reinterpret_cast<uint8_t*>(e.ptr);
+            size_t offset = 0;
+            while (offset < e.bytes) {
+                size_t chunk = std::min(e.bytes - offset, CHUNK_WORDS * sizeof(uint32_t));
+                chunk = (chunk / sizeof(uint32_t)) * sizeof(uint32_t);
+                if (chunk == 0) chunk = e.bytes - offset;
+                descs.push_back(FusedFillDesc{base + offset, chunk, e.word});
+                offset += chunk;
+            }
+        }
+        const int ndescs = static_cast<int>(descs.size());
+        // Reuse the fused_fill_desc_buf allocation from state (it's no longer needed after forward).
+        // Allocate a fresh temporary buffer for the backward fill descs.
+        void* bwd_fill_buf = nullptr;
+        CUDA_CHECK(cudaMalloc(&bwd_fill_buf, (size_t)ndescs * sizeof(FusedFillDesc)));
+        CUDA_CHECK(cudaMemcpyAsync(bwd_fill_buf, descs.data(),
+                                   (size_t)ndescs * sizeof(FusedFillDesc),
+                                   cudaMemcpyHostToDevice, stream));
+        fused_fill_kernel<<<ndescs, 512, 0, stream>>>(
+            static_cast<const FusedFillDesc*>(bwd_fill_buf), ndescs);
+        CUDA_CHECK(cudaGetLastError());
+        // Free after kernel completes (same stream ordering).
+        CUDA_CHECK(cudaFreeAsync(bwd_fill_buf, stream));
+    }
     // trace_backward_boundary_kernel<<<1, 1, 0, stream>>>(backward_state, 0);
     CUDA_CHECK(cudaGetLastError());
 
