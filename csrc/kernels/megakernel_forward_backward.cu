@@ -390,6 +390,14 @@ struct MegaKernelState {
     // --- Dispatch SM config ---
     int num_dispatch_channels;        // = num_dispatch_sms / 2 (physical even/odd SM pairing)
 
+    // --- RDMA buffer reuse (dispatch <-> combine) ---
+    // Symmetric mailboxes indexed by rdma_rank (size num_rdma_ranks). Peers publish per-phase
+    // "done" via IBGDA into the local copy; the combine prelude polls the local copy.
+    int* rdma_reuse_dispatch_quiet_done;  // borrowed (Buffer-owned symmetric memory)
+    int* rdma_reuse_combine_clear_done;   // borrowed (Buffer-owned symmetric memory)
+    int* rdma_reuse_prelude_done;         // state-owned [1] gate: leader sets, others wait
+    int rdma_reuse_prelude_enable;        // 1 = run combine RDMA-reuse prelude (forward only)
+
     // --- Publish offload (dispatch->compute bridge), Stage 1: backing state only ---
     // receiver copies token data + stashes topk/meta into pending_* (indexed by
     // recv_token_idx, overwrite-safe), then pushes recv_token_idx into its SPSC ring.
@@ -4464,6 +4472,107 @@ __device__ void combine_worker_v2(
     void** buffer_ptrs = state->combine_buffer_ptrs;
 
     constexpr int kCombineNumTMAStages = 2;
+
+    // ===== RDMA buffer reuse prelude (phase A + metadata clean + phase B) =====
+    // Runs once per GPU before combine begins. Leader = first warp of combine SM 0 (32 lanes
+    // cooperate); all other combine threads wait on state->rdma_reuse_prelude_done.
+    //   Phase A : wait this GPU's dispatch send side is drained, quiet dispatch QPs, cross-rank
+    //             barrier over same-nvl peers via the dispatch_quiet_done mailbox.
+    //   Clean   : zero the combine RDMA metadata (data-after head/tail region) of the reused
+    //             combine RDMA buffer, re-initializing head/tail for combine.
+    //   Phase B : cross-rank barrier over same-nvl peers via the combine_clear_done mailbox, so no
+    //             peer starts combine-RDMA sends into our buffer before our metadata is cleared.
+    // Work is spread across the leader warp's lanes. Quiet tasks are partitioned so no two lanes
+    // ever quiet the same (dst_pe, qp_id) (ibgda_poll_cq is not thread-safe); flag posts use qp 0
+    // to distinct dst_pe per lane, and lane 0 owns the local flag stores / fence.
+    if (state->rdma_reuse_prelude_enable) {
+        const int num_rdma_ranks_local = num_ranks / NUM_MAX_NVL_PEERS;
+        if (combine_sm_idx == 0 && thread_id < 32) {
+            const int ndc = state->num_dispatch_channels;
+
+            // 1. Dispatch send finished (dispatch_channel_barrier[lc] reaches 2 only after the RDMA
+            //    sender coordinator + forwarder passed the post-send CTA barrier). Lane-distributed.
+            for (int lc = lane_id; lc < num_logical_channels; lc += 32) {
+                while (ld_acquire_sys_global(&state->dispatch_channel_barrier[lc]) < 2)
+                    __nanosleep(64);
+            }
+            __syncwarp();
+
+            // 2. Quiet dispatch QPs (sender ch + forwarder ch+ndc) to same-nvl remote peers.
+            //    Task t = ((dr * ndc) + ch) * 2 + is_fwd -> unique (dst_pe, qp), one lane each.
+            const int qp_tasks = num_rdma_ranks_local * ndc * 2;
+            for (int t = lane_id; t < qp_tasks; t += 32) {
+                const int dr = t / (ndc * 2);
+                const int rem = t % (ndc * 2);
+                const int ch = rem >> 1;
+                const int is_fwd = rem & 1;
+                if (dr == rdma_rank) continue;
+                const int dst_pe = translate_dst_rdma_rank<kLowLatencyMode>(dr, nvl_rank);
+                nvshmemi_ibgda_quiet(dst_pe, is_fwd ? (ch + ndc) : ch);
+            }
+            __syncwarp();
+
+            // 3. Publish dispatch-quiet-done into every same-nvl peer's mailbox (and locally).
+            if (lane_id == 0)
+                st_release_sys_global(&state->rdma_reuse_dispatch_quiet_done[rdma_rank], 1);
+            for (int dr = lane_id; dr < num_rdma_ranks_local; dr += 32) {
+                if (dr == rdma_rank) continue;
+                const int dst_pe = translate_dst_rdma_rank<kLowLatencyMode>(dr, nvl_rank);
+                nvshmemi_ibgda_rma_p(&state->rdma_reuse_dispatch_quiet_done[rdma_rank], 1, dst_pe, 0);
+            }
+            __syncwarp();
+
+            // 4. Wait until all same-nvl RDMA peers finished dispatch quiet (lane-distributed).
+            for (int src = lane_id; src < num_rdma_ranks_local; src += 32) {
+                while (ld_acquire_sys_global(&state->rdma_reuse_dispatch_quiet_done[src]) == 0)
+                    __nanosleep(64);
+            }
+            __syncwarp();
+
+            // 5. Clean this GPU's combine RDMA metadata (data-after head/tail/meta int region).
+            //    Mirrors get_rdma_clean_meta(combine_hidden_int4, 0, 0, num_topk, ...) used by the
+            //    host combine cached_notify. num_bytes_per_token already == combine layout bytes.
+            {
+                const int recv_tokens = num_max_rdma_chunked_recv_tokens;  // combine recv capacity
+                const long long clean_offset =
+                    (long long)num_bytes_per_token * recv_tokens * num_rdma_ranks_local * 2 * num_logical_channels
+                    / (long long)sizeof(int);
+                const int clean_count =
+                    (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks_local * 2 * num_logical_channels;
+                int* clean_p = static_cast<int*>(state->combine_rdma_buffer_ptr);
+                for (int i = lane_id; i < clean_count; i += 32)
+                    clean_p[clean_offset + i] = 0;
+            }
+            __syncwarp();
+            if (lane_id == 0)
+                __threadfence_system();  // make the metadata clean visible before publishing clear-done
+            __syncwarp();
+
+            // 6. Publish combine-clear-done into every same-nvl peer's mailbox (and locally).
+            if (lane_id == 0)
+                st_release_sys_global(&state->rdma_reuse_combine_clear_done[rdma_rank], 1);
+            for (int dr = lane_id; dr < num_rdma_ranks_local; dr += 32) {
+                if (dr == rdma_rank) continue;
+                const int dst_pe = translate_dst_rdma_rank<kLowLatencyMode>(dr, nvl_rank);
+                nvshmemi_ibgda_rma_p(&state->rdma_reuse_combine_clear_done[rdma_rank], 1, dst_pe, 0);
+            }
+            __syncwarp();
+
+            // 7. Wait until all same-nvl RDMA peers finished the combine metadata clean.
+            for (int src = lane_id; src < num_rdma_ranks_local; src += 32) {
+                while (ld_acquire_sys_global(&state->rdma_reuse_combine_clear_done[src]) == 0)
+                    __nanosleep(64);
+            }
+            __syncwarp();
+
+            // Release the rest of the combine SMs.
+            if (lane_id == 0)
+                st_release_sys_global(state->rdma_reuse_prelude_done, 1);
+        }
+        while (ld_acquire_sys_global(state->rdma_reuse_prelude_done) == 0)
+            __nanosleep(64);
+        __syncthreads();
+    }
 
     for (int logical_stage = 0; logical_stage < num_logical_channels_per_physical; ++logical_stage) {
         const int logical_channel_id = channel_id * num_logical_channels_per_physical + logical_stage;
@@ -9396,7 +9505,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* external_fwd_slot_map,
     int4* external_combined_x,
     float* external_combined_topk_weights,
-    MegaKernelState* host_state_out
+    MegaKernelState* host_state_out,
+    int* rdma_reuse_dispatch_quiet_done,
+    int* rdma_reuse_combine_clear_done,
+    int rdma_reuse_prelude_enable
 ) {
 #define cudaMalloc(pp, n) mk_caching_alloc(reinterpret_cast<void**>(pp), (n))
     struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
@@ -10096,6 +10208,15 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.dispatch_round_barrier = dispatch_round_barrier;
     host_state.combine_channel_barrier = combine_channel_barrier;
 
+    // RDMA-buffer-reuse plumbing (borrowed symmetric mailboxes + state-owned gate flag)
+    host_state.rdma_reuse_dispatch_quiet_done = rdma_reuse_dispatch_quiet_done;
+    host_state.rdma_reuse_combine_clear_done = rdma_reuse_combine_clear_done;
+    host_state.rdma_reuse_prelude_enable = rdma_reuse_prelude_enable;
+    int* rdma_reuse_prelude_done = nullptr;
+    CUDA_CHECK(cudaMalloc(&rdma_reuse_prelude_done, sizeof(int)));
+    CUDA_CHECK(cudaMemset(rdma_reuse_prelude_done, 0, sizeof(int)));
+    host_state.rdma_reuse_prelude_done = rdma_reuse_prelude_done;
+
     // Combine state
     host_state.num_combine_sms = num_combine_sms;
     host_state.num_combine_channels = num_combine_channels;
@@ -10120,8 +10241,14 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.priority_batch_retry_epoch = priority_batch_retry_epoch;
     host_state.max_batches_per_expert = max_batches_per_expert;
 
-    // Combine infrastructure
-    void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
+    // Combine infrastructure.
+    // RDMA-buffer reuse: combine reuses the single dispatch RDMA region. Both forward and backward
+    // enable the in-kernel combine prelude, which guarantees all cross-machine dispatch has fully
+    // drained and the combine metadata is re-cleared (with a cross-rank barrier) before combine
+    // touches the region. The old separate "combine half" has been removed (allocation halved), so
+    // reuse is mandatory; the prelude MUST be enabled whenever this state drives a combine.
+    EP_HOST_ASSERT(rdma_reuse_prelude_enable && "combine RDMA reuse requires the prelude enabled");
+    void* combine_rdma_ptr = rdma_buffer_ptr;
 
 #if MK_PERF_TRACE_ENABLED
     int64_t* perf_dispatch_lch_ts;
@@ -10844,6 +10971,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.channel_dispatch_done));
     CUDA_CHECK(cudaFree(host_state.channel_normalized));
     CUDA_CHECK(cudaFree(host_state.dispatch_channel_barrier));
+    CUDA_CHECK(cudaFree(host_state.rdma_reuse_prelude_done));
     CUDA_CHECK(cudaFree(host_state.dispatch_round_barrier));
     CUDA_CHECK(cudaFree(host_state.combine_channel_barrier));
     CUDA_CHECK(cudaFree(host_state.fused_fill_desc_buf));
@@ -12006,7 +12134,12 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         fs.fwd_slot_map,
         reinterpret_cast<int4*>(grad_input),
         reinterpret_cast<float*>(grad_topk_weights),
-        &host_ctx->bwd_state);
+        &host_ctx->bwd_state,
+        fs.rdma_reuse_dispatch_quiet_done,
+        fs.rdma_reuse_combine_clear_done,
+        1 /* rdma_reuse_prelude_enable: backward reuses the dispatch RDMA region too.
+             Backward shares dispatch_worker_v2 / combine_worker_v2, so the same
+             dispatch_channel_barrier==2 gate + quiet + phase-B protocol applies. */);
 
     MegaKernelBackwardState& hs = host_ctx->backward_state;
     hs.fwd = fwd_device_state;
@@ -12372,6 +12505,7 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.channel_dispatch_done, (size_t)NLC * sizeof(int));
     z(hs.channel_normalized, (size_t)NLC * sizeof(int));
     z(hs.dispatch_channel_barrier, (size_t)NLC * sizeof(int));
+    z(hs.rdma_reuse_prelude_done, sizeof(int));
     z(hs.dispatch_round_barrier, (size_t)round_slots * sizeof(int));
     z(hs.combine_channel_barrier, (size_t)NLC * sizeof(int));
     z(hs.recv_rdma_channel_prefix_matrix, (size_t)kRDMA * NLC * sizeof(int));

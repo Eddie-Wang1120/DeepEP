@@ -115,6 +115,11 @@ private:
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
 
+    // RDMA-buffer-reuse mailboxes (symmetric, indexed by rdma_rank, size num_rdma_ranks).
+    // Peers publish per-phase "done" via IBGDA; scheduler polls its local copy.
+    int* rdma_reuse_dispatch_quiet_done = nullptr;
+    int* rdma_reuse_combine_clear_done = nullptr;
+
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;

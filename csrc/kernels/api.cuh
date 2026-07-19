@@ -451,7 +451,12 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* external_fwd_slot_map = nullptr,
     int4* external_combined_x = nullptr,
     float* external_combined_topk_weights = nullptr,
-    MegaKernelState* host_state_out = nullptr);
+    MegaKernelState* host_state_out = nullptr,
+    // RDMA-buffer-reuse mailboxes (symmetric, indexed by rdma_rank). Borrowed, not owned.
+    int* rdma_reuse_dispatch_quiet_done = nullptr,
+    int* rdma_reuse_combine_clear_done = nullptr,
+    // Enable the in-kernel combine RDMA-reuse prelude (forward only for now).
+    int rdma_reuse_prelude_enable = 0);
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
 void free_megakernel_forward_transient(MegaKernelState* device_state);

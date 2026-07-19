@@ -317,6 +317,10 @@ void Buffer::destroy() {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
         internode::free(rdma_buffer_ptr);
+        if (rdma_reuse_dispatch_quiet_done != nullptr)
+            internode::free(rdma_reuse_dispatch_quiet_done);
+        if (rdma_reuse_combine_clear_done != nullptr)
+            internode::free(rdma_reuse_combine_clear_done);
         if (enable_shrink) {
             internode::free(mask_buffer_ptr);
             internode::free(sync_buffer_ptr);
@@ -389,13 +393,27 @@ void Buffer::sync(const std::vector<int>& device_ids,
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
 
-        // Allocate dispatch and combine RDMA regions. The regular low-latency APIs use
-        // the first region, while megakernel uses the second region for combine.
-        int64_t rdma_alloc_bytes = num_rdma_bytes * 2;
+        // RDMA pool. Megakernel combine now reuses this single region (the in-kernel combine
+        // prelude serializes dispatch->clean->combine and barriers across same-nvl peers), so the
+        // old second "combine" half is no longer needed. Regular low-latency APIs also use only
+        // this region.
+        int64_t rdma_alloc_bytes = num_rdma_bytes;
         rdma_buffer_ptr = internode::alloc(rdma_alloc_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, rdma_alloc_bytes));
+
+        // RDMA-buffer-reuse mailboxes: symmetric memory, indexed by rdma_rank.
+        // Allocated like the RDMA pool so peers can IBGDA-write into the local copy.
+        {
+            int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
+            rdma_reuse_dispatch_quiet_done = reinterpret_cast<int*>(
+                internode::alloc(mailbox_bytes, NUM_BUFFER_ALIGNMENT_BYTES));
+            rdma_reuse_combine_clear_done = reinterpret_cast<int*>(
+                internode::alloc(mailbox_bytes, NUM_BUFFER_ALIGNMENT_BYTES));
+            CUDA_CHECK(cudaMemset(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes));
+            CUDA_CHECK(cudaMemset(rdma_reuse_combine_clear_done, 0, mailbox_bytes));
+        }
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -2348,12 +2366,16 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // Clean the combine region the DeepEP way: a clean-only cached_notify (num_combined_tokens=0,
     // null heads => no head normalization, just zero the combine head/tail metadata + a cross-rank
     // barrier inside the collective). This mirrors internode_combine's cached_notify and replaces
-    // the old host-side full-buffer memset + intranode/internode barriers. The combine buffers live
-    // in the second half of the symmetric allocation:
-    //   RDMA  combine half : rdma_buffer_ptr + num_rdma_bytes
-    //   NVL   combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
+    // the old host-side full-buffer memset + intranode/internode barriers.
+    //   RDMA : reuses the single symmetric region (rdma_buffer_ptr); this pre-launch RDMA clean is
+    //          redundant with the in-kernel combine prelude but kept for the NVL clean + barrier.
+    //   NVL  combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
     {
-        void* combine_rdma_ptr = static_cast<uint8_t*>(rdma_buffer_ptr) + num_rdma_bytes;
+        // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify is
+        // kept for the NVL combine metadata clean + cross-rank barrier; its RDMA metadata clean on
+        // the shared region is pre-launch and redundant with the in-kernel combine prelude (which
+        // re-clears combine metadata after dispatch drains), so it is harmless.
+        void* combine_rdma_ptr = rdma_buffer_ptr;
         internode::mk_cached_notfy(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
@@ -2476,7 +2498,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         nullptr,
         reinterpret_cast<int4*>(result.data_ptr()),
         nullptr,
-        nullptr);
+        nullptr,
+        rdma_reuse_dispatch_quiet_done,
+        rdma_reuse_combine_clear_done,
+        1 /* rdma_reuse_prelude_enable (forward) */);
     };
 
     void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
@@ -2514,6 +2539,17 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     auto compute_dtype = use_fp8_compute
         ? megakernel::ComputeDType::kFP8E4M3
         : megakernel::ComputeDType::kBF16;
+
+    // Reset RDMA-reuse mailboxes before launch. Barrier so every rank observes the cleared
+    // mailbox before any peer's combine prelude writes into it during this iteration.
+    if (num_rdma_bytes > 0 && rdma_reuse_dispatch_quiet_done != nullptr) {
+        int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
+        CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
+        AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        internode::barrier();
+    }
+
     megakernel_debug::launch_megakernel_debug_forward(
         static_cast<megakernel_debug::MegaKernelState*>(state),
         active_total_sms, smem_size, stage, compute_dtype, stream);
@@ -2680,6 +2716,18 @@ Buffer::megakernel_debug_backward(
         backward_host_context, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
+
+    // Reset RDMA-reuse mailboxes before the backward launch (backward runs the same combine
+    // prelude). Barrier so every rank observes the cleared mailbox before any peer's backward
+    // prelude writes into it, and so forward's leftover "done" flags can't be misread.
+    if (num_rdma_bytes > 0 && rdma_reuse_dispatch_quiet_done != nullptr) {
+        int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
+        CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
+        AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        internode::barrier();
+    }
+
     megakernel_debug::launch_megakernel_debug_backward(
         backward_state, backward_host_context, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);
