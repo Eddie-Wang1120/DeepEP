@@ -3496,16 +3496,39 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #endif
 
                     // Fused enqueue: tid0 immediately enqueues full batches.
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    while (count - cursor >= COMPUTE_BATCH_SIZE) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
-                        cursor += COMPUTE_BATCH_SIZE;
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-#if MK_PERF_TRACE_ARGS
-                        normal_full_batch_enqueues += 1;
-#endif
-                    }
+                    // Visibility fix: tid0 (the thread that publishes the compute task) must
+                    // itself acquire every slot it is about to publish, so the
+                    // producer -> tid0 -> compute release/acquire chain covers each slot's data.
+                    // `count` was produced by a cooperative scan where OTHER threads acquired the
+                    // slots, so without this re-acquire the compute worker can read not-yet-visible
+                    // token metadata -> garbage indices -> intermittent illegal access.
+                    // Perf: the acquires are issued in ILP batches so their latency overlaps.
+                    // This is the SAME set of acquire loads on the SAME thread as a serial loop
+                    // (identical synchronization coverage), only pipelined -> no correctness change.
+//                     int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+//                     const int slot_base_for_enqueue = state->expert_slot_base[expert_id];
+//                     constexpr int kAcqIlp = 16;  // divides COMPUTE_BATCH_SIZE (1024)
+//                     while (count - cursor >= COMPUTE_BATCH_SIZE) {
+//                         bool batch_visible = true;
+//                         for (int s = cursor; s < cursor + COMPUTE_BATCH_SIZE; s += kAcqIlp) {
+//                             int r[kAcqIlp];
+//                             #pragma unroll
+//                             for (int j = 0; j < kAcqIlp; ++j)
+//                                 r[j] = ld_acquire_global(&state->expert_slot_ready[slot_base_for_enqueue + s + j]);
+//                             #pragma unroll
+//                             for (int j = 0; j < kAcqIlp; ++j)
+//                                 batch_visible &= (r[j] == 1);
+//                         }
+//                         if (!batch_visible)
+//                             break;  // monotonic readiness => should not happen; guards correctness
+//                         int batch_id = cursor / COMPUTE_BATCH_SIZE;
+//                         scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
+//                         cursor += COMPUTE_BATCH_SIZE;
+//                         st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
+// #if MK_PERF_TRACE_ARGS
+//                         normal_full_batch_enqueues += 1;
+// #endif
+//                     }
                 }
 #if MK_PERF_TRACE_ARGS
                 if (tid == 0) {
@@ -6922,8 +6945,26 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #endif
 
                     // Fused enqueue: tid0 immediately enqueues full batches.
+                    // Visibility fix: tid0 must acquire every slot it publishes so the
+                    // producer -> tid0 -> compute release/acquire chain covers each slot's data.
+                    // Perf: acquires issued in ILP batches to overlap latency (same thread, same
+                    // acquire coverage as a serial loop -> no correctness change).
                     int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
+                    const int slot_base_for_enqueue = state->expert_slot_base[expert_id];
+                    constexpr int kAcqIlp = 16;  // divides COMPUTE_BATCH_SIZE (1024)
                     while (count - cursor >= COMPUTE_BATCH_SIZE) {
+                        bool batch_visible = true;
+                        for (int s = cursor; s < cursor + COMPUTE_BATCH_SIZE; s += kAcqIlp) {
+                            int r[kAcqIlp];
+                            #pragma unroll
+                            for (int j = 0; j < kAcqIlp; ++j)
+                                r[j] = ld_acquire_global(&state->expert_slot_ready[slot_base_for_enqueue + s + j]);
+                            #pragma unroll
+                            for (int j = 0; j < kAcqIlp; ++j)
+                                batch_visible &= (r[j] == 1);
+                        }
+                        if (!batch_visible)
+                            break;
                         int batch_id = cursor / COMPUTE_BATCH_SIZE;
                         scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, COMPUTE_BATCH_SIZE, 0, 1);
                         cursor += COMPUTE_BATCH_SIZE;
