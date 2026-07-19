@@ -155,6 +155,8 @@ struct ComputeTask {
 
 struct MegaKernelBackwardState;
 
+constexpr int kMegakernelArenaChunkCap = 64;
+
 struct MegaKernelState {
     int* timeout_log_counters;        // [kTimeoutLogCount] per-site bounded logging budget
     // --- DeepEP NVSHMEM infrastructure (from Buffer object) ---
@@ -416,6 +418,12 @@ struct MegaKernelState {
 
     // Backing store for the fused buffer-init descriptors (see fused_fill_kernel). Freed with the state.
     void* fused_fill_desc_buf;
+
+    // --- Owned arena bookkeeping ---
+    void* persistent_arena_chunks[kMegakernelArenaChunkCap];
+    int persistent_arena_chunk_count;
+    void* transient_arena_chunks[kMegakernelArenaChunkCap];
+    int transient_arena_chunk_count;
 
 #if MK_PERF_TRACE_ENABLED
     // Per-logical-channel timing. Each logical channel has sender and forwarder rows
@@ -9438,6 +9446,67 @@ struct TmaCacheEntry {
 constexpr int kTmaCacheCap = 8;
 static thread_local TmaCacheEntry s_tma_cache[kTmaCacheCap];
 static thread_local int s_tma_cache_next = 0;
+
+constexpr size_t kMegakernelArenaChunkBytes = 256ull * 1024ull * 1024ull;
+
+struct MegakernelArenaAllocator {
+    std::vector<void*> chunks;
+    void* current_chunk = nullptr;
+    size_t current_chunk_bytes = 0;
+    size_t offset = 0;
+
+    cudaError_t alloc(void** pp, size_t nbytes) {
+        if (nbytes == 0) {
+            *pp = nullptr;
+            return cudaSuccess;
+        }
+        constexpr size_t kAlign = NUM_BUFFER_ALIGNMENT_BYTES;
+        auto align_up = [](size_t v, size_t a) {
+            return (v + a - 1) / a * a;
+        };
+        nbytes = align_up(nbytes, kAlign);
+        size_t aligned_offset = align_up(offset, kAlign);
+        if (current_chunk == nullptr || aligned_offset + nbytes > current_chunk_bytes) {
+            if (chunks.size() >= kMegakernelArenaChunkCap)
+                return cudaErrorMemoryAllocation;
+            const size_t chunk_bytes = align_up(std::max(nbytes, kMegakernelArenaChunkBytes), kAlign);
+            void* chunk = nullptr;
+            cudaError_t err = mk_caching_alloc(&chunk, chunk_bytes);
+            if (err != cudaSuccess)
+                return err;
+            chunks.push_back(chunk);
+            current_chunk = chunk;
+            current_chunk_bytes = chunk_bytes;
+            offset = 0;
+            aligned_offset = 0;
+        } else {
+            offset = aligned_offset;
+        }
+        *pp = static_cast<void*>(static_cast<char*>(current_chunk) + aligned_offset);
+        offset = aligned_offset + nbytes;
+        return cudaSuccess;
+    }
+};
+
+static inline void store_arena_chunks(const MegakernelArenaAllocator& arena, void** dst, int* count) {
+    EP_HOST_ASSERT(arena.chunks.size() <= kMegakernelArenaChunkCap);
+    *count = static_cast<int>(arena.chunks.size());
+    for (int i = 0; i < *count; ++i)
+        dst[i] = arena.chunks[i];
+}
+
+static inline cudaError_t free_arena_chunks(void** chunks, int count) {
+    for (int i = 0; i < count; ++i) {
+        if (chunks[i] != nullptr) {
+            cudaError_t err = mk_caching_free(chunks[i]);
+            if (err != cudaSuccess)
+                return err;
+            chunks[i] = nullptr;
+        }
+    }
+    return cudaSuccess;
+}
+
 }  // anonymous namespace
 
 MegaKernelState* allocate_megakernel_state_v7(
@@ -9510,7 +9579,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* rdma_reuse_combine_clear_done,
     int rdma_reuse_prelude_enable
 ) {
-#define cudaMalloc(pp, n) mk_caching_alloc(reinterpret_cast<void**>(pp), (n))
+    MegakernelArenaAllocator persistent_arena;
+    MegakernelArenaAllocator transient_arena;
+    MegakernelArenaAllocator* arena = &persistent_arena;
+#define cudaMalloc(pp, n) arena->alloc(reinterpret_cast<void**>(pp), (n))
+    auto mk_cache_alloc = [](auto** pp, size_t nbytes) -> cudaError_t {
+        return mk_caching_alloc(reinterpret_cast<void**>(pp), nbytes);
+    };
     struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
     std::vector<MkFillRec> mk_fill_recs;
     auto mk_record_fill = [&](void* ptr, int byte_value, size_t bytes) -> cudaError_t {
@@ -9632,7 +9707,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&expert_slot_ready, total_expert_slots * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_slot_ready, 0, total_expert_slots * sizeof(int)));
     size_t recv_tokens_bytes = total_expert_slots * hidden_dim * sizeof(__nv_bfloat16);
+    arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&recv_tokens, recv_tokens_bytes));
+    arena = &persistent_arena;
 
     CUDA_CHECK(cudaMalloc(&expert_token_offsets, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_token_offsets, 0, num_local_experts * sizeof(int)));
@@ -9749,11 +9826,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(publish_all_done, 0, sizeof(int)));
 
     // Combine input namespace from dispatch receive.
+    arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&combine_input, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMemset(combine_input, 0, (size_t)max_total_recv_tokens * hidden_dim * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMalloc(&combine_input_topk_weights, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMemset(combine_input_topk_weights, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&combine_input_src_meta, (size_t)max_total_recv_tokens * sizeof(internode::SourceMeta)));
+    arena = &persistent_arena;
 
     // Per-token compute signaling
     int* token_compute_expected;
@@ -9772,8 +9851,10 @@ MegaKernelState* allocate_megakernel_state_v7(
 #endif
     int* priority_batch_skip_epoch;
     int* priority_batch_retry_epoch;
+    arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
     CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
+    arena = &persistent_arena;
     // Backward activation save: original fc1 input X plus gate/up preact by recv_token.
     // A backward replay borrows the forward state's saved buffers directly, avoiding a
     // transient allocate/free cycle for hundreds of MiB.
@@ -9831,7 +9912,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     // GU scratch region remains reserved so existing descriptors/helpers stay valid.
     size_t per_group_elems = (size_t)COMPUTE_BATCH_SIZE * (2 * hidden_dim + 3 * intermediate_dim);
     size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
+    arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
+    arena = &persistent_arena;
 
     const auto* W_gateup_fp8_typed = reinterpret_cast<const umma_fp8::ElemAB*>(W_gateup_fp8);
     const auto* W_down_fp8_typed = reinterpret_cast<const umma_fp8::ElemAB*>(W_down_fp8);
@@ -9901,7 +9984,7 @@ MegaKernelState* allocate_megakernel_state_v7(
         umma::ComputeTmaAtoms h_atoms;
         umma::build_compute_tma_atoms(h_atoms, W_gateup, num_local_experts,
                                       intermediate_dim, hidden_dim);
-        CUDA_CHECK(cudaMalloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
+        CUDA_CHECK(mk_cache_alloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_tma, &h_atoms, sizeof(umma::ComputeTmaAtoms), cudaMemcpyHostToDevice));
 
         std::vector<umma::InputTmaAtom_t> h_in;
@@ -9915,13 +9998,13 @@ MegaKernelState* allocate_megakernel_state_v7(
                                                         COMPUTE_BATCH_SIZE, hidden_dim,
                                                         intermediate_dim, hidden_dim));
         }
-        CUDA_CHECK(cudaMalloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
+        CUDA_CHECK(mk_cache_alloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
         CUDA_CHECK(cudaMemcpy(d_group_input_tma, h_in.data(),
                               num_compute_groups * sizeof(umma::InputTmaAtom_t), cudaMemcpyHostToDevice));
 
         umma::ComputeDownTmaAtoms h_down;
         umma::build_compute_down_tma_atoms(h_down, W_down, num_local_experts, hidden_dim, intermediate_dim);
-        CUDA_CHECK(cudaMalloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
+        CUDA_CHECK(mk_cache_alloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_down_tma, &h_down, sizeof(umma::ComputeDownTmaAtoms), cudaMemcpyHostToDevice));
     }
 
@@ -9929,14 +10012,14 @@ MegaKernelState* allocate_megakernel_state_v7(
         umma_fp8::ComputeFp8TmaAtoms h_fp8_atoms;
         umma_fp8::build_compute_fp8_tma_atoms(h_fp8_atoms, W_gateup_fp8_typed, W_gateup_fp8_sf_typed,
                                               num_local_experts, intermediate_dim, hidden_dim);
-        CUDA_CHECK(cudaMalloc(&d_compute_fp8_tma, sizeof(umma_fp8::ComputeFp8TmaAtoms)));
+        CUDA_CHECK(mk_cache_alloc(&d_compute_fp8_tma, sizeof(umma_fp8::ComputeFp8TmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_fp8_tma, &h_fp8_atoms,
                               sizeof(umma_fp8::ComputeFp8TmaAtoms), cudaMemcpyHostToDevice));
 
         umma_fp8::ComputeFp8DownTmaAtoms h_fp8_down;
         umma_fp8::build_compute_fp8_down_tma_atoms(h_fp8_down, W_down_fp8_typed, W_down_fp8_sf_typed,
                                                    num_local_experts, hidden_dim, intermediate_dim);
-        CUDA_CHECK(cudaMalloc(&d_compute_fp8_down_tma, sizeof(umma_fp8::ComputeFp8DownTmaAtoms)));
+        CUDA_CHECK(mk_cache_alloc(&d_compute_fp8_down_tma, sizeof(umma_fp8::ComputeFp8DownTmaAtoms)));
         CUDA_CHECK(cudaMemcpy(d_compute_fp8_down_tma, &h_fp8_down,
                               sizeof(umma_fp8::ComputeFp8DownTmaAtoms), cudaMemcpyHostToDevice));
 
@@ -9983,6 +10066,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     } // end cache miss
 
     // Output accumulator [num_tokens, hidden_dim] in float32
+    arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&output_accum, (size_t)num_tokens * hidden_dim * sizeof(float)));
     CUDA_CHECK(cudaMemset(output_accum, 0, (size_t)num_tokens * hidden_dim * sizeof(float)));
 
@@ -9999,6 +10083,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(combine_rdma_head_work, 0, (size_t)num_logical_channels * combine_rdma_head_stride * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&combine_nvl_head_work, (size_t)num_logical_channels * combine_nvl_head_stride * sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_nvl_head_work, 0, (size_t)num_logical_channels * combine_nvl_head_stride * sizeof(int)));
+    arena = &persistent_arena;
 
     // Recv logical-channel prefix matrices (written by forwarder)
     int num_physical_channels = num_dispatch_sms / 2;  // even/odd pairing
@@ -10808,8 +10893,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     int4* combined_x = external_combined_x;
     const bool owns_combined_x = combined_x == nullptr;
     if (owns_combined_x) {
+        arena = &transient_arena;
         CUDA_CHECK(cudaMalloc(&combined_x, num_tokens * hidden_int4 * sizeof(int4)));
         CUDA_CHECK(cudaMemset(combined_x, 0, num_tokens * hidden_int4 * sizeof(int4)));
+        arena = &persistent_arena;
     }
     host_state.combined_x = combined_x;
     host_state.owns_combined_x = owns_combined_x;
@@ -10817,8 +10904,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     float* combined_topk_weights = external_combined_topk_weights;
     const bool owns_combined_topk_weights = combined_topk_weights == nullptr;
     if (owns_combined_topk_weights) {
+        arena = &transient_arena;
         CUDA_CHECK(cudaMalloc(&combined_topk_weights, num_tokens * num_topk * sizeof(float)));
         CUDA_CHECK(cudaMemset(combined_topk_weights, 0, num_tokens * num_topk * sizeof(float)));
+        arena = &persistent_arena;
     }
     host_state.combined_topk_weights = combined_topk_weights;
     host_state.owns_combined_topk_weights = owns_combined_topk_weights;
@@ -10853,11 +10942,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.fused_fill_desc_buf = fill_desc_buf;
 
     // Copy state + fill descs to device in one async batch on the current stream.
-    if (host_state_out != nullptr)
-        *host_state_out = host_state;
     cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
     MegaKernelState* device_state;
     CUDA_CHECK(cudaMalloc(&device_state, sizeof(MegaKernelState)));
+    store_arena_chunks(persistent_arena, host_state.persistent_arena_chunks, &host_state.persistent_arena_chunk_count);
+    store_arena_chunks(transient_arena, host_state.transient_arena_chunks, &host_state.transient_arena_chunk_count);
+    if (host_state_out != nullptr)
+        *host_state_out = host_state;
     CUDA_CHECK(cudaMemcpyAsync(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice, init_stream));
     if (mk_num_descs > 0) {
         CUDA_CHECK(cudaMemcpyAsync(fill_desc_buf, host_descs.data(),
@@ -10881,6 +10972,12 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     // Copy back to read pointers for freeing
     MegaKernelState host_state;
     CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+
+    if (host_state.persistent_arena_chunk_count > 0 || host_state.transient_arena_chunk_count > 0) {
+        CUDA_CHECK(free_arena_chunks(host_state.transient_arena_chunks, host_state.transient_arena_chunk_count));
+        CUDA_CHECK(free_arena_chunks(host_state.persistent_arena_chunks, host_state.persistent_arena_chunk_count));
+        return;
+    }
 
     CUDA_CHECK(cudaFree(host_state.expert_recv_count));
     CUDA_CHECK(cudaFree(host_state.expert_slot_ready));
@@ -11194,6 +11291,27 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
         return;
     MegaKernelState hs;
     CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    if (hs.transient_arena_chunk_count > 0) {
+        CUDA_CHECK(free_arena_chunks(hs.transient_arena_chunks, hs.transient_arena_chunk_count));
+        hs.transient_arena_chunk_count = 0;
+        hs.recv_tokens = nullptr;
+        hs.compute_output_slot = nullptr;
+        hs.combine_input = nullptr;
+        hs.combine_input_topk_weights = nullptr;
+        hs.combine_input_src_meta = nullptr;
+        hs.combine_rdma_head_work = nullptr;
+        hs.combine_nvl_head_work = nullptr;
+        hs.gemm_workspace = nullptr;
+        hs.output_accum = nullptr;
+        hs.send_rdma_head = nullptr;
+        hs.send_nvl_head = nullptr;
+        if (hs.owns_combined_x)
+            hs.combined_x = nullptr;
+        if (hs.owns_combined_topk_weights)
+            hs.combined_topk_weights = nullptr;
+        CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
+        return;
+    }
     auto free_and_null = [](auto*& ptr) {
         CUDA_CHECK(mk_caching_free(static_cast<void*>(ptr)));
         ptr = nullptr;

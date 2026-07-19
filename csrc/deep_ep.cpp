@@ -2674,9 +2674,10 @@ Buffer::megakernel_debug_backward(
     auto grad_input = torch::empty_like(grad_output);
     auto bf16_options = grad_output.options();
     auto fp32_options = grad_output.options().dtype(torch::kFloat32);
-    auto grad_w_gateup = torch::zeros(
+    // These are fully overwritten by the QuACK wgrad postprocess, so zero-init is unnecessary.
+    auto grad_w_gateup = torch::empty(
         {num_local_experts, 2 * intermediate, hidden}, bf16_options);
-    auto grad_w_down = torch::zeros(
+    auto grad_w_down = torch::empty(
         {num_local_experts, hidden, intermediate}, bf16_options);
     auto grad_topk_weights = torch::zeros({num_tokens, num_topk}, fp32_options);
     const std::vector<int>& expert_token_counts = context->expert_counts();
