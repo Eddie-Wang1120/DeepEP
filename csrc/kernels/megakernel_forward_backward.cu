@@ -10998,62 +10998,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     CUDA_CHECK(cudaMemcpyAsync(device_bs, &hs, sizeof(MegaKernelBackwardState),
                                cudaMemcpyHostToDevice, stream));
 
-    // Append the backward-specific fills (send_rdma_head=0xff, send_nvl_head=0xff,
-    // grad_input=0x00) to the same stream so they execute in the fused_fill_kernel
-    // already launched by allocate_megakernel_state_v7 above — or, since that kernel
-    // has already been enqueued, launch a second merged fill covering all three entries
-    // in one kernel. This merges what was previously a separate fused_fill in
-    // launch_megakernel_debug_backward into the allocate path, eliminating one kernel
-    // launch + one H2D from the critical path between fused_fill and cached_notify.
-    {
-        const MegaKernelState& bwd_hs = host_ctx->bwd_state;
-        const int kRDMA = bwd_hs.num_ranks / NUM_MAX_NVL_PEERS;
-        const int NLC = bwd_hs.num_logical_channels;
-        const int TK = bwd_hs.num_topk;
-        const int combine_rdma_head_stride = bwd_hs.num_tokens * kRDMA;
-        const int combine_nvl_head_stride = (bwd_hs.num_tokens * TK) * NUM_MAX_NVL_PEERS;
-        const size_t rdma_head_bytes = (size_t)NLC * combine_rdma_head_stride * sizeof(int);
-        const size_t nvl_head_bytes = (size_t)NLC * combine_nvl_head_stride * sizeof(int);
-        const size_t grad_input_bytes = (size_t)bwd_hs.num_tokens * bwd_hs.hidden_dim * sizeof(__nv_bfloat16);
-
-        constexpr size_t CHUNK_WORDS = 64 * 1024;
-        struct BwdFillEntry { void* ptr; size_t bytes; uint32_t word; };
-        BwdFillEntry entries[] = {
-            {bwd_hs.send_rdma_head, rdma_head_bytes, 0xffffffffu},
-            {bwd_hs.send_nvl_head,  nvl_head_bytes,  0xffffffffu},
-            {hs.grad_input,         grad_input_bytes, 0x00000000u},
-        };
-        std::vector<FusedFillDesc> bwd_descs;
-        for (auto& e : entries) {
-            uint8_t* base = reinterpret_cast<uint8_t*>(e.ptr);
-            size_t offset = 0;
-            while (offset < e.bytes) {
-                size_t chunk = std::min(e.bytes - offset, CHUNK_WORDS * sizeof(uint32_t));
-                chunk = (chunk / sizeof(uint32_t)) * sizeof(uint32_t);
-                if (chunk == 0) chunk = e.bytes - offset;
-                bwd_descs.push_back(FusedFillDesc{base + offset, chunk, e.word});
-                offset += chunk;
-            }
-        }
-        const int ndescs = static_cast<int>(bwd_descs.size());
-        if (ndescs > 0) {
-            void* bwd_fill_buf = nullptr;
-            CUDA_CHECK(mk_caching_alloc(&bwd_fill_buf, (size_t)ndescs * sizeof(FusedFillDesc)));
-            CUDA_CHECK(cudaMemcpyAsync(bwd_fill_buf, bwd_descs.data(),
-                                       (size_t)ndescs * sizeof(FusedFillDesc),
-                                       cudaMemcpyHostToDevice, stream));
-            fused_fill_kernel<<<ndescs, 512, 0, stream>>>(
-                static_cast<const FusedFillDesc*>(bwd_fill_buf), ndescs,
-                nullptr, nullptr, nullptr, 0);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(mk_caching_free(bwd_fill_buf));
-        }
-    }
-
     // Single sync covers all prior async H2Ds (compute_bwd_tma, allocate_state_v7's
-    // state+fill_descs, wgrad_dgu_a_tma, device_bs, backward fill descs) plus both
-    // fused_fill_kernel launches. This mirrors the forward pattern: batch all async
-    // ops, sync once at the end.
+    // state+fill_descs, wgrad_dgu_a_tma, device_bs) plus the single fused_fill_kernel
+    // launch inside allocate_megakernel_state_v7. This mirrors the forward pattern:
+    // batch all async ops, sync once at the end.
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     EP_HOST_ASSERT(host_context != nullptr);
