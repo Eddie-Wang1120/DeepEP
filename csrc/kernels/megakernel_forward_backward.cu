@@ -3939,7 +3939,9 @@ __device__ __forceinline__ void compute_worker_core(
     // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
     float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
 
-    // TMEM alloc-once flag: first UMMA call allocates, subsequent calls reuse.
+    // TMEM persistent across tasks: allocate on first UMMA use, keep alive
+    // until the compute worker exits the persistent loop. This eliminates
+    // per-task init/dealloc overhead (2x cluster_sync + barrier init each).
     bool umma_tmem_allocated = false;
 #if MK_PERF_TRACE_ARGS
     int64_t last_task_end_ns = 0;
@@ -4037,6 +4039,17 @@ __device__ __forceinline__ void compute_worker_core(
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
+        // Tail-batch M packing (1-CTA only): round the real token count up to the
+        // UMMA M-tile (128) instead of always padding to COMPUTE_BATCH_SIZE (1024).
+        // This drops scheduled M-tiles from ceil(1024/128)=8 to ceil(batch_size/128),
+        // so a 10-token tail runs 1 M-tile instead of 8. Rows [batch_size, gemm_m)
+        // are still zero-padded and masked by valid_rows/batch_size.
+        constexpr int kGemmMAlign = 128;   // UMMA M-tile granularity (kDgBlockM)
+        const int gemm_m = (kUmmaClusterDim == 1)
+            ? min(COMPUTE_BATCH_SIZE,
+                  (batch_size + kGemmMAlign - 1) / kGemmMAlign * kGemmMAlign)
+            : COMPUTE_BATCH_SIZE;
+
         // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
         // Keep gate/up and down independent so diagnostic switches can isolate each UMMA path.
         if constexpr (kUseUmmaCompute) {
@@ -4108,7 +4121,7 @@ __device__ __forceinline__ void compute_worker_core(
         // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
         // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
         // so padding rows never leave the kernel.
-        for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
+        for (int i = batch_size + thread_id; i < gemm_m; i += blockDim.x) {
             s_route_w[i] = 0.0f;
             s_recv_token_idx[i] = -1;
             s_topk_slot[i] = -1;
@@ -4119,7 +4132,7 @@ __device__ __forceinline__ void compute_worker_core(
 #endif
 
         const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
-        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
+        const int input_vec_stride = gemm_m * hidden_int4;
         const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
         int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
@@ -4141,10 +4154,9 @@ __device__ __forceinline__ void compute_worker_core(
         // Gate/up compute always consumes pairwise interleaved W_gateup rows
         // [g0,u0,g1,u1,...]. UMMA folds adjacent gate/up columns in its epilogue;
         // WMMA fallback reads the same layout with a 2*K B-matrix stride.
-        // umma_accum_iter tracks TMEM accumulator pipeline phase (tmem_full/tmem_empty
-        // barrier ring) across ALL three GEMMs (gate, up, down). Must NOT be reset
-        // between gate/up and down-proj — the barrier ring is initialized once and
-        // must stay in phase. Declared here so it spans both if-blocks below.
+        // umma_accum_iter is reset to 0 at the start of each GEMM pass (gate/up
+        // and down) since barriers are re-initialized. TMEM itself persists across
+        // tasks — only allocated once and freed on worker exit.
         uint32_t umma_accum_iter = 0;
 
         // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path over
@@ -4161,21 +4173,26 @@ __device__ __forceinline__ void compute_worker_core(
             // Wgu rows [g0,u0,g1,u1,...], then the epilogue folds each adjacent
             // gate/up pair directly from TMEM into act_buf (up_buf). This is the
             // microkernel path moved into the megakernel for both 1-CTA and 2-CTA.
-            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            if (!umma_tmem_allocated) {
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = true;
+            } else {
+                // TMEM already allocated; just re-init barriers for the new pass.
+                umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
+            }
+            umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
             umma::umma_gateup_interleaved_persistent(
                 &in_atom.a,
                 &state->compute_tma->wgateup[expert_id],
                 &in_atom.act_cd,
                 s_route_w,
-                COMPUTE_BATCH_SIZE, intermediate, hidden,
+                gemm_m, intermediate, hidden,
                 cluster_in_group, num_clusters,
                 cluster_smem, umma_accum_iter,
                 (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
                 s_recv_token_idx, s_topk_slot,
                 /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
                 0, 2 * intermediate, batch_size);
-            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
-            umma_tmem_allocated = false;   // freed each task (4a)
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -4196,10 +4213,8 @@ __device__ __forceinline__ void compute_worker_core(
 #endif
 
         // GEMM 3: down-proj D = act @ W_down^T.
-        // Same task-level PERSISTENT lifecycle as gate/up: init barriers+TMEM
-        // once, run the persistent down GEMM (tile loop inside the three warp
-        // roles, zero cluster sync between tiles), dealloc once. A fresh accum
-        // counter is used because gate/up already freed TMEM at their dealloc.
+        // TMEM is shared with gate/up — no separate init/dealloc. accum_iter
+        // continues from gate/up so the TMEM phase ring stays correct.
         // Tail batches run over the fixed task extent: padded act rows hold the
         // SwiGLU of zero-padded gate/up (== 0), so padded down output rows are 0
         // and are masked off by the batch_size-bounded output/reduce below.
@@ -4210,17 +4225,21 @@ __device__ __forceinline__ void compute_worker_core(
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
-            uint32_t down_accum_iter = 0;
-            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            if (!umma_tmem_allocated) {
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = true;
+            } else {
+                // TMEM already allocated; just re-init barriers for the new pass.
+                umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
+            }
+            umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
             umma::umma_down_persistent(
                 &in_atom.act_a,
                 &state->compute_down_tma->wdown[expert_id],
                 &in_atom.down_cd,
-                COMPUTE_BATCH_SIZE, hidden, intermediate,
+                gemm_m, hidden, intermediate,
                 cluster_in_group, num_clusters,
-                cluster_smem, down_accum_iter);
-            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
-            umma_tmem_allocated = false;
+                cluster_smem, umma_accum_iter);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
@@ -6032,7 +6051,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // ============================================================================
 
 #if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms, const char* trace_phase);
+static void dump_perf_trace_perfetto(const MegaKernelState& host_state, int total_sms, const char* trace_phase);
 #endif
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
@@ -6089,19 +6108,24 @@ static void launch_megakernel_v7_case(
 
 void launch_megakernel_v7(
     MegaKernelState* device_state,
+    const MegaKernelState* host_state,
     int total_sms,
     int smem_size,
     int stage,
     ComputeDType compute_dtype,
     cudaStream_t stream
 ) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
-    const int num_ranks = host_state.num_ranks;
+    MegaKernelState copied_host_state;
+    const MegaKernelState* launcher_host_state = host_state;
+    if (launcher_host_state == nullptr) {
+        CUDA_CHECK(cudaMemcpy(&copied_host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+        launcher_host_state = &copied_host_state;
+    }
+    const int num_ranks = launcher_host_state->num_ranks;
     EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
 
 #define MEGAKERNEL_LAUNCH_STAGE_CASE(kNumRDMARanks, kStage, kComputeDType) \
-    launch_megakernel_v7_case<kNumRDMARanks, kStage, kComputeDType>(device_state, host_state, total_sms, smem_size, stream); \
+    launch_megakernel_v7_case<kNumRDMARanks, kStage, kComputeDType>(device_state, *launcher_host_state, total_sms, smem_size, stream); \
     break
 
 #define MEGAKERNEL_LAUNCH_CASE_WITH_DTYPE(kNumRDMARanks, kComputeDType) \
@@ -6127,14 +6151,12 @@ void launch_megakernel_v7(
 #undef MEGAKERNEL_LAUNCH_STAGE_CASE
 
 #if MK_PERF_TRACE_ENABLED
-    dump_perf_trace_perfetto(device_state, total_sms, "forward");
+    dump_perf_trace_perfetto(*launcher_host_state, total_sms, "forward");
 #endif
 }
 
 #if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(MegaKernelState* device_state, int total_sms, const char* trace_phase) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+static void dump_perf_trace_perfetto(const MegaKernelState& host_state, int total_sms, const char* trace_phase) {
 
     static int forward_trace_iter = 0;
     static int backward_trace_iter = 0;
@@ -9563,11 +9585,16 @@ MegaKernelState* allocate_megakernel_state_v7(
     return device_state;
 }
 
-void free_megakernel_state_v7(MegaKernelState* device_state) {
+void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state) {
 #define cudaFree(p) mk_caching_free(p)
-    // Copy back to read pointers for freeing
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    MegaKernelState host_state_copy;
+    MegaKernelState* hs = &host_state_copy;
+    if (cached_host_state != nullptr) {
+        *hs = *cached_host_state;
+    } else {
+        CUDA_CHECK(cudaMemcpy(hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    }
+#define host_state (*hs)
 
     if (host_state.persistent_arena_chunk_count > 0 || host_state.transient_arena_chunk_count > 0) {
         CUDA_CHECK(free_arena_chunks(host_state.transient_arena_chunks, host_state.transient_arena_chunk_count));
@@ -9872,6 +9899,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state) {
     CUDA_CHECK(cudaFree(host_state.perf_task_group_id));
 #endif
     CUDA_CHECK(cudaFree(device_state));
+#undef host_state
 #undef cudaFree
 }
 
@@ -10015,6 +10043,7 @@ void* get_combined_x_ptr(MegaKernelState* device_state) {
 // same kernel specialization while the forward implementation is still moving.
 void launch_megakernel_debug_forward(
     MegaKernelState* device_state,
+    const MegaKernelState* host_state,
     int total_sms,
     int smem_size,
     int stage,
@@ -10022,7 +10051,7 @@ void launch_megakernel_debug_forward(
     cudaStream_t stream
 ) {
     launch_megakernel_v7(
-        device_state, total_sms, smem_size, stage, compute_dtype, stream);
+        device_state, host_state, total_sms, smem_size, stage, compute_dtype, stream);
 }
 
 // ============================================================================
@@ -10260,6 +10289,9 @@ __device__ __forceinline__ void compute_backward_worker_core(
     constexpr size_t kRouteWOffset =
         (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
     float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
+
+    // TMEM persistent across tasks (same optimization as forward compute_worker_core).
+    bool umma_tmem_allocated = false;
 #if MK_PERF_TRACE_ARGS
     int64_t last_task_end_ns = 0;
 #endif
@@ -10326,8 +10358,14 @@ __device__ __forceinline__ void compute_backward_worker_core(
         if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
             state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
 #endif
-        if (task_idx == -2 || task_idx == -3)
+        if (task_idx == -2 || task_idx == -3) {
+            // Dealloc TMEM before exiting the backward persistent loop.
+            if (umma_tmem_allocated) {
+                char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
+                umma::umma_dealloc(cluster_smem);
+            }
             break;
+        }
         if (task_idx < 0) {
             if (group_sm_idx == 0 && thread_id == 0)
                 __nanosleep(128);
@@ -10463,7 +10501,12 @@ __device__ __forceinline__ void compute_backward_worker_core(
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
             uint32_t grad_act_accum_iter = 0;
-            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            if (!umma_tmem_allocated) {
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = true;
+            } else {
+                umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
+            }
             umma::umma_dgrad_mn_persistent(
                 &in_atom.a,
                 &bs->compute_bwd_tma->wdown[expert_id],
@@ -10471,7 +10514,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 COMPUTE_BATCH_SIZE, intermediate, hidden,
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_act_accum_iter);
-            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -10575,7 +10617,12 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const CUtensorMap* dgu_a_tma =
                 &bs->wgrad_dgu_a_tma[(int64_t)expert_id * state->max_batches_per_expert + dgu_batch_id];
             uint32_t grad_x_accum_iter = 0;
-            umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+            if (!umma_tmem_allocated) {
+                umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
+                umma_tmem_allocated = true;
+            } else {
+                umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
+            }
             umma::umma_dgrad_mn_persistent(
                 dgu_a_tma,
                 &bs->compute_bwd_tma->wgateup[expert_id],
@@ -10583,7 +10630,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 batch_size, hidden, twoI,
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_x_accum_iter);
-            umma::dg_dealloc_tmem<umma::kDgRunMulticast>(cluster_smem);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
@@ -11032,7 +11078,9 @@ void free_megakernel_backward_state(
     // wgrad_* buffers are borrowed from caller-owned Torch tensors.
     CUDA_CHECK(mk_caching_free(hs.compute_bwd_tma));
     CUDA_CHECK(mk_caching_free(hs.wgrad_dgu_a_tma));
-    free_megakernel_state_v7(hs.bwd_device_state);
+    free_megakernel_state_v7(
+        hs.bwd_device_state,
+        host_context != nullptr ? &host_context->bwd_state : nullptr);
     CUDA_CHECK(mk_caching_free(device_bs));
 }
 
@@ -11458,7 +11506,7 @@ void launch_megakernel_debug_backward(
 
 #if MK_PERF_TRACE_ENABLED
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    dump_perf_trace_perfetto(hbs.bwd_device_state, active_total_sms, "backward");
+    dump_perf_trace_perfetto(hstate, active_total_sms, "backward");
 #endif
 
     // Weight-gradient operands are consumed by the host-side QuACK grouped GEMMs.

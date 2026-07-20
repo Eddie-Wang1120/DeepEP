@@ -2005,7 +2005,9 @@ MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKerne
 
 MegaKernelAutogradContext::~MegaKernelAutogradContext() {
 #ifndef DISABLE_NVSHMEM
-    if (state_ != nullptr) megakernel_debug::free_megakernel_state_v7(state_);
+    if (state_ != nullptr)
+        megakernel_debug::free_megakernel_state_v7(
+            state_, cached_host_state_);
 #endif
     if (cached_host_state_ != nullptr)
         megakernel_state_cache::free_host(cached_host_state_);
@@ -2572,6 +2574,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     megakernel_debug::launch_megakernel_debug_forward(
         static_cast<megakernel_debug::MegaKernelState*>(state),
+        fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
 #ifdef MK_TOKEN_TRACE
@@ -2594,8 +2597,16 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             static_cast<megakernel_debug::MegaKernelState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
             mk_expert_counts);
-        // Cache the host-side state snapshot so backward can skip the synchronous D2H.
-        // Transfer ownership of the pre-allocated fwd_host_state_ptr to context.
+        // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
+        // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
+        // from this forward state. Release the forward-only working buffers (recv_tokens,
+        // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
+        // heads, ...) now so they don't stay resident across the forward->backward gap.
+        // The returned Torch tensor owns combined_x and is not released with the state.
+        // Free transient BEFORE caching and freeing fwd_host_state_ptr.
+        megakernel_debug::free_megakernel_forward_transient_from_host(fwd_host_state_ptr);
+        // Cache the host-side state snapshot (with transient pointers already freed) so
+        // backward can skip the synchronous D2H.
         context->set_cached_host_state(*fwd_host_state_ptr);
         megakernel_state_cache::free_host(fwd_host_state_ptr);
         fwd_host_state_ptr = nullptr;
@@ -2612,17 +2623,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             topk_idx,
             topk_weights,
         });
-        // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
-        // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
-        // from this forward state. Release the forward-only working buffers (recv_tokens,
-        // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
-        // heads, ...) now so they don't stay resident across the forward->backward gap.
-        // The returned Torch tensor owns combined_x and is not released with the state.
-        // Use the host-cached version to avoid D2H+H2D memcpy on the critical path.
-        megakernel_debug::free_megakernel_forward_transient_from_host(fwd_host_state_ptr);
     } else {
         megakernel_debug::free_megakernel_state_v7(
-            static_cast<megakernel_debug::MegaKernelState*>(state));
+            static_cast<megakernel_debug::MegaKernelState*>(state),
+            fwd_host_state_ptr);
         if (fwd_host_state_ptr != nullptr)
             megakernel_state_cache::free_host(fwd_host_state_ptr);
     }

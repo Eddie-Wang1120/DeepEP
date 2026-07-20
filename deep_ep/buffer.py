@@ -715,7 +715,15 @@ class Buffer:
             ctx.runtime = runtime
             ctx.handle = handle
             ctx.grad_topk_weights = grad_topk_weights
-            ctx.save_for_backward(x, topk_idx, topk_weights, W_gateup, W_down)
+            # Only retain tensors whose underlying storage the backward C++ code
+            # dereferences via raw pointers cached in the forward state.
+            # - x: NOT needed. The forward kernel saves permuted X into bwd_fc1_input;
+            #   backward re-runs dispatch with grad_output, not x.
+            # - topk_idx / topk_weights: kept alive by retain_layout_tensors in C++
+            #   (stored in ctx.handle / MegaKernelAutogradContext).
+            # - W_gateup / W_down: backward state reads fs.W_gateup / fs.W_down raw
+            #   pointers, so the PyTorch tensors must outlive forward->backward.
+            ctx.save_for_backward(W_gateup, W_down)
             ctx.total_sms = total_sms
             ctx.stage = stage
             return output

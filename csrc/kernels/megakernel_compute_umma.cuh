@@ -462,6 +462,36 @@ __device__ void dg_init_barriers_tmem(char* cluster_smem) {
     else __syncthreads();
 }
 
+// dg_reinit_barriers — re-init mbarriers WITHOUT re-allocating TMEM.
+// Use when TMEM is persistent across multiple dg_gemm_persistent calls
+// (e.g., gate/up then down within the same task). Avoids the TMEM alloc/free
+// overhead while resetting barrier phase state for the next GEMM pass.
+template <uint32_t kNumMulticast>
+__device__ void dg_reinit_barriers(char* cluster_smem) {
+    using namespace deep_gemm;
+    using L = DgSmemLayout<kNumMulticast>;
+    const auto warp_idx = cutlass::canonical_warp_idx_sync();
+    auto bar = L::barrier_start(cluster_smem);
+    auto full_b  = utils::PatternVisitor([=](const uint32_t& i) { return bar + i; });
+    auto empty_b = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages + i); });
+    auto tf_b    = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages * 2 + i); });
+    auto te_b    = utils::PatternVisitor([=](const uint32_t& i) { return bar + (L::kNumStages * 2 + L::kNumEpilogueStages + i); });
+
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    if (warp_idx == 1 and cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < L::kNumStages; ++ i) { full_b[i]->init(kNumMulticast); empty_b[i]->init(1); }
+        #pragma unroll
+        for (uint32_t i = 0; i < L::kNumEpilogueStages; ++ i) {
+            tf_b[i]->init(1);
+            te_b[i]->init(kNumMulticast * L::kNumUMMAStoreThreads);
+        }
+        cutlass::arch::fence_barrier_init();
+    }
+    if constexpr (kNumMulticast > 1) comm::cluster_sync_with_relaxed_arrive();
+    else __syncthreads();
+}
+
 // dg_dealloc_tmem — free TMEM ONCE per task (4a).
 template <uint32_t kNumMulticast>
 __device__ void dg_dealloc_tmem(char* cluster_smem) {

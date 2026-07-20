@@ -462,7 +462,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Enable the in-kernel combine RDMA-reuse prelude (forward only for now).
     int rdma_reuse_prelude_enable = 0);
 
-void free_megakernel_state_v7(MegaKernelState* device_state);
+void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state = nullptr);
 void free_megakernel_forward_transient(MegaKernelState* device_state);
 void free_megakernel_forward_transient_from_host(MegaKernelState* host_state);
 void get_megakernel_backward_dimensions(
@@ -481,6 +481,7 @@ float* get_output_accum_ptr(MegaKernelState* device_state);
 void* get_combined_x_ptr(MegaKernelState* device_state);
 void launch_megakernel_debug_forward(
     MegaKernelState* device_state,
+    const MegaKernelState* host_state,
     int total_sms,
     int smem_size,
     int stage,
