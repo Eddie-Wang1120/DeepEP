@@ -87,6 +87,16 @@ constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
 #ifndef MK_ASYNC_PUBLISH
 #define MK_ASYNC_PUBLISH 1
 #endif
+// MK_RECV_DIRECT_STAGING: when enabled, the NVL receiver allocates the expert
+// slot inline and writes token data directly into the per-expert-contiguous
+// `recv_tokens[slot]` staging buffer (and stashes the slot into `pending_slot`
+// for the publisher), instead of only writing the global `combine_input`
+// namespace. This lets the compute worker read its GEMM input contiguously
+// (Step 3) rather than gathering scattered rows from `combine_input`.
+// Default 0 = original behavior (combine_input gather).
+#ifndef MK_RECV_DIRECT_STAGING
+#define MK_RECV_DIRECT_STAGING 1
+#endif
 #ifndef MK_PRIORITY_ENABLE
 #define MK_PRIORITY_ENABLE 0
 #endif
@@ -411,6 +421,9 @@ struct MegaKernelState {
     int* pending_topk_idx;            // [max_total_recv_tokens * num_topk] receiver-stashed expert ids
     float* pending_topk_weights;      // [max_total_recv_tokens * num_topk] receiver-stashed routing weights
     internode::SourceMeta* pending_meta; // [max_total_recv_tokens] receiver-stashed SourceMeta
+    // [max_total_recv_tokens * num_topk] receiver-allocated expert abs-slot per topk hit
+    // (MK_RECV_DIRECT_STAGING): -1 for non-hit topk slots, else expert_slot_base+slot.
+    int* pending_slot;
     int* pub_ring;                    // [num_pub_warps_total * PUB_RING_DEPTH] recv_token_idx queue
     int* pub_ring_head;               // [num_pub_warps_total] consumer cursor (publisher)
     int* pub_ring_tail;               // [num_pub_warps_total] producer cursor (receiver)
@@ -1049,6 +1062,13 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
 
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
+#if MK_RECV_DIRECT_STAGING
+            // Slot was already allocated by the NVL receiver (inline staging).
+            // Read it back instead of doing our own atomicAdd, so expert_token_offsets
+            // is advanced exactly once (by the receiver).
+            hit_abs_slot = ld_nc_global(&state->pending_slot[recv_token_idx * num_topk + lane_id]);
+            hit_slot = hit_abs_slot - state->expert_slot_base[local_expert_id];
+#else
             unsigned same_expert_mask = __match_any_sync(hit_mask, local_expert_id) & hit_mask;
             int leader_lane = __ffs(same_expert_mask) - 1;
             int group_count = __popc(same_expert_mask);
@@ -1066,6 +1086,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             group_base_slot = __shfl_sync(same_expert_mask, group_base_slot, leader_lane);
             hit_slot = group_base_slot + rank_in_expert;
             hit_abs_slot = state->expert_slot_base[local_expert_id] + hit_slot;
+#endif
         }
 
 #if MK_PERF_TRACE_ARGS
@@ -2462,13 +2483,74 @@ __device__ void dispatch_worker_v2(
                 auto weight_data_ptr = reinterpret_cast<float*>(topk_data_ptr + num_topk);
                 auto* src_data = reinterpret_cast<const __nv_bfloat16*>(tma_buffer);
 
-                // Copy token data to DeepEP compact combine-input namespace.
+                // Token data placement.
+                //   MK_RECV_DIRECT_STAGING off: write the global combine_input[recv_token]
+                //     namespace; compute gathers from there.
+                //   on: skip the combine_input INPUT write entirely (compute now reads
+                //     recv_tokens); allocate the expert slot inline and stage the token
+                //     into per-expert-contiguous recv_tokens[slot], stashing the slot in
+                //     pending_slot for the publisher. This is where the gather copy is saved.
+                //   NOTE: combine_input is still used as the OUTPUT namespace (compute /
+                //     gather write results there for the combine sender); only the input
+                //     write is elided here.
                 const int hidden_int4 = state->hidden_dim * sizeof(__nv_bfloat16) / sizeof(int4);
                 const int4* src_i4 = reinterpret_cast<const int4*>(src_data);
+#if !MK_RECV_DIRECT_STAGING
                 int4* dst_i4 = reinterpret_cast<int4*>(state->combine_input) +
                     (int64_t)recv_token_idx * hidden_int4;
                 for (int v = lane_id; v < hidden_int4; v += 32)
                     dst_i4[v] = src_i4[v];
+#endif
+
+#if MK_RECV_DIRECT_STAGING
+                // --- Inline expert-slot allocation (mirrors publish_recv_token_from_pending) ---
+                // Each lane owns one topk slot; group same-expert hits so the leader
+                // lane does a single grouped atomicAdd on expert_token_offsets.
+                {
+                    const int rds_local_expert_end = local_expert_begin + state->num_local_experts;
+                    int rds_expert_id = -1;
+                    bool rds_is_hit = false;
+                    if (lane_id < num_topk) {
+                        rds_expert_id = ld_nc_global(topk_data_ptr + lane_id);
+                        rds_is_hit = (rds_expert_id >= local_expert_begin && rds_expert_id < rds_local_expert_end);
+                    }
+                    const unsigned rds_hit_mask = __ballot_sync(0xffffffff, rds_is_hit);
+                    int rds_abs_slot = -1;
+                    if (rds_is_hit) {
+                        int rds_local_expert = rds_expert_id - local_expert_begin;
+                        unsigned rds_same = __match_any_sync(rds_hit_mask, rds_local_expert) & rds_hit_mask;
+                        int rds_leader = __ffs(rds_same) - 1;
+                        int rds_gcount = __popc(rds_same);
+                        int rds_rank_in_e = __popc(rds_same & ((1u << lane_id) - 1));
+                        int rds_gbase = 0;
+                        if (lane_id == rds_leader) {
+                            rds_gbase = atomicAdd(&state->expert_token_offsets[rds_local_expert], rds_gcount);
+                            if (rds_gbase + rds_gcount > state->expert_count[rds_local_expert]) {
+                                printf("MK recv-stage expert slot overflow, rank=%d recv_token=%lld expert=%d slot=%d count=%d\n",
+                                       state->rank, (long long)recv_token_idx, rds_expert_id, rds_gbase, state->expert_count[rds_local_expert]);
+                                __threadfence_system(); trap();
+                            }
+                        }
+                        rds_gbase = __shfl_sync(rds_same, rds_gbase, rds_leader);
+                        int rds_slot = rds_gbase + rds_rank_in_e;
+                        rds_abs_slot = state->expert_slot_base[rds_local_expert] + rds_slot;
+                        // Stash slot for the publisher (which will skip its own atomicAdd).
+                        state->pending_slot[recv_token_idx * num_topk + lane_id] = rds_abs_slot;
+                    }
+                    // Stage token data into each hit's contiguous slot. All 32 lanes
+                    // cooperate per hit; broadcast the hit lane's abs_slot to everyone.
+                    int4* recv_tokens_i4 = reinterpret_cast<int4*>(state->recv_tokens);
+                    unsigned rds_m = rds_hit_mask;
+                    while (rds_m) {
+                        int rds_hl = __ffs(rds_m) - 1;
+                        rds_m &= rds_m - 1;
+                        int rds_slot_bcast = __shfl_sync(0xffffffff, rds_abs_slot, rds_hl);
+                        int4* rds_dst = recv_tokens_i4 + (int64_t)rds_slot_bcast * hidden_int4;
+                        for (int v = lane_id; v < hidden_int4; v += 32)
+                            rds_dst[v] = src_i4[v];
+                    }
+                }
+#endif
 
 
                 // Fill topk weights/src_meta, publish this token's local expert count, then
@@ -4133,8 +4215,22 @@ __device__ __forceinline__ void compute_worker_core(
 
         const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
         const int input_vec_stride = gemm_m * hidden_int4;
-        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
         int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
+#if MK_RECV_DIRECT_STAGING
+        // Direct-staging: dispatch already placed this task's tokens contiguously
+        // in recv_tokens[expert_slot_base + start_slot .. + batch_size). Read them
+        // sequentially (coalesced) instead of gathering scattered combine_input rows.
+        const int rds_slot_base = state->expert_slot_base[expert_id] + start_slot;
+        const int4* recv_tokens_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
+        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
+            input_buf_i4[idx] = (row < batch_size)
+                ? recv_tokens_i4[(int64_t)(rds_slot_base + row) * hidden_int4 + v]
+                : make_int4(0, 0, 0, 0);
+        }
+#else
+        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
@@ -4142,6 +4238,7 @@ __device__ __forceinline__ void compute_worker_core(
                 ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
                 : make_int4(0, 0, 0, 0);
         }
+#endif
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_input_ns = globaltimer_ns();
@@ -4270,32 +4367,28 @@ __device__ __forceinline__ void compute_worker_core(
         __syncthreads();
 #endif
 
+        // Merged output scatter + backward activation save: one pass over
+        // batch_size*hidden_int4 (shared row/v index math). Output goes to
+        // combine_input (single-hit) or compute_output_slot (multi-hit); the fc1
+        // input X (still in input_buf) is saved by recv_token for backward.
+        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
         const int slot_base = state->expert_slot_base[expert_id] + start_slot;
+        const bool save_bwd = (state->bwd_fc1_input != nullptr);
+        const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
+        int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
-            int slot = slot_base + row;
+            int rt = s_recv_token_idx[row];
             if (s_is_single[row])
-                token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = down_i4[idx];
+                token_out_i4[(int64_t)rt * hidden_int4 + v] = down_i4[idx];
             else
-                slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
-        }
-
-        // ==== Backward activation save ====
-        // Save fc1 input (permuted X) by recv_token for the backward pass. input_buf still
-        // holds X here (the scatter above only overwrote combine_input, not input_buf).
-        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
-        if (state->bwd_fc1_input != nullptr) {
-            const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
-            int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
-            for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
-                int row = idx / hidden_int4;
-                int v = idx - row * hidden_int4;
-                bwd_in_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = bwd_in_src_i4[idx];
-            }
+                slot_out_i4[(int64_t)(slot_base + row) * hidden_int4 + v] = down_i4[idx];
+            if (save_bwd)
+                bwd_in_i4[(int64_t)rt * hidden_int4 + v] = bwd_in_src_i4[idx];
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
@@ -8407,6 +8500,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* pending_topk_idx;
     float* pending_topk_weights;
     internode::SourceMeta* pending_meta;
+    int* pending_slot;
     int* pub_ring;
     int* pub_ring_head;
     int* pub_ring_tail;
@@ -8419,6 +8513,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&pending_topk_weights, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMemset(pending_topk_weights, 0, (size_t)max_total_recv_tokens * num_topk * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&pending_meta, (size_t)max_total_recv_tokens * sizeof(internode::SourceMeta)));
+    CUDA_CHECK(cudaMalloc(&pending_slot, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
+    CUDA_CHECK(cudaMemset(pending_slot, 0xff, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&pub_ring, (size_t)num_pub_warps_total * PUB_RING_DEPTH * sizeof(int)));
     CUDA_CHECK(cudaMemset(pub_ring, 0, (size_t)num_pub_warps_total * PUB_RING_DEPTH * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&pub_ring_head, (size_t)num_pub_warps_total * sizeof(int)));
@@ -8839,6 +8935,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.pending_topk_idx = pending_topk_idx;
     host_state.pending_topk_weights = pending_topk_weights;
     host_state.pending_meta = pending_meta;
+    host_state.pending_slot = pending_slot;
     host_state.pub_ring = pub_ring;
     host_state.pub_ring_head = pub_ring_head;
     host_state.pub_ring_tail = pub_ring_tail;
@@ -9656,6 +9753,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.pending_topk_idx));
     CUDA_CHECK(cudaFree(host_state.pending_topk_weights));
     CUDA_CHECK(cudaFree(host_state.pending_meta));
+    CUDA_CHECK(cudaFree(host_state.pending_slot));
     CUDA_CHECK(cudaFree(host_state.pub_ring));
     CUDA_CHECK(cudaFree(host_state.pub_ring_head));
     CUDA_CHECK(cudaFree(host_state.pub_ring_tail));
@@ -10451,6 +10549,12 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
         const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);   // = grad_down
         const int4* bwd_x_i4 = reinterpret_cast<const int4*>(bs->bwd_fc1_input);               // = X
+#if MK_RECV_DIRECT_STAGING
+        // Direct-staging: backward dispatch staged grad_down contiguously into
+        // recv_tokens[expert_slot_base + start_slot ..]. Read it sequentially.
+        // X still comes from bwd_fc1_input keyed by recv_token (saved in forward).
+        const int4* rds_recv_tokens_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
+#endif
         int4* grad_down_i4 = reinterpret_cast<int4*>(input_buf);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
             int row = idx / hidden_int4;
@@ -10458,7 +10562,11 @@ __device__ __forceinline__ void compute_backward_worker_core(
             if (row < batch_size) {
                 int rt = s_recv_token_idx[row];
                 const int64_t slot = slot_base64 + row;
+#if MK_RECV_DIRECT_STAGING
+                const int4 grad_vec = rds_recv_tokens_i4[slot * hidden_int4 + v];
+#else
                 const int4 grad_vec = combine_input_i4[(int64_t)rt * hidden_int4 + v];
+#endif
                 const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
                 grad_down_i4[idx] = grad_vec;
                 reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
@@ -10973,11 +11081,10 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
         const int ebase = h_bwd_expert_slot_base[expert];
         const int ecnt = h_bwd_expert_count[expert];
-        for (int batch = 0; batch < fs.max_batches_per_expert; ++batch) {
-            // Descriptors for batches past this expert's real slots are never consumed by
-            // the compute worker; keep them in-bounds by clamping to the expert base.
-            const int row = (batch * COMPUTE_BATCH_SIZE < ecnt)
-                ? (ebase + batch * COMPUTE_BATCH_SIZE) : ebase;
+        const int active_batches = (ecnt + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
+        EP_HOST_ASSERT(active_batches <= fs.max_batches_per_expert);
+        for (int batch = 0; batch < active_batches; ++batch) {
+            const int row = ebase + batch * COMPUTE_BATCH_SIZE;
             const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot + (size_t)row * twoI;
             host_ctx->wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
                 umma::dg_make_a_desc(dgu_batch, COMPUTE_BATCH_SIZE, twoI);
@@ -11295,6 +11402,7 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.combine_all_done, sizeof(int));
     f(hs.pending_topk_idx, MTR * TK * sizeof(int));
     z(hs.pending_topk_weights, MTR * TK * sizeof(float));
+    f(hs.pending_slot, MTR * TK * sizeof(int));
     z(hs.pub_ring, (size_t)NPUB * PUB_RING_DEPTH * sizeof(int));
     z(hs.pub_ring_head, (size_t)NPUB * sizeof(int));
     z(hs.pub_ring_tail, (size_t)NPUB * sizeof(int));
