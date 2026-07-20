@@ -2493,6 +2493,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         num_rdma_bytes,
         num_nvl_bytes,
         mk_expert_counts.data(),
+        moe_recv_expert_counter_mapped,
         nullptr,
         nullptr,
         nullptr,
@@ -2657,6 +2658,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
 Buffer::megakernel_debug_backward(
     const std::shared_ptr<MegaKernelAutogradContext>& context,
     const torch::Tensor& grad_output,
+    const std::optional<torch::Tensor>& grad_topk_weights,
     int total_sms,
     int stage) {
 #ifndef DISABLE_NVSHMEM
@@ -2679,7 +2681,17 @@ Buffer::megakernel_debug_backward(
         {num_local_experts, 2 * intermediate, hidden}, bf16_options);
     auto grad_w_down = torch::empty(
         {num_local_experts, hidden, intermediate}, bf16_options);
-    auto grad_topk_weights = torch::zeros({num_tokens, num_topk}, fp32_options);
+    torch::Tensor grad_topk_weights_out;
+    if (grad_topk_weights.has_value()) {
+        grad_topk_weights_out = *grad_topk_weights;
+        EP_HOST_ASSERT(grad_topk_weights_out.is_cuda() && grad_topk_weights_out.is_contiguous());
+        EP_HOST_ASSERT(grad_topk_weights_out.scalar_type() == torch::kFloat32);
+        EP_HOST_ASSERT(grad_topk_weights_out.dim() == 2);
+        EP_HOST_ASSERT(num_tokens == grad_topk_weights_out.size(0));
+        EP_HOST_ASSERT(num_topk == grad_topk_weights_out.size(1));
+    } else {
+        grad_topk_weights_out = torch::zeros({num_tokens, num_topk}, fp32_options);
+    }
     const std::vector<int>& expert_token_counts = context->expert_counts();
     EP_HOST_ASSERT(static_cast<int>(expert_token_counts.size()) == num_local_experts);
     std::vector<int> h_cu_seqlens_k(num_local_experts + 1, 0);
@@ -2709,7 +2721,7 @@ Buffer::megakernel_debug_backward(
     megakernel_debug::MegaKernelBackwardHostContext* backward_host_context = nullptr;
     auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
-        grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights.data_ptr(),
+        grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights_out.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
         scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
         &backward_host_context, stream);
@@ -2738,7 +2750,7 @@ Buffer::megakernel_debug_backward(
     CUDA_CHECK(cudaStreamSynchronize(stream));
     megakernel_debug::free_megakernel_backward_state(backward_state, backward_host_context);
     megakernel_debug::free_megakernel_backward_host_context(backward_host_context);
-    return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights,
+    return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights_out,
             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
 #else
     EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
@@ -2823,7 +2835,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
              py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
         .def("megakernel_debug_backward", &deep_ep::Buffer::megakernel_debug_backward,
-             py::arg("context"), py::arg("grad_output"),
+             py::arg("context"), py::arg("grad_output"), py::arg("grad_topk_weights") = py::none(),
              py::arg("total_sms") = 148, py::arg("stage") = 1)
 #if MK_PERF_TRACE_ENABLED
         .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)

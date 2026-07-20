@@ -155,7 +155,11 @@ struct ComputeTask {
 
 struct MegaKernelBackwardState;
 
-constexpr int kMegakernelArenaChunkCap = 64;
+// Headroom for the smaller arena chunk granularity below: with an 8 MiB default
+// chunk, large activation buffers each take their own exact-sized chunk and the
+// remaining small buffers pack into a few chunks, so the chunk count grows but
+// stays well under this cap for realistic cases.
+constexpr int kMegakernelArenaChunkCap = 128;
 
 struct MegaKernelState {
     int* timeout_log_counters;        // [kTimeoutLogCount] per-site bounded logging budget
@@ -9402,7 +9406,27 @@ struct FusedFillDesc {
 
 // Simple parallel fill: one block per desc, all threads stride over words.
 // Host splits large buffers into <=CHUNK_SIZE descs so blocks are balanced.
-__global__ void fused_fill_kernel(const FusedFillDesc* descs, int ndescs) {
+// When expert_count_mapped is provided, block 0 also builds the compact expert
+// layout in the same launch so we avoid a separate H2D or a separate kernel.
+__global__ void fused_fill_kernel(
+    const FusedFillDesc* descs,
+    int ndescs,
+    const int* expert_count_mapped,
+    int* expert_slot_base,
+    int* expert_count,
+    int num_local_experts) {
+    if (expert_count_mapped != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+        int slot_base = 0;
+        for (int le = 0; le < num_local_experts; ++le) {
+            int cnt = expert_count_mapped[le];
+            if (cnt < 0)
+                cnt = 0;
+            expert_count[le] = cnt;
+            expert_slot_base[le] = slot_base;
+            slot_base += cnt;
+        }
+    }
+
     const int desc_idx = blockIdx.x;
     if (desc_idx >= ndescs)
         return;
@@ -9447,7 +9471,15 @@ constexpr int kTmaCacheCap = 8;
 static thread_local TmaCacheEntry s_tma_cache[kTmaCacheCap];
 static thread_local int s_tma_cache_next = 0;
 
-constexpr size_t kMegakernelArenaChunkBytes = 256ull * 1024ull * 1024ull;
+// Default arena chunk granularity. A new chunk is sized max(nbytes, this), so any
+// single allocation >= this value gets its own exact-sized chunk (zero tail waste),
+// while allocations smaller than this pack together. Kept small (8 MiB) so the large
+// bf16 activation/scratch buffers (bwd_preact, bwd_fc1_input, recv_tokens,
+// compute_output_slot, combine_input, gemm_workspace, ...) are each right-sized
+// instead of rounding up to a 256 MiB chunk; only the small int side-tables pay the
+// <=8 MiB packing tail. This removes the ~256 MiB-granularity internal fragmentation
+// that inflated the forward activation retained / peak reserved.
+constexpr size_t kMegakernelArenaChunkBytes = 8ull * 1024ull * 1024ull;
 
 struct MegakernelArenaAllocator {
     std::vector<void*> chunks;
@@ -9568,6 +9600,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     int64_t num_rdma_bytes,
     int64_t num_nvl_bytes,
     const int* host_expert_count,
+    const int* device_expert_count_mapped,
     // Optional caller-owned buffers. Non-null pointers are borrowed by the state.
     __nv_bfloat16* external_bwd_fc1_input,
     __nv_bfloat16* external_bwd_preact,
@@ -9678,24 +9711,35 @@ MegaKernelState* allocate_megakernel_state_v7(
     // region is sized by its real received-token count and regions are packed contiguously
     // via an exclusive prefix sum (total = Σ count). When null (backward / legacy path),
     // falls back to the fixed le*max_tokens_per_expert layout (total = num_local_experts*max_tpe).
-    // NOTE: cudaMalloc here is the mk_caching_alloc macro; cudaMemcpy below is the real
-    // driver call (not macro'd), matching the TMA-atom upload pattern later in this function.
+    // The forward path also passes device_expert_count_mapped so fused_fill_kernel can
+    // materialize expert_count / expert_slot_base in the same launch that clears buffers.
     int* expert_slot_base;
     int* expert_count;
     CUDA_CHECK(cudaMalloc(&expert_slot_base, num_local_experts * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&expert_count, num_local_experts * sizeof(int)));
-    std::vector<int> h_expert_slot_base(num_local_experts);
-    std::vector<int> h_expert_count(num_local_experts);
     size_t total_expert_slots = 0;
-    for (int le = 0; le < num_local_experts; ++le) {
-        const int cnt = (host_expert_count != nullptr) ? host_expert_count[le] : max_tokens_per_expert;
-        EP_HOST_ASSERT(cnt >= 0 && cnt <= max_tokens_per_expert);
-        h_expert_slot_base[le] = static_cast<int>(total_expert_slots);
-        h_expert_count[le] = cnt;
-        total_expert_slots += static_cast<size_t>(cnt);
+    if (host_expert_count != nullptr) {
+        for (int le = 0; le < num_local_experts; ++le) {
+            const int cnt = host_expert_count[le];
+            EP_HOST_ASSERT(cnt >= 0 && cnt <= max_tokens_per_expert);
+            total_expert_slots += static_cast<size_t>(cnt);
+        }
+    } else {
+        for (int le = 0; le < num_local_experts; ++le) {
+            total_expert_slots += static_cast<size_t>(max_tokens_per_expert);
+        }
     }
     if (total_expert_slots == 0) total_expert_slots = 1;  // avoid zero-size allocations
-    {
+    if (device_expert_count_mapped == nullptr) {
+        std::vector<int> h_expert_slot_base(num_local_experts);
+        std::vector<int> h_expert_count(num_local_experts);
+        size_t slot_base = 0;
+        for (int le = 0; le < num_local_experts; ++le) {
+            const int cnt = (host_expert_count != nullptr) ? host_expert_count[le] : max_tokens_per_expert;
+            h_expert_slot_base[le] = static_cast<int>(slot_base);
+            h_expert_count[le] = cnt;
+            slot_base += static_cast<size_t>(cnt);
+        }
         cudaStream_t s = c10::cuda::getCurrentCUDAStream().stream();
         CUDA_CHECK(cudaMemcpyAsync(expert_slot_base, h_expert_slot_base.data(),
                               num_local_experts * sizeof(int), cudaMemcpyHostToDevice, s));
@@ -10954,8 +10998,15 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMemcpyAsync(fill_desc_buf, host_descs.data(),
                               static_cast<size_t>(mk_num_descs) * sizeof(FusedFillDesc),
                               cudaMemcpyHostToDevice, init_stream));
-        fused_fill_kernel<<<mk_num_descs, 512, 0, init_stream>>>(
-            static_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_descs);
+    }
+    if (mk_num_descs > 0 || device_expert_count_mapped != nullptr) {
+        const int fill_blocks = std::max(1, mk_num_descs);
+        fused_fill_kernel<<<fill_blocks, 512, 0, init_stream>>>(
+            static_cast<const FusedFillDesc*>(fill_desc_buf), mk_num_descs,
+            device_expert_count_mapped,
+            expert_slot_base,
+            expert_count,
+            num_local_experts);
         CUDA_CHECK(cudaGetLastError());
     }
     // Sync to ensure host_state (stack) and host_descs (vector) remain valid
@@ -12247,6 +12298,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         fs.allocator_max_tokens_per_expert, fs.allocator_max_total_recv_tokens,
         fs.allocator_num_rdma_bytes, fs.allocator_num_nvl_bytes,
         h_bwd_expert_count.data(),
+        nullptr,
         const_cast<__nv_bfloat16*>(fs.bwd_fc1_input),
         const_cast<__nv_bfloat16*>(fs.bwd_preact),
         fs.fwd_slot_map,
@@ -12757,7 +12809,8 @@ void launch_megakernel_debug_backward(
                                    (size_t)ndescs * sizeof(FusedFillDesc),
                                    cudaMemcpyHostToDevice, stream));
         fused_fill_kernel<<<ndescs, 512, 0, stream>>>(
-            static_cast<const FusedFillDesc*>(bwd_fill_buf), ndescs);
+            static_cast<const FusedFillDesc*>(bwd_fill_buf), ndescs,
+            nullptr, nullptr, nullptr, 0);
         CUDA_CHECK(cudaGetLastError());
         // Free after kernel completes (same stream ordering).
         CUDA_CHECK(cudaFreeAsync(bwd_fill_buf, stream));

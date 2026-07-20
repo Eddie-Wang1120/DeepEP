@@ -445,6 +445,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     // prefix sum (total = Σ count). When nullptr, falls back to the fixed
     // num_local_experts * max_tokens_per_expert layout.
     const int* host_expert_count = nullptr,
+    // Optional mapped device pointer to the same per-expert counts. When provided,
+    // megakernel can build the compact expert layout on device and skip the H2D copy
+    // for expert_count / expert_slot_base.
+    const int* device_expert_count_mapped = nullptr,
     // Optional caller-owned buffers. Non-null pointers are borrowed by the state.
     __nv_bfloat16* external_bwd_fc1_input = nullptr,
     __nv_bfloat16* external_bwd_preact = nullptr,

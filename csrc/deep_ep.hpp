@@ -389,6 +389,7 @@ public:
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
         const std::shared_ptr<MegaKernelAutogradContext>& context,
         const torch::Tensor& grad_output,
+        const std::optional<torch::Tensor>& grad_topk_weights,
         int total_sms,
         int stage);
 

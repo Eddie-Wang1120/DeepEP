@@ -707,13 +707,14 @@ class Buffer:
         @staticmethod
         def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
                     num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
-                    dispatch_config, combine_config):
+                    dispatch_config, combine_config, grad_topk_weights):
             output, handle = runtime.megakernel_debug_forward_train(
                 x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
                 num_dispatch_sms, num_combine_sms, total_sms, stage,
                 dispatch_config, combine_config)
             ctx.runtime = runtime
             ctx.handle = handle
+            ctx.grad_topk_weights = grad_topk_weights
             ctx.save_for_backward(x, topk_idx, topk_weights, W_gateup, W_down)
             ctx.total_sms = total_sms
             ctx.stage = stage
@@ -725,7 +726,8 @@ class Buffer:
             (grad_x, grad_w_gateup, grad_w_down, grad_topk_weights,
              scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k) = (
                 ctx.runtime.megakernel_debug_backward(
-                    ctx.handle, grad_output.contiguous(), ctx.total_sms, ctx.stage))
+                    ctx.handle, grad_output.contiguous(), ctx.grad_topk_weights,
+                    ctx.total_sms, ctx.stage))
             try:
                 from quack.gemm_interface import gemm as _quack_gemm
             except Exception as exc:
@@ -743,7 +745,7 @@ class Buffer:
                     cu_seqlens_k=cu_seqlens_k,
                     tuned=False)
             return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
-                    None, None, None, None, None, None, None)
+                    None, None, None, None, None, None, None, None)
 
     def megakernel_debug_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
                                   topk_weights: torch.Tensor, W_gateup: torch.Tensor,
@@ -751,16 +753,20 @@ class Buffer:
                                   num_dispatch_sms: int = 24, num_combine_sms: int = 24,
                                   total_sms: int = 148, stage: int = 1,
                                   dispatch_config: Optional[Config] = None,
-                                  combine_config: Optional[Config] = None) -> torch.Tensor:
+                                  combine_config: Optional[Config] = None,
+                                  grad_topk_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run the BF16 debug megakernel with an input-gradient-only autograd backward."""
         if x.dtype != torch.bfloat16:
             raise ValueError("megakernel debug autograd currently supports BF16 only")
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
+        if grad_topk_weights is None:
+            grad_topk_weights = torch.zeros(
+                (x.size(0), topk_weights.size(1)), dtype=torch.float32, device=topk_weights.device)
         return self._MegaKernelDebugFunction.apply(
             self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
-            dispatch_config, combine_config)
+            dispatch_config, combine_config, grad_topk_weights)
 
     def megakernel_debug_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                                  W_gateup: torch.Tensor, W_down: torch.Tensor,
