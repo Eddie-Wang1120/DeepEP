@@ -75,6 +75,12 @@ public:
     int num_local_experts() const;
     const std::vector<int>& expert_counts() const;
 
+    // Host-side snapshot of the forward MegaKernelState, captured at forward-end.
+    // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
+    // the device state, eliminating the most expensive host stall in the backward path.
+    const megakernel_debug::MegaKernelState& cached_host_state() const;
+    void set_cached_host_state(const megakernel_debug::MegaKernelState& hs);
+
     // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
     // training state. The MegaKernelState stores only raw data_ptr()s into these tensors, and
     // the backward re-runs dispatch/combine off the same state. Without retaining them here they
@@ -85,6 +91,7 @@ public:
 
 private:
     megakernel_debug::MegaKernelState* state_;
+    megakernel_debug::MegaKernelState* cached_host_state_ = nullptr;
     int num_tokens_;
     int hidden_dim_;
     int intermediate_dim_;

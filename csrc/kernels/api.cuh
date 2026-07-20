@@ -464,6 +464,7 @@ MegaKernelState* allocate_megakernel_state_v7(
 
 void free_megakernel_state_v7(MegaKernelState* device_state);
 void free_megakernel_forward_transient(MegaKernelState* device_state);
+void free_megakernel_forward_transient_from_host(MegaKernelState* host_state);
 void get_megakernel_backward_dimensions(
     MegaKernelState* device_state,
     int* num_tokens,
@@ -499,7 +500,8 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     const int* host_expert_count,
     int total_sms,
     MegaKernelBackwardHostContext** host_context,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const MegaKernelState* cached_fwd_host_state = nullptr);
 void free_megakernel_backward_state(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context = nullptr);
@@ -524,5 +526,13 @@ void launch_megakernel_debug_backward(
     cudaStream_t stream);
 
 }  // namespace megakernel_debug
+
+// Opaque host-side helpers for caching MegaKernelState on the host (avoids
+// exposing the full struct definition outside the .cu compilation unit).
+namespace megakernel_state_cache {
+megakernel_debug::MegaKernelState* alloc_host();
+void copy_host(megakernel_debug::MegaKernelState* dst, const megakernel_debug::MegaKernelState* src);
+void free_host(megakernel_debug::MegaKernelState* ptr);
+}  // namespace megakernel_state_cache
 
 }  // namespace deep_ep

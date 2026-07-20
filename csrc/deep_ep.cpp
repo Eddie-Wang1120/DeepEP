@@ -2007,6 +2007,8 @@ MegaKernelAutogradContext::~MegaKernelAutogradContext() {
 #ifndef DISABLE_NVSHMEM
     if (state_ != nullptr) megakernel_debug::free_megakernel_state_v7(state_);
 #endif
+    if (cached_host_state_ != nullptr)
+        megakernel_state_cache::free_host(cached_host_state_);
 }
 
 megakernel_debug::MegaKernelState* MegaKernelAutogradContext::state() const {
@@ -2039,6 +2041,18 @@ const std::vector<int>& MegaKernelAutogradContext::expert_counts() const {
 
 void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
     retained_layout_tensors_ = std::move(tensors);
+}
+
+const megakernel_debug::MegaKernelState& MegaKernelAutogradContext::cached_host_state() const {
+    EP_HOST_ASSERT(cached_host_state_ != nullptr);
+    return *cached_host_state_;
+}
+
+void MegaKernelAutogradContext::set_cached_host_state(const megakernel_debug::MegaKernelState& hs) {
+    if (cached_host_state_ != nullptr)
+        megakernel_state_cache::free_host(cached_host_state_);
+    cached_host_state_ = megakernel_state_cache::alloc_host();
+    megakernel_state_cache::copy_host(cached_host_state_, &hs);
 }
 
 std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_impl(
@@ -2442,6 +2456,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     auto result = torch::empty(
         {num_tokens, hidden_dim}, x.options().dtype(torch::kBFloat16));
 
+    // host_state_out receives the complete host-side MegaKernelState snapshot from
+    // allocate_megakernel_state_v7. The backward uses this directly (via context) instead
+    // of a synchronous D2H cudaMemcpy from the device state.
+    megakernel_debug::MegaKernelState* fwd_host_state_ptr =
+        megakernel_state_cache::alloc_host();
     auto allocate_state = [&](auto allocator) {
         return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -2499,7 +2518,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         nullptr,
         reinterpret_cast<int4*>(result.data_ptr()),
         nullptr,
-        nullptr,
+        fwd_host_state_ptr,
         rdma_reuse_dispatch_quiet_done,
         rdma_reuse_combine_clear_done,
         1 /* rdma_reuse_prelude_enable (forward) */);
@@ -2547,8 +2566,8 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
-        AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-        internode::barrier();
+        // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        // internode::barrier();
     }
 
     megakernel_debug::launch_megakernel_debug_forward(
@@ -2575,6 +2594,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             static_cast<megakernel_debug::MegaKernelState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
             mk_expert_counts);
+        // Cache the host-side state snapshot so backward can skip the synchronous D2H.
+        // Transfer ownership of the pre-allocated fwd_host_state_ptr to context.
+        context->set_cached_host_state(*fwd_host_state_ptr);
+        megakernel_state_cache::free_host(fwd_host_state_ptr);
+        fwd_host_state_ptr = nullptr;
         // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
         // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
         // they outlive this forward call (otherwise the backward reads dangling/zeroed memory —
@@ -2594,11 +2618,13 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         // compute_output_slot, combine_input, gemm_workspace, output_accum, combine/dispatch
         // heads, ...) now so they don't stay resident across the forward->backward gap.
         // The returned Torch tensor owns combined_x and is not released with the state.
-        megakernel_debug::free_megakernel_forward_transient(
-            static_cast<megakernel_debug::MegaKernelState*>(state));
+        // Use the host-cached version to avoid D2H+H2D memcpy on the critical path.
+        megakernel_debug::free_megakernel_forward_transient_from_host(fwd_host_state_ptr);
     } else {
         megakernel_debug::free_megakernel_state_v7(
             static_cast<megakernel_debug::MegaKernelState*>(state));
+        if (fwd_host_state_ptr != nullptr)
+            megakernel_state_cache::free_host(fwd_host_state_ptr);
     }
 
     return {result, context};
@@ -2724,7 +2750,8 @@ Buffer::megakernel_debug_backward(
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights_out.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
         scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
-        &backward_host_context, stream);
+        &backward_host_context, stream,
+        &context->cached_host_state());
     megakernel_debug::prepare_megakernel_backward_communication_replay(
         backward_host_context, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
@@ -2737,17 +2764,19 @@ Buffer::megakernel_debug_backward(
         int64_t mailbox_bytes = static_cast<int64_t>(num_rdma_ranks) * sizeof(int);
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_dispatch_quiet_done, 0, mailbox_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(rdma_reuse_combine_clear_done, 0, mailbox_bytes, stream));
-        AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-        internode::barrier();
+        // AT_CUDA_CHECK(cudaStreamSynchronize(stream));
+        // internode::barrier();
     }
 
     megakernel_debug::launch_megakernel_debug_backward(
         backward_state, backward_host_context, total_sms, smem_size, stage,
         megakernel_debug::ComputeDType::kBF16, stream);
 
-    // The backward wrote the compact wgrad operands directly into torch-owned tensors.
-    // Synchronize before destroying the borrowed-pointer state and returning them to Python/QuACK.
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // The backward kernel writes wgrad scratch operands directly into the caller-owned
+    // torch tensors (scratch_x/act/dz/dgu). No host-device synchronization is needed here
+    // because the caller (QuACK wgrad) launches on the same CUDA stream, so stream ordering
+    // guarantees the backward kernel completes before the wgrad GEMMs read the scratch data.
+    // Free the backward state using the host-cached copy (no D2H required).
     megakernel_debug::free_megakernel_backward_state(backward_state, backward_host_context);
     megakernel_debug::free_megakernel_backward_host_context(backward_host_context);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights_out,

@@ -11,7 +11,7 @@ constexpr int kComputeBatchSize = 1024;  // Tokens per expert batch before trigg
 constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
 constexpr int kComputeSchedulerSms = 1;
 constexpr int kGatherSms = 3;
-constexpr int kCombineStartHeadPercent = 50;  // Combine SM waits until compute_task_head / tail >= this %
+constexpr int kCombineStartHeadPercent = 60;  // Combine SM waits until compute_task_head / tail >= this %
 constexpr int kPrioritySchedTidBegin = 576;
 constexpr int kGatherSchedTidBegin = 608;
 constexpr int kNormalSchedThreads = kPrioritySchedTidBegin;
@@ -21,10 +21,10 @@ constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
 constexpr int kTimeoutLogBudget = 8;
-constexpr int kPriorityScanWindowTokens = 128;
-constexpr int kPriorityMaxEnqueuePerLoop = 2;
-constexpr int kPriorityAlreadySkipEpochs = 64;
-constexpr int kPriorityNotReadyRetryEpochs = 8;
+constexpr int kPriorityScanWindowTokens = 512;
+constexpr int kPriorityMaxEnqueuePerLoop = 8;
+constexpr int kPriorityAlreadySkipEpochs = 16;
+constexpr int kPriorityNotReadyRetryEpochs = 2;
 constexpr int kDispatchRoleCount = 5;
 constexpr int kPubRingDepth = 128;
 constexpr int kPubConsumeBatch = 16;
