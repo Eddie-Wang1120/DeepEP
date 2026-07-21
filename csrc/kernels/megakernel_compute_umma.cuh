@@ -161,14 +161,18 @@ static constexpr uint32_t kDgStoreBlockN = kDgSwizzleCD / sizeof(cutlass::bfloat
 // kNumEpilogueThreads: epilogue store warps = 4 warps * 32 = 128 (= STORE_BLOCK_M).
 // kNumTmemCols: get_num_aligned_tmem_cols<kNumEpilogueStages * UMMA_N>
 //   = get_num_aligned_tmem_cols<2 * 128> = get_num_aligned_tmem_cols<256> = 256.
+// Tuned config (S6/EPI2/TS1). Reachable now that per-token metadata was moved out of
+// smem into GMEM: GEMM scratch = 16384(CD,TS1) + 6*32768 + barriers ≈ 213KB < 221952
+// launch budget, so no launch-smem bump needed. Deepening the pipeline is the biggest
+// MFU lever (fwd +~23%, bwd grad_x +~34% vs the old kNumStages=4).
 #ifndef MK_DG_NUM_STAGES
-#define MK_DG_NUM_STAGES 4
+#define MK_DG_NUM_STAGES 6
 #endif
 #ifndef MK_DG_EPI_STAGES
 #define MK_DG_EPI_STAGES 2
 #endif
 #ifndef MK_DG_TMA_STORE_STAGES
-#define MK_DG_TMA_STORE_STAGES 2
+#define MK_DG_TMA_STORE_STAGES 1
 #endif
 static constexpr int kDgWsNumStages         = MK_DG_NUM_STAGES;
 static constexpr int kDgWsNumEpilogueStages = MK_DG_EPI_STAGES;

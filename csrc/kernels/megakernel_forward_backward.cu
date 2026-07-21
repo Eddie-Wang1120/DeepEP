@@ -232,6 +232,15 @@ struct MegaKernelState {
     int* recv_token_source_info;      // [max_total_recv_tokens, 2] — (recv_token_idx, topk_slot)
     float* recv_token_route_weights;  // [max_total_recv_tokens] — route weight for this compute slot
     internode::SourceMeta* recv_src_meta; // [max_total_recv_tokens] — DeepEP SourceMeta for combine routing
+    // Per-group compute task metadata, moved OUT of shared memory into GMEM so the
+    // GEMM scratch can use the full smem budget (deeper pipeline). Contiguous per row,
+    // indexed [group_id * COMPUTE_BATCH_SIZE + row]; read directly by the gate/up
+    // epilogue (route_w) and the output/bwd/signal phases. Mirrors the microkernel's
+    // contiguous GMEM metadata arrays (validated: ~0% slowdown vs smem).
+    float* g_meta_route_w;            // [num_compute_groups * COMPUTE_BATCH_SIZE]
+    int* g_meta_recv_idx;             // [num_compute_groups * COMPUTE_BATCH_SIZE] recv_token per row
+    int* g_meta_topk_slot;            // [num_compute_groups * COMPUTE_BATCH_SIZE] compact fwd slot per row
+    unsigned char* g_meta_is_single;  // [num_compute_groups * COMPUTE_BATCH_SIZE]
 
     // --- Compute signaling / per-slot output path (MEGAKERNEL_COMPUTE_DESIGN section III) ---
     int* token_compute_expected;        // [max_total_recv_tokens] how many local experts must compute this token
@@ -3585,29 +3594,22 @@ __device__ __forceinline__ void compute_worker_core(
             (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
         kComputeUmmaBarrierBytes;
     constexpr size_t kComputeScratchBytes = kComputeUmmaScratchBytes;
-    constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
+    // GEMM scratch alone must fit the launch dynamic-smem budget (metadata no longer
+    // shares it — see below). This is what lets kNumStages grow.
+    static_assert(kComputeScratchBytes <=
+                  (size_t)kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
+                  "compute GEMM scratch must fit the launch dynamic-smem budget");
 
-    constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
-    constexpr size_t kTopkSlotBytes = COMPUTE_BATCH_SIZE * sizeof(int);
-    constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
-    constexpr size_t kRouteWAlignPad = alignof(float) - 1;
-    constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
-    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
-    static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
-                  kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
-                  "compute dynamic smem metadata must fit after compute scratch");
-
-    uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
-    int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
-    compute_smem += kRecvTokenIdxBytes;
-    int* s_topk_slot = reinterpret_cast<int*>(compute_smem);
-    compute_smem += kTopkSlotBytes;
-    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
-    constexpr size_t kRouteWOffset =
-        (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
-    // Per-row route weight, gathered once and consumed inside the fused
-    // gate+up SwiGLU epilogue (act = silu(gate) * up * route_w).
-    float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
+    // Compute-task metadata now lives in GMEM (moved out of shared memory so the GEMM
+    // scratch can use the full dynamic-smem budget → deeper pipeline). The s_* names are
+    // retained; each points at this SM's contiguous per-row GMEM slice
+    // [sm_id*COMPUTE_BATCH_SIZE + row]. Per-row scalar reads are cached and hidden by
+    // the MMA mainloop (microkernel-validated ~0% slowdown vs smem).
+    const int64_t kMetaBase = (int64_t)sm_id * COMPUTE_BATCH_SIZE;
+    int* s_recv_token_idx = state->g_meta_recv_idx + kMetaBase;
+    int* s_topk_slot = state->g_meta_topk_slot + kMetaBase;
+    unsigned char* s_is_single = state->g_meta_is_single + kMetaBase;
+    float* s_route_w = state->g_meta_route_w + kMetaBase;
 
     // TMEM persistent across tasks: allocate on first UMMA use, keep alive
     // until the compute worker exits the persistent loop. This eliminates
@@ -3784,7 +3786,11 @@ __device__ __forceinline__ void compute_worker_core(
             // Phase 3 (Step 3.3a): record (recv_token, topk_slot) -> compact forward slot,
             // and repurpose s_topk_slot to carry that compact slot so the preact epilogue
             // (called with num_topk=0) writes bwd_preact by slot: (recv*0 + slot)*stride = slot*stride.
-            if (recv_token >= 0 && topk_slot >= 0)
+            // fwd_slot_map[recv,topk] -> compact forward slot is the same value on every
+            // SM of the group (base_offset depends only on the task, not the SM). Only one
+            // SM needs to write it — guarding to group_sm_idx==0 removes 47/48 redundant,
+            // same-address global writes (contention). All SMs still gather their own s_*.
+            if (group_sm_idx == 0 && recv_token >= 0 && topk_slot >= 0)
                 state->fwd_slot_map[recv_token * num_topk + topk_slot] = base_offset;
             s_topk_slot[i] = base_offset;
 // #ifdef MK_TOKEN_TRACE
@@ -4011,10 +4017,15 @@ __device__ __forceinline__ void compute_worker_core(
 #endif
             for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
                 const int recv_token = s_recv_token_idx[row];
-                int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
-                if (s_is_single[row] && done >= 1) {
-                    __threadfence();
+                if (s_is_single[row]) {
+                    // Single-hit token: sole contributor. The down output was already made
+                    // device-visible by the __threadfence + compute_group_sync above, so
+                    // publish ready directly — no per-row fence, and no token_done_count
+                    // bump (that counter is only consumed for multi-hit tokens by the gather
+                    // worker). Removes the global atomicAdd on the common single-hit path.
                     atomicExch(&state->combine_token_ready[recv_token], 1);
+                } else {
+                    atomicAdd(&state->token_done_count[recv_token], 1);
                 }
             }
             compute_group_sync(state, group_id, group_size);
@@ -7882,6 +7893,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* recv_token_source_info;
     float* recv_token_route_weights;
     internode::SourceMeta* recv_src_meta;
+    float* g_meta_route_w;
+    int* g_meta_recv_idx;
+    int* g_meta_topk_slot;
+    unsigned char* g_meta_is_single;
     int* compute_group_barrier;
     int* compute_group_phase;
     ComputeTask* compute_tasks;
@@ -8025,6 +8040,19 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT(base_compute_groups > 0);
     EP_HOST_ASSERT(num_compute_groups > 0);
     EP_HOST_ASSERT(num_compute_sms == base_compute_groups * COMPUTE_GROUP_SIZE);
+    // Per-block (per-SM) compute-task metadata in GMEM (moved out of smem to free GEMM
+    // scratch). Indexed [sm_id * COMPUTE_BATCH_SIZE + row]; each SM gathers/reads its own
+    // slice exactly like the old per-SM smem (block-local, __syncthreads suffices — no
+    // cross-SM sync). Sized by the full launch grid so any sm_id is in bounds.
+    {
+        size_t launch_total_sms = (size_t)num_dispatch_sms + num_combine_sms + num_compute_sms
+                                  + COMPUTE_SCHEDULER_SMS + GATHER_SMS;
+        size_t meta_rows = launch_total_sms * megakernel_config::kComputeBatchSize;
+        CUDA_CHECK(cudaMalloc(&g_meta_route_w, meta_rows * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_meta_recv_idx, meta_rows * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&g_meta_topk_slot, meta_rows * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&g_meta_is_single, meta_rows * sizeof(unsigned char)));
+    }
     CUDA_CHECK(cudaMalloc(&compute_group_barrier, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_barrier, 0, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&compute_group_phase, num_compute_groups * sizeof(int)));
@@ -8500,6 +8528,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.recv_token_source_info = recv_token_source_info;
     host_state.recv_token_route_weights = recv_token_route_weights;
     host_state.recv_src_meta = recv_src_meta;
+    host_state.g_meta_route_w = g_meta_route_w;
+    host_state.g_meta_recv_idx = g_meta_recv_idx;
+    host_state.g_meta_topk_slot = g_meta_topk_slot;
+    host_state.g_meta_is_single = g_meta_is_single;
 
     // Compute state
     host_state.compute_group_barrier = compute_group_barrier;
@@ -9314,6 +9346,10 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.expert_count));
     CUDA_CHECK(cudaFree(host_state.recv_token_source_info));
     CUDA_CHECK(cudaFree(host_state.recv_token_route_weights));
+    CUDA_CHECK(cudaFree(host_state.g_meta_route_w));
+    CUDA_CHECK(cudaFree(host_state.g_meta_recv_idx));
+    CUDA_CHECK(cudaFree(host_state.g_meta_topk_slot));
+    CUDA_CHECK(cudaFree(host_state.g_meta_is_single));
     CUDA_CHECK(cudaFree(host_state.recv_src_meta));
     CUDA_CHECK(cudaFree(host_state.token_compute_expected));
     CUDA_CHECK(cudaFree(host_state.compute_output_slot));
@@ -9970,27 +10006,17 @@ __device__ __forceinline__ void compute_backward_worker_core(
             (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
         kComputeUmmaBarrierBytes;
     constexpr size_t kComputeScratchBytes = kComputeUmmaScratchBytes;
-    constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
+    static_assert(kComputeScratchBytes <=
+                  (size_t)kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
+                  "backward compute GEMM scratch must fit the launch dynamic-smem budget");
 
-    constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
-    constexpr size_t kTopkSlotBytes = COMPUTE_BATCH_SIZE * sizeof(int);
-    constexpr size_t kIsSingleBytes = COMPUTE_BATCH_SIZE * sizeof(unsigned char);
-    constexpr size_t kRouteWAlignPad = alignof(float) - 1;
-    constexpr size_t kRouteWBytes = COMPUTE_BATCH_SIZE * sizeof(float);
-    constexpr size_t kComputeBatchMetaBytes = kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + kRouteWAlignPad + kRouteWBytes;
-    static_assert(kComputeMetaOffset + kComputeBatchMetaBytes <=
-                  kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
-                  "backward compute dynamic smem metadata must fit after compute scratch");
-
-    uint8_t* compute_smem = smem_buffer + kComputeMetaOffset;
-    int* s_recv_token_idx = reinterpret_cast<int*>(compute_smem);
-    compute_smem += kRecvTokenIdxBytes;
-    int* s_topk_slot = reinterpret_cast<int*>(compute_smem);
-    compute_smem += kTopkSlotBytes;
-    unsigned char* s_is_single = reinterpret_cast<unsigned char*>(compute_smem);
-    constexpr size_t kRouteWOffset =
-        (kComputeMetaOffset + kRecvTokenIdxBytes + kTopkSlotBytes + kIsSingleBytes + alignof(float) - 1) & ~(size_t)(alignof(float) - 1);
-    float* s_route_w = reinterpret_cast<float*>(smem_buffer + kRouteWOffset);
+    // Compute-task metadata in GMEM (moved out of shared memory, per-SM slice), same as
+    // forward. s_* names retained; each points at [sm_id*COMPUTE_BATCH_SIZE + row].
+    const int64_t kMetaBase = (int64_t)sm_id * COMPUTE_BATCH_SIZE;
+    int* s_recv_token_idx = state->g_meta_recv_idx + kMetaBase;
+    int* s_topk_slot = state->g_meta_topk_slot + kMetaBase;
+    unsigned char* s_is_single = state->g_meta_is_single + kMetaBase;
+    float* s_route_w = state->g_meta_route_w + kMetaBase;
 
     // TMEM persistent across tasks (same optimization as forward compute_worker_core).
     bool umma_tmem_allocated = false;
@@ -10413,10 +10439,13 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
         for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
             const int recv_token = s_recv_token_idx[row];
-            int done = atomicAdd(&state->token_done_count[recv_token], 1) + 1;
-            if (s_is_single[row] && done >= 1) {
-                __threadfence();
+            if (s_is_single[row]) {
+                // Single-hit: sole contributor; output already fenced device-wide by the
+                // __threadfence + compute_group_sync above. Publish directly — no per-row
+                // fence, no token_done_count bump (only multi-hit uses it in the gather worker).
                 atomicExch(&state->combine_token_ready[recv_token], 1);
+            } else {
+                atomicAdd(&state->token_done_count[recv_token], 1);
             }
         }
         compute_group_sync(state, group_id, group_size);

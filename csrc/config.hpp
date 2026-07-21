@@ -7,7 +7,7 @@ namespace deep_ep {
 
 namespace megakernel_config {
 
-constexpr int kComputeBatchSize = 4096;  // Tokens per expert batch before triggering GEMM.
+constexpr int kComputeBatchSize = 1024;  // Tokens per expert batch before triggering GEMM.
 constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
 constexpr int kComputeSchedulerSms = 1;
 constexpr int kGatherSms = 3;
