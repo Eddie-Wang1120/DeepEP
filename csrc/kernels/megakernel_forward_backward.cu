@@ -282,6 +282,15 @@ struct MegaKernelState {
     int* priority_scheduler_done;       // 0=running/barrier closed, 1=priority stopped, 2=final-flush barrier released
     int* expert_enqueue_cursor;         // [num_local_experts] how many slots have been enqueued
     int* expert_batch_min_token;        // [num_local_experts * max_batches_per_expert] combine-order key = min recv_token_idx in batch; -1 = uncomputed
+    // --- Arrival-order FIFO batch queue (dispatch receiver -> scheduler) ---
+    // The receiver appends a batch id (expert*max_batches_per_expert + batch) here the
+    // moment that batch fills (COMPUTE_BATCH_SIZE slots assigned) or reaches the expert
+    // tail. Queue order == token arrival order == combine send order (approx). The
+    // scheduler drains it strictly in order, gating each batch on slot readiness. This
+    // replaces the combine-key scan + k-way merge with a single FIFO.
+    int* ready_batch_queue;             // [num_local_experts * max_batches_per_expert] appended batch id; -1 = not yet published
+    int* ready_batch_reserve_tail;      // atomic append cursor (receiver)
+    int* expert_batch_ready_count;      // [num_local_experts * max_batches_per_expert] per-batch slot-ready counter (publisher atomicAdd)
     int* compute_group_task_idx;        // [num_compute_groups] broadcast popped task idx to group SMs
 
     // --- Dedicated Gather SM state ---
@@ -922,6 +931,21 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
             st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + hit_slot], 1);
+            // Per-batch ready counter: when all slots in a batch have been published,
+            // the last writer triggers the FIFO append so scheduler can consume immediately.
+            int batch_id = hit_slot / COMPUTE_BATCH_SIZE;
+            int batch_start = batch_id * COMPUTE_BATCH_SIZE;
+            int ecnt = state->expert_count[local_expert_id];
+            int batch_end = batch_start + COMPUTE_BATCH_SIZE;
+            if (batch_end > ecnt) batch_end = ecnt;
+            int batch_size = batch_end - batch_start;
+            int mbe = state->max_batches_per_expert;
+            int done = atomicAdd(&state->expert_batch_ready_count[local_expert_id * mbe + batch_id], 1) + 1;
+            if (done == batch_size) {
+                int enc = local_expert_id * mbe + batch_id;
+                int qpos = atomicAdd(state->ready_batch_reserve_tail, 1);
+                st_na_release(&state->ready_batch_queue[qpos], enc);
+            }
         }
 #if MK_PERF_TRACE_ARGS
         if (lane_id == 0)
@@ -2336,6 +2360,10 @@ __device__ void dispatch_worker_v2(
                         rds_abs_slot = state->expert_slot_base[rds_local_expert] + rds_slot;
                         // Stash slot for the publisher (which will skip its own atomicAdd).
                         state->pending_slot[recv_token_idx * num_topk + lane_id] = rds_abs_slot;
+                        // NOTE: ready_batch_queue append has been moved to the publisher
+                        // (publish_recv_token_from_pending), which appends only after all
+                        // slots in a batch have expert_slot_ready set. This ensures FIFO
+                        // entries are data-ready when consumed by the scheduler.
                     }
                     // Stage token data into each hit's contiguous slot. All 32 lanes
                     // cooperate per hit; broadcast the hit lane's abs_slot to everyone.
@@ -2431,6 +2459,9 @@ __device__ void dispatch_worker_v2(
                         hit_local_expert[num_hits] = local_expert_id;
                         hit_slot[num_hits] = slot;
                         hit_abs_slot[num_hits] = state->expert_slot_base[local_expert_id] + slot;
+                        // NOTE: ready_batch_queue append moved to publisher
+                        // (publish_recv_token_from_pending), which appends only after all
+                        // slots in a batch have expert_slot_ready set.
                         num_hits += 1;
                     }
                     if (num_hits > 0) {
@@ -3003,8 +3034,8 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     const int tid = threadIdx.x;
     const int num_threads = min(NORMAL_SCHED_THREADS, static_cast<int>(blockDim.x));
     const int num_local_experts = state->num_local_experts;
-    const int max_tpe = state->max_tokens_per_expert;
 
+    // --- Gather scheduler lanes (unchanged) ---
     if (tid >= GATHER_SCHED_TID_BEGIN) {
         while (ld_acquire_global(state->combine_all_done) == 0) {
             scheduler_scan_gather_tokens(state, scheduler_id, num_schedulers);
@@ -3012,21 +3043,20 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         }
         return;
     }
-
-    if (tid >= NORMAL_SCHED_THREADS) {
-        // Priority scheduler removed; the reserved [NORMAL_SCHED_THREADS, GATHER_SCHED_TID_BEGIN)
-        // lanes are unused. Combine-order enqueue is handled by the normal producer (path B).
+    if (tid >= NORMAL_SCHED_THREADS)
         return;
-    }
 
-    bool tail_enqueued = false;
-
-    __shared__ int s_priority_alloc_count;
-    __shared__ int s_priority_new_cursor;
-    __shared__ int s_normal_enqueued_count;
+    // --- Shared state for the parallel normal scheduler ---
     __shared__ int s_dispatch_done;
-    __shared__ int s_compute_all_result;
+    __shared__ int s_head;           // current drain cursor into ready_batch_queue
+    __shared__ int s_rtail;          // snapshot of ready_batch_reserve_tail
+    __shared__ int s_done;           // termination flag
 
+    if (tid == 0) {
+        s_head = 0;
+        s_done = 0;
+    }
+    scheduler_compute_sync(num_threads);
 
 #if MK_PERF_TRACE_ENABLED
     if (tid == 0 && scheduler_id == 0)
@@ -3034,498 +3064,170 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
 #endif
 #if MK_PERF_TRACE_ARGS
     int64_t sched_scan_acc = 0;
-    int64_t sched_enqueue_acc = 0;
     int64_t sched_idle_acc = 0;
-    int64_t sched_normal_acc = 0;
     int64_t sched_tail_flush_acc = 0;
-    int64_t normal_full_batch_enqueues = 0;
-    int64_t flush_tail_enqueues = 0;
-    int64_t queue_empty_count = 0;
-    int64_t queue_empty_after_dispatch_count = 0;
-    int64_t max_ready_tail_gap = 0;
-    int64_t stall_expert = -1;
-    int64_t stall_recv_count = 0;
-    int64_t stall_alloc_count = 0;
-    int64_t stall_enqueue_cursor = 0;
-    int64_t stall_first_unready_slot = -1;
-    int64_t stall_first_unready_ready = 0;
-    int64_t stall_dispatch_done = 0;
 #endif
 
     while (true) {
-        // Thread 0 loads dispatch_done and broadcasts via shared memory
+        // --- Broadcast dispatch_done ---
         if (tid == 0) {
 #if MK_ASYNC_PUBLISH
             s_dispatch_done = (ld_acquire_global(state->publish_all_done) != 0) ? 1 : 0;
 #else
-            int dispatch_done_count = ld_acquire_global(state->dispatch_done_count);
-            s_dispatch_done = (dispatch_done_count == state->expected_dispatch_done_count) ? 1 : 0;
+            s_dispatch_done = (ld_acquire_global(state->dispatch_done_count) == state->expected_dispatch_done_count) ? 1 : 0;
 #endif
         }
         scheduler_compute_sync(num_threads);
-        bool dispatch_done = (s_dispatch_done != 0);
-#if MK_PERF_TRACE_ARGS
-        if (tid == 0 && dispatch_done)
-            mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
-#endif
+        const bool dispatch_done = (s_dispatch_done != 0);
 
-        if (tail_enqueued)
+        if (s_done)
             break;
 
-#if MK_PERF_TRACE_ARGS
-        if (tid == 0 && scheduler_id == 0) {
-            int task_head = ld_acquire_global(state->compute_task_head);
-            int task_tail = ld_acquire_global(state->compute_task_tail);
-            if (task_head >= task_tail) {
-                queue_empty_count += 1;
-                if (dispatch_done)
-                    queue_empty_after_dispatch_count += 1;
-            }
+        // --- tid 0 snapshots queue bounds and advances head past already-published entries ---
+        if (tid == 0) {
+            int rtail = ld_acquire_global(state->ready_batch_reserve_tail);
+            int head = s_head;
+            constexpr int kEnqPublished = -2;
+            while (head < rtail && ld_acquire_global(&state->ready_batch_queue[head]) == kEnqPublished)
+                head++;
+            s_head = head;
+            s_rtail = rtail;
         }
-        int64_t sched_scan_start = 0;
-        int64_t sched_enqueue_start = 0;
-#endif
+        scheduler_compute_sync(num_threads);
 
-        if (!dispatch_done) {
+        // --- tid 0 consumes FIFO in arrival order ---
+        // Since publisher only appends to ready_batch_queue after all slots in a batch
+        // have expert_slot_ready set (via expert_batch_ready_count), any entry present
+        // in the queue is guaranteed data-ready. No slot scanning needed.
 #if MK_PERF_TRACE_ARGS
-            sched_scan_start = globaltimer_ns();
+        int64_t scan_start = globaltimer_ns();
 #endif
-
-            // === Unified multi-thread cooperative scan + immediate enqueue ===
-            // All threads cooperatively scan one expert at a time (parallel ld_acquire).
-            // all_ready → advance full wave.  !all_ready → atomicMin finds prefix boundary.
-            // tid0 immediately enqueues full batches after each scan advance.
-            // Single producer (tid0) — no CAS contention, no spin-wait deadlock.
-            for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
-#if MK_ASYNC_PUBLISH
-                if (tid == 0 && ld_acquire_global(state->publish_all_done) != 0) {
-                    s_dispatch_done = 1;
-#if MK_PERF_TRACE_ARGS
-                    mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
-#endif
-                }
-                scheduler_compute_sync(num_threads);
-                if (s_dispatch_done != 0)
-                    break;
-#endif
-                int old_count;
-                if (tid == 0) {
-                    old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    s_priority_alloc_count = old_count;
-                }
-                scheduler_compute_sync(num_threads);
-                old_count = s_priority_alloc_count;
-
-                // Read current enqueue cursor
-                int cursor = old_count;
-                if (tid == 0)
-                    cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                if (tid == 0)
-                    s_priority_new_cursor = cursor;
-                scheduler_compute_sync(num_threads);
-                cursor = s_priority_new_cursor;
-
-                int count = old_count;
-                while (count < state->expert_count[expert_id]) {
-                    int my_slot = count + tid;
-                    int my_ready = 0;
-                    if (my_slot < state->expert_count[expert_id])
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-
-#if MK_ASYNC_PUBLISH
-                    int all_ready = scheduler_compute_all_until_publish_done(
-                        my_ready || (my_slot >= state->expert_count[expert_id]),
-                        &s_compute_all_result, num_threads, state, &s_dispatch_done);
-                    if (s_dispatch_done != 0)
-                        break;
-#else
-                    int all_ready = scheduler_compute_all(
-                        my_ready || (my_slot >= state->expert_count[expert_id]),
-                        &s_compute_all_result, num_threads);
-#endif
-                    if (!all_ready) {
-                        // atomicMin reduction: find the first not-ready tid offset.
-                        if (tid == 0)
-                            s_priority_alloc_count = num_threads;
-                        scheduler_compute_sync(num_threads);
-                        if (my_slot < state->expert_count[expert_id] && !my_ready)
-                            atomicMin(&s_priority_alloc_count, tid);
-                        scheduler_compute_sync(num_threads);
-                        count += s_priority_alloc_count;
-                        break;
-                    }
-                    count += num_threads;
-                    if (count > state->expert_count[expert_id])
-                        count = state->expert_count[expert_id];
-
-                    // Publish recv_count and immediately enqueue full batches
-                    if (tid == 0) {
-                        __threadfence();
-                        st_na_release(&state->expert_recv_count[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        sched_scan_acc += globaltimer_ns() - sched_scan_start;
-                        sched_enqueue_start = globaltimer_ns();
-#endif
-                    }
-                    scheduler_compute_sync(num_threads);
-                    // Enqueue moved to the combine-key phase after the expert scan;
-                    // phase 1 here only advances expert_recv_count.
-                }
-#if MK_ASYNC_PUBLISH
-                if (s_dispatch_done != 0)
-                    break;
-#endif
-
-                // Publish final recv_count for this expert; enqueue happens in the
-                // combine-key phase below (not here).
-                if (tid == 0 && count != old_count) {
-                    __threadfence();
-                    st_na_release(&state->expert_recv_count[expert_id], count);
-                }
-                scheduler_compute_sync(num_threads);
-#if MK_PERF_TRACE_ARGS
-                if (tid == 0) {
-                    int alloc_count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
-                    int gap = alloc_count - count;
-                    if (gap > max_ready_tail_gap) {
-                        max_ready_tail_gap = gap;
-                        stall_expert = expert_id;
-                        stall_recv_count = count;
-                        stall_alloc_count = alloc_count;
-                        stall_enqueue_cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                        stall_first_unready_slot = count;
-                        stall_first_unready_ready = (count < state->expert_count[expert_id]) ? ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + count]) : -1;
-                        stall_dispatch_done = dispatch_done ? 1 : 0;
-                    }
-                }
-#endif
-                scheduler_compute_sync(num_threads);
+        if (tid == 0) {
+            constexpr int kEnqPublished = -2;
+            const int mbe = state->max_batches_per_expert;
+            int head = s_head;
+            int rtail = s_rtail;
+            while (head < rtail) {
+                int enc = ld_acquire_global(&state->ready_batch_queue[head]);
+                if (enc == kEnqPublished) { head++; continue; }
+                if (enc < 0) break;  // -1 = reserved but not yet written; wait
+                int e = enc / mbe;
+                int b = enc - e * mbe;
+                int start = b * COMPUTE_BATCH_SIZE;
+                int ecount = state->expert_count[e];
+                int size = min(COMPUTE_BATCH_SIZE, ecount - start);
+                scheduler_try_enqueue_batch(state, e, b, start, size,
+                                            size < COMPUTE_BATCH_SIZE ? 1 : 0, 1);
+                if (ld_acquire_global(&state->expert_enqueue_cursor[e]) < start + size)
+                    st_na_release(&state->expert_enqueue_cursor[e], start + size);
+                st_na_release(&state->ready_batch_queue[head], kEnqPublished);
+                head++;
             }
-
-            // === Combine-key enqueue (path B) ===
-            // Assumes COMPUTE_SCHEDULER_SMS == 1 (single scheduler SM sees all experts).
-            // Phase 2: lazily compute each expert's front (ready, un-enqueued) batch key.
-            // Phase 3: k-way merge — enqueue ready front batches by ascending
-            //          min recv_token_idx, bounded by a small target queue depth.
-            if (tid == 0) {
-                for (int e = 0; e < num_local_experts; ++e) {
-                    int cur = ld_acquire_global(&state->expert_enqueue_cursor[e]);
-                    int rc = ld_acquire_global(&state->expert_recv_count[e]);
-                    int b = cur / COMPUTE_BATCH_SIZE;
-                    if ((b + 1) * COMPUTE_BATCH_SIZE > rc)
-                        continue;  // front batch not fully ready
-                    int kidx = e * state->max_batches_per_expert + b;
-                    if (ld_nc_global(&state->expert_batch_min_token[kidx]) >= 0)
-                        continue;  // key already computed
-                    int base = state->expert_slot_base[e] + b * COMPUTE_BATCH_SIZE;
-                    int mn = 0x7fffffff;
-                    for (int s = base; s < base + COMPUTE_BATCH_SIZE; ++s) {
-                        int rt = ld_nc_global(&state->recv_token_source_info[s * 2]);
-                        if (rt >= 0 && rt < mn)
-                            mn = rt;
-                    }
-                    st_na_global(&state->expert_batch_min_token[kidx], mn);
-                }
-                const int target_depth = state->num_compute_groups * 2;
-                while (true) {
-                    int qdepth = ld_acquire_global(state->compute_task_reserve_tail) -
-                                 ld_acquire_global(state->compute_task_head);
-                    if (qdepth >= target_depth)
-                        break;
-                    int best_e = -1, best_b = -1, best_key = 0x7fffffff;
-                    for (int e = 0; e < num_local_experts; ++e) {
-                        int cur = ld_acquire_global(&state->expert_enqueue_cursor[e]);
-                        int rc = ld_acquire_global(&state->expert_recv_count[e]);
-                        int b = cur / COMPUTE_BATCH_SIZE;
-                        if ((b + 1) * COMPUTE_BATCH_SIZE > rc)
-                            continue;
-                        int key = ld_nc_global(&state->expert_batch_min_token[e * state->max_batches_per_expert + b]);
-                        if (key < 0)
-                            continue;  // key not computed yet this round
-                        if (key < best_key) {
-                            best_key = key;
-                            best_e = e;
-                            best_b = b;
-                        }
-                    }
-                    if (best_e < 0)
-                        break;
-                    int start = best_b * COMPUTE_BATCH_SIZE;
-                    scheduler_try_enqueue_batch(state, best_e, best_b, start, COMPUTE_BATCH_SIZE, 0, 1);
-                    st_na_release(&state->expert_enqueue_cursor[best_e], start + COMPUTE_BATCH_SIZE);
-                }
-            }
-            scheduler_compute_sync(num_threads);
-#if MK_ASYNC_PUBLISH
-            dispatch_done = (s_dispatch_done != 0);
-#endif
-#if MK_PERF_TRACE_ARGS
-            sched_scan_acc += globaltimer_ns() - sched_scan_start;
-            sched_enqueue_start = globaltimer_ns();
-            sched_enqueue_acc += 0;
-            sched_normal_acc += 0;
-#endif
+            s_head = head;
         }
-
-        // === Tail flush ===
-        if (dispatch_done && !tail_enqueued) {
+        scheduler_compute_sync(num_threads);
 #if MK_PERF_TRACE_ARGS
-            int64_t sched_tail_flush_start = globaltimer_ns();
-            sched_enqueue_start = globaltimer_ns();
+        sched_scan_acc += globaltimer_ns() - scan_start;
 #endif
-            // Stop every compute-task producer before reserving final-flush slots.
-            // Priority-specific tail pre-publish is only useful when the priority
-            // scanner is enabled; keep the cross-scheduler barrier either way so
-            // final-flush tasks cannot race ahead of still-running normal producers.
-            scheduler_compute_sync(num_threads);
+
+        // --- Final drain after dispatch_done (parallel) ---
+        if (dispatch_done) {
+#if MK_PERF_TRACE_ARGS
+            int64_t flush_start = globaltimer_ns();
+#endif
+            // Wait for all publisher warps to finish
             if (tid == 0) {
-                atomicAdd(state->scheduler_done_count, 1);
-                if (scheduler_id == 0) {
-                    while (ld_acquire_global(state->scheduler_done_count) < num_schedulers)
-                        __nanosleep(32);
-                    st_na_release(state->scheduler_done_count, 0);
-                    st_na_release(state->priority_scheduler_done, 2);
-                } else {
-                    while (ld_acquire_global(state->priority_scheduler_done) < 2)
-                        __nanosleep(32);
-                }
-            }
-            scheduler_compute_sync(num_threads);
 #if MK_ASYNC_PUBLISH
-            if (tid == 0) {
-                for (int pw = 0; pw < state->num_pub_warps_total; ++pw) {
+                for (int pw = 0; pw < state->num_pub_warps_total; ++pw)
                     while (ld_acquire_global(&state->publish_warp_done[pw]) == 0)
                         __nanosleep(32);
-                }
-                for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
-                    int count = ld_acquire_global(&state->expert_token_offsets[expert_id]);
-                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                    if (count < cursor)
-                        count = cursor;
-                    st_na_release(&state->expert_recv_count[expert_id], count);
-
-                    int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
-                    for (int b = 0; b < full_batch_count; ++b) {
-                        int start = cursor + b * COMPUTE_BATCH_SIZE;
-                        int batch_id = start / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            normal_full_batch_enqueues += 1;
 #endif
-                    }
-                    cursor += full_batch_count * COMPUTE_BATCH_SIZE;
-                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-
-                    if (count > cursor) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            flush_tail_enqueues += 1;
-#endif
-                    }
-                }
-#if MK_PERF_TRACE_ARGS
-                int64_t sched_done_publish_start = globaltimer_ns();
-                sched_enqueue_acc += sched_done_publish_start - sched_enqueue_start;
-#endif
-                __threadfence();
-                int finished = atomicAdd(state->scheduler_done_count, 1) + 1;
-                if (finished == num_schedulers) {
-#if MK_PERF_TRACE_ENABLED
-                    state->perf_sched_ts[1] = globaltimer_ns();
-#endif
-                    st_na_release(state->compute_enqueue_done, 1);
-                }
-#if MK_PERF_TRACE_ARGS
-                sched_enqueue_acc += globaltimer_ns() - sched_done_publish_start;
-#endif
+                // Snapshot final queue tail after all publishers are done
+                s_rtail = ld_acquire_global(state->ready_batch_reserve_tail);
             }
-#else
-#if MK_PERF_TRACE_ARGS
-            sched_scan_start = globaltimer_ns();
-#endif
-            for (int expert_id = scheduler_id; expert_id < num_local_experts; expert_id += num_schedulers) {
-                int old_count;
-                if (tid == 0) {
-                    old_count = ld_acquire_global(&state->expert_recv_count[expert_id]);
-                    s_priority_alloc_count = old_count;
-                }
-                scheduler_compute_sync(num_threads);
-                old_count = s_priority_alloc_count;
+            scheduler_compute_sync(num_threads);
 
-                int count = old_count;
-                int cursor = old_count;
-                if (tid == 0)
-                    cursor = ld_acquire_global(&state->expert_enqueue_cursor[expert_id]);
-                scheduler_compute_sync(num_threads);
-                if (tid == 0)
-                    s_priority_new_cursor = cursor;
-                scheduler_compute_sync(num_threads);
-                cursor = s_priority_new_cursor;
-
-                while (count < state->expert_count[expert_id]) {
-                    int my_slot = (tid < num_threads) ? count + tid : state->expert_count[expert_id];
-                    int my_ready = 0;
-                    if (my_slot < state->expert_count[expert_id])
-                        my_ready = (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + my_slot]) == 1) ? 1 : 0;
-                    int all_ready = scheduler_compute_all(my_ready || (my_slot >= state->expert_count[expert_id]), &s_compute_all_result, num_threads);
-                    if (!all_ready) {
-                        if (tid == 0) {
-                            for (int s = count; s < count + num_threads && s < state->expert_count[expert_id]; ++s) {
-                                if (ld_acquire_global(&state->expert_slot_ready[state->expert_slot_base[expert_id] + s]) == 1)
-                                    count = s + 1;
-                                else
-                                    break;
-                            }
-                            s_priority_alloc_count = count;
-                        }
-                        scheduler_compute_sync(num_threads);
-                        count = s_priority_alloc_count;
-                        break;
-                    }
-                    count += num_threads;
-                    if (count > state->expert_count[expert_id]) count = state->expert_count[expert_id];
-
-                    if (tid == 0) {
-                        __threadfence();
-                        st_na_release(&state->expert_recv_count[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        sched_scan_acc += globaltimer_ns() - sched_scan_start;
-                        sched_enqueue_start = globaltimer_ns();
-#endif
-                    }
-                    scheduler_compute_sync(num_threads);
-                    int full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
-                    for (int b = tid; b < full_batch_count; b += num_threads) {
-                        int start = cursor + b * COMPUTE_BATCH_SIZE;
-                        int batch_id = start / COMPUTE_BATCH_SIZE;
-                        scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
-                    }
-                    scheduler_compute_sync(num_threads);
-                    if (tid == 0) {
-                        cursor += full_batch_count * COMPUTE_BATCH_SIZE;
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-                        s_priority_new_cursor = cursor;
-#if MK_PERF_TRACE_ARGS
-                        normal_full_batch_enqueues += full_batch_count;
-                        sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
-                        sched_scan_start = globaltimer_ns();
-#endif
-                    }
-                    scheduler_compute_sync(num_threads);
-                    cursor = s_priority_new_cursor;
+            // --- Phase 1: All threads drain FIFO entries in parallel ---
+            {
+                constexpr int kEnqPublished = -2;
+                const int mbe = state->max_batches_per_expert;
+                const int head = s_head;
+                const int rtail = s_rtail;
+                const int total = rtail - head;
+                for (int idx = tid; idx < total; idx += num_threads) {
+                    int qi = head + idx;
+                    int enc = ld_acquire_global(&state->ready_batch_queue[qi]);
+                    if (enc < 0) continue;  // skip sentinels
+                    int e = enc / mbe;
+                    int b = enc - e * mbe;
+                    int start = b * COMPUTE_BATCH_SIZE;
+                    int ecount = state->expert_count[e];
+                    int size = min(COMPUTE_BATCH_SIZE, ecount - start);
+                    scheduler_try_enqueue_batch(state, e, b, start, size,
+                                                size < COMPUTE_BATCH_SIZE ? 1 : 0, 3);
+                    atomicMax(&state->expert_enqueue_cursor[e], start + size);
                 }
-
-                if (tid == 0) {
-                    __threadfence();
-                    st_na_release(&state->expert_recv_count[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                    sched_scan_acc += globaltimer_ns() - sched_scan_start;
-                    sched_enqueue_start = globaltimer_ns();
-#endif
-                }
-                scheduler_compute_sync(num_threads);
-                int final_full_batch_count = (count - cursor) / COMPUTE_BATCH_SIZE;
-                for (int b = tid; b < final_full_batch_count; b += num_threads) {
-                    int start = cursor + b * COMPUTE_BATCH_SIZE;
-                    int batch_id = start / COMPUTE_BATCH_SIZE;
-                    scheduler_try_enqueue_batch(state, expert_id, batch_id, start, COMPUTE_BATCH_SIZE, 0, 3);
-                }
-                scheduler_compute_sync(num_threads);
-                if (tid == 0) {
-                    cursor += final_full_batch_count * COMPUTE_BATCH_SIZE;
-                    st_na_release(&state->expert_enqueue_cursor[expert_id], cursor);
-                    if (count > cursor) {
-                        int batch_id = cursor / COMPUTE_BATCH_SIZE;
-                        bool enq = scheduler_try_enqueue_batch(state, expert_id, batch_id, cursor, count - cursor, 1, 3);
-                        st_na_release(&state->expert_enqueue_cursor[expert_id], count);
-#if MK_PERF_TRACE_ARGS
-                        if (enq)
-                            flush_tail_enqueues += 1;
-#endif
-                    }
-#if MK_PERF_TRACE_ARGS
-                    normal_full_batch_enqueues += final_full_batch_count;
-                    sched_enqueue_acc += globaltimer_ns() - sched_enqueue_start;
-                    sched_scan_start = globaltimer_ns();
-#endif
-                }
-                scheduler_compute_sync(num_threads);
             }
-#if MK_PERF_TRACE_ARGS
-            int64_t sched_done_publish_start = globaltimer_ns();
-#endif
+            scheduler_compute_sync(num_threads);
+
+            // --- Phase 2: Safety net per-expert sweep (parallel by expert) ---
+            {
+                for (int e = tid; e < num_local_experts; e += num_threads) {
+                    int count = ld_acquire_global(&state->expert_token_offsets[e]);
+                    int cursor = ld_acquire_global(&state->expert_enqueue_cursor[e]);
+                    if (count < cursor) count = cursor;
+                    while (cursor < count) {
+                        int size = min(COMPUTE_BATCH_SIZE, count - cursor);
+                        scheduler_try_enqueue_batch(state, e, cursor / COMPUTE_BATCH_SIZE,
+                                                    cursor, size, size < COMPUTE_BATCH_SIZE ? 1 : 0, 3);
+                        cursor += size;
+                    }
+                    atomicMax(&state->expert_enqueue_cursor[e], count);
+                }
+            }
+            scheduler_compute_sync(num_threads);
+
+            // --- Phase 3: tid 0 signals completion ---
             if (tid == 0) {
                 __threadfence();
-                int finished = atomicAdd(state->scheduler_done_count, 1) + 1;
-                if (finished == num_schedulers) {
 #if MK_PERF_TRACE_ENABLED
-                    state->perf_sched_ts[1] = globaltimer_ns();
+                state->perf_sched_ts[1] = globaltimer_ns();
 #endif
-                    st_na_release(state->compute_enqueue_done, 1);
-                }
+                st_na_release(state->compute_enqueue_done, 1);
+                s_done = 1;
             }
+            scheduler_compute_sync(num_threads);
 #if MK_PERF_TRACE_ARGS
-            sched_enqueue_acc += globaltimer_ns() - sched_done_publish_start;
+            sched_tail_flush_acc += globaltimer_ns() - flush_start;
 #endif
-#endif
-#if MK_PERF_TRACE_ARGS
-            sched_tail_flush_acc += globaltimer_ns() - sched_tail_flush_start;
-#endif
-            tail_enqueued = true;
+            break;
         }
 
-        if (tail_enqueued)
-            break;
+        // --- Idle sleep (only if nothing consumed this iteration) ---
+#if MK_PERF_TRACE_ARGS
+        int64_t idle_start = globaltimer_ns();
+#endif
+        __nanosleep(32);
+#if MK_PERF_TRACE_ARGS
+        sched_idle_acc += globaltimer_ns() - idle_start;
+#endif
+    }
 
 #if MK_PERF_TRACE_ARGS
-        int64_t sched_idle_start = globaltimer_ns();
-#endif
-        __nanosleep(64);
-#if MK_PERF_TRACE_ARGS
-        sched_idle_acc += globaltimer_ns() - sched_idle_start;
-#endif
-    }
-#if MK_PERF_TRACE_ARGS
     if (tid == 0) {
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_scan_ns),
-              static_cast<unsigned long long>(sched_scan_acc));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_enqueue_ns),
-              static_cast<unsigned long long>(sched_enqueue_acc));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_idle_ns),
-              static_cast<unsigned long long>(sched_idle_acc));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_normal_ns),
-              static_cast<unsigned long long>(sched_normal_acc));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_tail_flush_ns),
-              static_cast<unsigned long long>(sched_tail_flush_acc));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_normal_full_batch_enqueues),
-              static_cast<unsigned long long>(normal_full_batch_enqueues));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_flush_tail_enqueues),
-              static_cast<unsigned long long>(flush_tail_enqueues));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_queue_empty_count),
-              static_cast<unsigned long long>(queue_empty_count));
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_queue_empty_after_dispatch_count),
-              static_cast<unsigned long long>(queue_empty_after_dispatch_count));
-    unsigned long long old_gap = atomicMax(reinterpret_cast<unsigned long long*>(state->perf_sched_max_ready_tail_gap),
-                                           static_cast<unsigned long long>(max_ready_tail_gap));
-    if (static_cast<unsigned long long>(max_ready_tail_gap) > old_gap && max_ready_tail_gap > 0) {
-        st_na_global(state->perf_sched_stall_expert, stall_expert);
-        st_na_global(state->perf_sched_stall_recv_count, stall_recv_count);
-        st_na_global(state->perf_sched_stall_alloc_count, stall_alloc_count);
-        st_na_global(state->perf_sched_stall_enqueue_cursor, stall_enqueue_cursor);
-        st_na_global(state->perf_sched_stall_first_unready_slot, stall_first_unready_slot);
-        st_na_global(state->perf_sched_stall_first_unready_ready, stall_first_unready_ready);
-        st_na_global(state->perf_sched_stall_dispatch_done, stall_dispatch_done);
+        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_scan_ns),
+                  static_cast<unsigned long long>(sched_scan_acc));
+        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_idle_ns),
+                  static_cast<unsigned long long>(sched_idle_acc));
+        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_tail_flush_ns),
+                  static_cast<unsigned long long>(sched_tail_flush_acc));
     }
-    }  // tid == 0
 #endif
 }
 
 template <ComputeDType kComputeDType, bool kStopAtDispatchDone>
 __device__ __forceinline__ void compute_worker_core(
+
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
@@ -8177,6 +7879,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* token_priority_dep_count;
 #endif
     int* expert_batch_min_token;
+    int* ready_batch_queue;
+    int* ready_batch_reserve_tail;
     arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&compute_output_slot, recv_tokens_bytes));
     CUDA_CHECK(cudaMemset(compute_output_slot, 0, recv_tokens_bytes));
@@ -8227,6 +7931,16 @@ MegaKernelState* allocate_megakernel_state_v7(
 #endif
     CUDA_CHECK(cudaMalloc(&expert_batch_min_token, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_batch_min_token, 0xff, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
+    // Arrival-order FIFO batch queue (dispatch receiver -> scheduler). Sized at the flat
+    // (expert, batch) id space; total appended entries <= Σ ceil(count_e/BATCH) <= that.
+    // Initialized to -1 (0xff) = "not yet published".
+    CUDA_CHECK(cudaMalloc(&ready_batch_queue, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
+    CUDA_CHECK(cudaMemset(ready_batch_queue, 0xff, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ready_batch_reserve_tail, sizeof(int)));
+    CUDA_CHECK(cudaMemset(ready_batch_reserve_tail, 0, sizeof(int)));
+    int* expert_batch_ready_count;
+    CUDA_CHECK(cudaMalloc(&expert_batch_ready_count, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
+    CUDA_CHECK(cudaMemset(expert_batch_ready_count, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
 
     // GEMM workspace: per-compute-group batched intermediates for M=128 compute batches.
     // Layout still keeps the legacy [input(M*hidden)][GU scratch(M*2I)][act(M*I)][down(M*hidden)]
@@ -8666,6 +8380,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_priority_dep_count = token_priority_dep_count;
 #endif
     host_state.expert_batch_min_token = expert_batch_min_token;
+    host_state.ready_batch_queue = ready_batch_queue;
+    host_state.ready_batch_reserve_tail = ready_batch_reserve_tail;
+    host_state.expert_batch_ready_count = expert_batch_ready_count;
     host_state.max_batches_per_expert = max_batches_per_expert;
 
     // Combine infrastructure.
@@ -9364,6 +9081,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.token_priority_dep_count));
 #endif
     CUDA_CHECK(cudaFree(host_state.expert_batch_min_token));
+    CUDA_CHECK(cudaFree(host_state.ready_batch_queue));
+    CUDA_CHECK(cudaFree(host_state.ready_batch_reserve_tail));
+    CUDA_CHECK(cudaFree(host_state.expert_batch_ready_count));
     CUDA_CHECK(cudaFree(host_state.compute_group_barrier));
     CUDA_CHECK(cudaFree(host_state.compute_group_phase));
     CUDA_CHECK(cudaFree(host_state.compute_tasks));
@@ -11051,6 +10771,9 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     f(hs.token_slot_list, MTR * TK * sizeof(int));
     z(hs.expert_batch_enqueued, (size_t)E * MBE * sizeof(int));
     f(hs.expert_batch_min_token, (size_t)E * MBE * sizeof(int));
+    f(hs.ready_batch_queue, (size_t)E * MBE * sizeof(int));
+    z(hs.ready_batch_reserve_tail, sizeof(int));
+    z(hs.expert_batch_ready_count, (size_t)E * MBE * sizeof(int));
     z(hs.combine_input, MTR * hs.hidden_dim * sizeof(__nv_bfloat16));
     z(hs.combine_input_topk_weights, MTR * TK * sizeof(float));
     z(hs.output_accum, (size_t)hs.num_tokens * hs.hidden_dim * sizeof(float));
