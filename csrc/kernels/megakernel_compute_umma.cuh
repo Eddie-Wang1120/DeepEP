@@ -1255,13 +1255,14 @@ __device__ inline void umma_dgrad_mn_persistent(
     const CUtensorMap* desc_a, const CUtensorMap* desc_b_mn, const CUtensorMap* desc_cd,
     int M, int N, int K,
     int cluster_idx, int num_clusters,
-    char* cluster_smem, uint32_t& accum_iter) {
+    char* cluster_smem, uint32_t& accum_iter,
+    uint32_t m_base = 0) {
 
     dg_gemm_persistent<false, kDgRunMulticast, false, cute::UMMA::Major::MN>(
         desc_a, desc_b_mn, desc_cd,
         (uint32_t)M, (uint32_t)N, (uint32_t)K,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
-        nullptr, nullptr, 0);
+        nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0, 0, 0xffffffffu, m_base);
 }
 
 // DeepGEMM down-proj for one (m_block, n_block) tile: D = act @ W_down^T.

@@ -3773,7 +3773,13 @@ __device__ __forceinline__ void compute_worker_core(
     // Full batches use M=128. Tail batches use the same path with rows [batch_size,128)
     // zero-filled so WMMA M tiles never read past valid token rows.
     const int padded_m = COMPUTE_BATCH_SIZE;
+#if MK_RECV_DIRECT_STAGING
+    // input_buf is unused (gate/up TMA-fed from recv_tokens, bwd save reads recv_tokens),
+    // so the input region is dropped from the per-group workspace to save memory.
+    const int input_stride = 0;
+#else
     const int input_stride = padded_m * hidden;
+#endif
     const int gu_stride   = padded_m * (2 * intermediate);   // reserved GU scratch [M,2I]
     const int act_stride  = padded_m * intermediate;         // interleaved SwiGLU epilogue result (down A)
     const int down_stride = padded_m * hidden;
@@ -8426,7 +8432,15 @@ MegaKernelState* allocate_megakernel_state_v7(
     // Layout: [input(M*hidden)][GU scratch(M*2I)][act(M*I)][down(M*hidden)].
     // The interleaved gate/up path writes act directly from the GEMM epilogue; the
     // GU scratch region remains reserved so existing descriptors/helpers stay valid.
-    size_t per_group_elems = (size_t)COMPUTE_BATCH_SIZE * (2 * hidden_dim + 3 * intermediate_dim);
+    // Under MK_RECV_DIRECT_STAGING the input region is dropped (input_buf unused: gate/up
+    // and grad_act are TMA-fed from recv_tokens), matching the device gemm_stride.
+#if MK_RECV_DIRECT_STAGING
+    const size_t per_group_input_elems = 0;
+#else
+    const size_t per_group_input_elems = (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+#endif
+    size_t per_group_elems = per_group_input_elems +
+        (size_t)COMPUTE_BATCH_SIZE * (hidden_dim + 3 * intermediate_dim);
     size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
     arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
@@ -8507,7 +8521,7 @@ MegaKernelState* allocate_megakernel_state_v7(
         h_in.reserve(num_compute_groups);
         for (int g = 0; g < num_compute_groups; ++g) {
             const __nv_bfloat16* in_g = gemm_workspace + (size_t)g * per_group_elems;
-            const __nv_bfloat16* gu_g   = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+            const __nv_bfloat16* gu_g   = in_g + per_group_input_elems;
             const __nv_bfloat16* act_g  = gu_g + (size_t)COMPUTE_BATCH_SIZE * (2 * intermediate_dim);
             const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
             h_in.push_back(umma::make_input_group_atoms(in_g, gu_g, act_g, down_g,
@@ -8543,7 +8557,7 @@ MegaKernelState* allocate_megakernel_state_v7(
         h_fp8_in.reserve(num_compute_groups);
         for (int g = 0; g < num_compute_groups; ++g) {
             const __nv_bfloat16* in_g = gemm_workspace + (size_t)g * per_group_elems;
-            const __nv_bfloat16* gu_g = in_g + (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+            const __nv_bfloat16* gu_g = in_g + per_group_input_elems;
             const __nv_bfloat16* act_g = gu_g + (size_t)COMPUTE_BATCH_SIZE * (2 * intermediate_dim);
             const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
             const umma_fp8::ElemAB* in_fp8_g = input_fp8_workspace + (size_t)g * COMPUTE_BATCH_SIZE * hidden_dim;
@@ -10159,7 +10173,12 @@ __device__ __forceinline__ void compute_backward_worker_core(
     // Per-group global workspace, same layout as the forward compute worker:
     //   input_buf[M,hidden] = grad_down (gathered)   gu_buf[M,2I] = GU scratch
     //   up_buf[M,I]         = grad_act                down_buf[M,hidden] = grad_xperm
+#if MK_RECV_DIRECT_STAGING
+    // input_buf unused (grad_act TMA-fed from recv_tokens); drop the input region.
+    const int input_stride = 0;
+#else
     const int input_stride = COMPUTE_BATCH_SIZE * hidden;
+#endif
     const int gu_stride    = COMPUTE_BATCH_SIZE * twoI;
     const int act_stride   = COMPUTE_BATCH_SIZE * intermediate;
     const int down_stride  = COMPUTE_BATCH_SIZE * hidden;
@@ -10363,17 +10382,27 @@ __device__ __forceinline__ void compute_backward_worker_core(
         if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
 #endif
 
-        // ---- gather grad_down (input_buf) and cache X in wgrad_x_slot by recv_token ----
+        // ---- stage weight-grad inputs (wgrad_dz_slot = grad_down, wgrad_x_slot = X) ----
         const int64_t slot_base64 = (int64_t)state->expert_slot_base[expert_id] + start_slot;
-        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
-        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);   // = grad_down
         const int4* bwd_x_i4 = reinterpret_cast<const int4*>(bs->bwd_fc1_input);               // = X
 #if MK_RECV_DIRECT_STAGING
-        // Direct-staging: backward dispatch staged grad_down contiguously into
-        // recv_tokens[expert_slot_base + start_slot ..]. Read it sequentially.
-        // X still comes from bwd_fc1_input keyed by recv_token (saved in forward).
+        // grad_act is TMA-fed from recv_tokens (backward dispatch staged grad_down there),
+        // so input_buf is not filled here. This loop only stages the per-slot weight-grad
+        // inputs for the wgrad GEMMs. Padding rows are unused (dSwiGLU/wgrad bounded by batch_size).
         const int4* rds_recv_tokens_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
-#endif
+        for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
+            int row = idx / hidden_int4;
+            int v = idx - row * hidden_int4;
+            int rt = s_recv_token_idx[row];
+            const int64_t slot = slot_base64 + row;
+            const int4 grad_vec = rds_recv_tokens_i4[slot * hidden_int4 + v];
+            const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
+            reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
+            reinterpret_cast<int4*>(bs->wgrad_x_slot)[slot * hidden_int4 + v] = x_vec;
+        }
+#else
+        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
+        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);   // = grad_down
         int4* grad_down_i4 = reinterpret_cast<int4*>(input_buf);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
             int row = idx / hidden_int4;
@@ -10381,11 +10410,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             if (row < batch_size) {
                 int rt = s_recv_token_idx[row];
                 const int64_t slot = slot_base64 + row;
-#if MK_RECV_DIRECT_STAGING
-                const int4 grad_vec = rds_recv_tokens_i4[slot * hidden_int4 + v];
-#else
                 const int4 grad_vec = combine_input_i4[(int64_t)rt * hidden_int4 + v];
-#endif
                 const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
                 grad_down_i4[idx] = grad_vec;
                 reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
@@ -10394,13 +10419,20 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 grad_down_i4[idx] = make_int4(0, 0, 0, 0);
             }
         }
+#endif
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_input_ns = globaltimer_ns();
 #endif
         if (group_sm_idx == 0) {
+#if MK_RECV_DIRECT_STAGING
+            // input_buf is not filled under direct-staging; grad_down lives in wgrad_dz_slot.
+            trace_backward_values("GRAD-DOWN", bs->wgrad_dz_slot + (size_t)slot_base64 * hidden,
+                                  batch_size * hidden, state->rank, task_idx, expert_id, batch_size);
+#else
             trace_backward_values("GRAD-DOWN", input_buf, batch_size * hidden,
                                   state->rank, task_idx, expert_id, batch_size);
+#endif
             trace_backward_values("ACTIVATION", bs->wgrad_x_slot + (size_t)slot_base64 * hidden,
                                   batch_size * hidden, state->rank, task_idx, expert_id, batch_size);
         }
@@ -10427,13 +10459,23 @@ __device__ __forceinline__ void compute_backward_worker_core(
             } else {
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
+            // grad_act A operand = grad_down. Default per-group input_buf descriptor
+            // (m_base=0); under direct-staging TMA-feed straight from recv_tokens
+            // (backward dispatch staged grad_down there) with the task's row base.
+            const CUtensorMap* gradact_a_desc = &in_atom.a;
+            uint32_t gradact_a_m_base = 0;
+#if MK_RECV_DIRECT_STAGING
+            gradact_a_desc = &state->recv_tokens_a_tma;
+            gradact_a_m_base = (uint32_t)slot_base64;
+#endif
             umma::umma_dgrad_mn_persistent(
-                &in_atom.a,
+                gradact_a_desc,
                 &bs->compute_bwd_tma->wdown[expert_id],
                 &in_atom.act_cd,
                 COMPUTE_BATCH_SIZE, intermediate, hidden,
                 cluster_in_group, num_clusters,
-                cluster_smem, grad_act_accum_iter);
+                cluster_smem, grad_act_accum_iter,
+                gradact_a_m_base);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
