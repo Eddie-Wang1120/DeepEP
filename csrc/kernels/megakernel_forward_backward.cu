@@ -95,7 +95,7 @@ constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
 #define MK_RECV_DIRECT_STAGING 1
 #endif
 #ifndef MK_PRIORITY_ENABLE
-#define MK_PRIORITY_ENABLE 0
+#define MK_PRIORITY_ENABLE 1
 #endif
 #ifndef MK_UMMA_GATEUP
 #define MK_UMMA_GATEUP 1
@@ -3787,7 +3787,6 @@ __device__ __forceinline__ void compute_worker_core(
     __nv_bfloat16* input_buf = state->gemm_workspace + group_id * gemm_stride;
     __nv_bfloat16* gu_buf   = input_buf + input_stride;   // reserved GU scratch [M,2I]
     __nv_bfloat16* up_buf   = gu_buf + gu_stride;         // act = silu(gate)*up*route_w (down-proj A operand)
-    __nv_bfloat16* down_buf = up_buf + act_stride;
 
     auto smem_wmma_buf = reinterpret_cast<float*>(smem_buffer);
 
@@ -4118,6 +4117,7 @@ __device__ __forceinline__ void compute_worker_core(
         // Tail batches run over the fixed task extent: padded act rows hold the
         // SwiGLU of zero-padded gate/up (== 0), so padded down output rows are 0
         // and are masked off by the batch_size-bounded output/reduce below.
+        const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
@@ -4133,13 +4133,23 @@ __device__ __forceinline__ void compute_worker_core(
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
             umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
-            umma::umma_down_persistent(
+            umma::DownScatterParams down_scatter{
+                reinterpret_cast<int4*>(state->combine_input),
+                reinterpret_cast<int4*>(state->compute_output_slot),
+                s_recv_token_idx,
+                s_is_single,
+                slot_base,
+                batch_size,
+                hidden_int4,
+            };
+            umma::umma_down_scatter_persistent(
                 &in_atom.act_a,
                 &state->compute_down_tma->wdown[expert_id],
                 &in_atom.down_cd,
                 gemm_m, hidden, intermediate,
                 cluster_in_group, num_clusters,
-                cluster_smem, umma_accum_iter);
+                cluster_smem, umma_accum_iter,
+                down_scatter);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
@@ -4149,10 +4159,8 @@ __device__ __forceinline__ void compute_worker_core(
         if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
 #endif
 
-        // Per-slot output (change A): every (recv_token, local-expert-hit) writes its OWN
-        // expert-sorted slot row in compute_output_slot. Slots are unique across tasks, so
-        // no write conflict and no atomic. Same-rank multi-expert reduce is deferred to the
-        // combine sender (change C), which gathers a token's nh slots and fp32-sums them.
+        // Backward activation save: the down output is now written directly in the
+        // UMMA epilogue, so this tail only preserves fc1 input X by recv_token.
 #if MK_PERF_TRACE_ARGS
         if (thread_id == 0) {
             int multi_rows = 0;
@@ -4163,15 +4171,6 @@ __device__ __forceinline__ void compute_worker_core(
         __syncthreads();
 #endif
 
-        // Merged output scatter + backward activation save: one pass over
-        // batch_size*hidden_int4 (shared row/v index math). Output goes to
-        // combine_input (single-hit) or compute_output_slot (multi-hit); the fc1
-        // input X is saved by recv_token for backward.
-        // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
-        const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
-        int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
-        int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
-        const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         const bool save_bwd = (state->bwd_fc1_input != nullptr);
         int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
 #if MK_RECV_DIRECT_STAGING
@@ -4185,10 +4184,6 @@ __device__ __forceinline__ void compute_worker_core(
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
             int rt = s_recv_token_idx[row];
-            if (s_is_single[row])
-                token_out_i4[(int64_t)rt * hidden_int4 + v] = down_i4[idx];
-            else
-                slot_out_i4[(int64_t)(slot_base + row) * hidden_int4 + v] = down_i4[idx];
             if (save_bwd) {
 #if MK_RECV_DIRECT_STAGING
                 bwd_in_i4[(int64_t)rt * hidden_int4 + v] =
@@ -4201,10 +4196,8 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
-        // device-scope fence: combine_worker reads compute_output_slot on the same GPU
-        // (different SM, same kernel launch), so device-scope visibility is sufficient.
-        // Each thread fences its own per-slot writes before the group sync lets any SM
-        // publish ready flags.
+        // Device-scope fence: the UMMA epilogue has already made the down output visible.
+        // Fence the backward-save writes before any SM publishes ready flags.
         __threadfence();
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
@@ -4212,11 +4205,11 @@ __device__ __forceinline__ void compute_worker_core(
 #endif
 
         // ==== Signal: per-token ready publish ====
-        // compute wrote per-slot rows into compute_output_slot. The same-rank multi-expert
-        // reduce is now done by the combine sender / gather worker, which gather a token's nh
-        // slots and fp32-sum them before sending. Compute only advances token_done_count and
-        // publishes nhits==1 tokens directly; nhits>1 tokens are claimed/enqueued by gather
-        // scheduler lanes (tid >= GATHER_SCHED_TID_BEGIN) once all local expert slots are done.
+        // Down epilogue already wrote per-slot rows into compute_output_slot / combine_input.
+        // The same-rank multi-expert reduce is now done by the combine sender / gather worker,
+        // which gather a token's nh slots and fp32-sum them before sending. Compute only
+        // advances token_done_count and publishes nhits==1 tokens directly; nhits>1 tokens are
+        // claimed/enqueued by gather scheduler lanes once all local expert slots are done.
         {
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) {
@@ -8429,9 +8422,11 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(priority_batch_retry_epoch, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
 
     // GEMM workspace: per-compute-group batched intermediates for M=128 compute batches.
-    // Layout: [input(M*hidden)][GU scratch(M*2I)][act(M*I)][down(M*hidden)].
-    // The interleaved gate/up path writes act directly from the GEMM epilogue; the
-    // GU scratch region remains reserved so existing descriptors/helpers stay valid.
+    // Layout still keeps the legacy [input(M*hidden)][GU scratch(M*2I)][act(M*I)][down(M*hidden)]
+    // footprint so the forward/backward workspace shape stays stable, but the forward down path
+    // now writes directly to its final destinations and no longer consumes the down slice.
+    // The interleaved gate/up path writes act directly from the GEMM epilogue; the GU scratch
+    // region remains reserved so existing descriptors/helpers stay valid.
     // Under MK_RECV_DIRECT_STAGING the input region is dropped (input_buf unused: gate/up
     // and grad_act are TMA-fed from recv_tokens), matching the device gemm_stride.
 #if MK_RECV_DIRECT_STAGING

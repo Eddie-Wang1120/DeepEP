@@ -49,6 +49,17 @@ namespace umma {
 
 using namespace cute;
 
+// Down-proj row-scatter epilogue used by the migrated megakernel path.
+struct DownScatterParams {
+    int4* combine_input_i4;
+    int4* compute_output_slot_i4;
+    const int* recv_token_idx;
+    const unsigned char* is_single;
+    int slot_base;
+    int valid_rows;
+    int hidden_int4;
+};
+
 // Named barrier over exactly the 128 threads (4 warps) that run the UMMA kernel
 // inside an 800-thread megakernel block. Plain __syncthreads() would wait for all
 // 800 threads and deadlock, since only thread_id<128 enter this code path.
@@ -116,8 +127,14 @@ using SBLayout_t = decltype(make_sB_layout());
 // descriptor smem box (LOAD_BLOCK_M/N) must match the device-side LOAD_BLOCK
 // used in dg_gemm_tile, which divides by the multicast factor.
 static constexpr uint32_t kDgBlockM     = 128;
-static constexpr uint32_t kDgBlockN     = 128;
-static constexpr uint32_t kDgBlockK     = 64;
+#ifndef MK_DG_BLOCK_N
+#define MK_DG_BLOCK_N 128
+#endif
+#ifndef MK_DG_BLOCK_K
+#define MK_DG_BLOCK_K 64
+#endif
+static constexpr uint32_t kDgBlockN     = MK_DG_BLOCK_N;
+static constexpr uint32_t kDgBlockK     = MK_DG_BLOCK_K;
 static constexpr uint32_t kDgSwizzleA   = 128;
 static constexpr uint32_t kDgSwizzleB   = 128;
 static constexpr uint32_t kDgSwizzleCD  = 128;
@@ -144,12 +161,22 @@ static constexpr uint32_t kDgStoreBlockN = kDgSwizzleCD / sizeof(cutlass::bfloat
 // kNumEpilogueThreads: epilogue store warps = 4 warps * 32 = 128 (= STORE_BLOCK_M).
 // kNumTmemCols: get_num_aligned_tmem_cols<kNumEpilogueStages * UMMA_N>
 //   = get_num_aligned_tmem_cols<2 * 128> = get_num_aligned_tmem_cols<256> = 256.
-static constexpr int kDgWsNumStages         = 4;
-static constexpr int kDgWsNumEpilogueStages = 2;
-static constexpr int kDgWsNumTmaStoreStages = 2;
+#ifndef MK_DG_NUM_STAGES
+#define MK_DG_NUM_STAGES 4
+#endif
+#ifndef MK_DG_EPI_STAGES
+#define MK_DG_EPI_STAGES 2
+#endif
+#ifndef MK_DG_TMA_STORE_STAGES
+#define MK_DG_TMA_STORE_STAGES 2
+#endif
+static constexpr int kDgWsNumStages         = MK_DG_NUM_STAGES;
+static constexpr int kDgWsNumEpilogueStages = MK_DG_EPI_STAGES;
+static constexpr int kDgWsNumTmaStoreStages = MK_DG_TMA_STORE_STAGES;
 static constexpr int kDgWsNonEpiThreads     = 128;   // 4 warps: warp0=TMA, warp1=MMA, warp2=alloc, warp3=idle
 static constexpr int kDgWsEpiThreads        = 128;   // 4 warps: warps[4..7] = epilogue
-static constexpr int kDgWsNumTmemCols       = 256;   // align_tmem(kNumEpilogueStages * BLOCK_N) = align_tmem(256) = 256
+// align_tmem(kNumEpilogueStages * BLOCK_N); depends on BLOCK_N so it tracks tuning.
+static constexpr int kDgWsNumTmemCols       = (kDgWsNumEpilogueStages * kDgBlockN + 31) / 32 * 32;
 
 // Build a 2D TMA descriptor exactly like umma_swiglu_ws_dg.cu::make_tma_2d.
 inline CUtensorMap dg_make_tma_2d(const void* ptr, CUtensorMapDataType dtype,
@@ -847,6 +874,117 @@ __device__ void dg_gemm_tile(
 #undef MK_DG_DBG
 }
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N,
+          uint32_t STORE_BLOCK_M, uint32_t STORE_BLOCK_N,
+          uint32_t kSwizzleCDMode,
+          uint32_t kNumTMAStoreStages,
+          uint32_t kNumUMMAStoreThreads,
+          typename cd_dtype_t,
+          typename epilogue_type_t,
+          typename pattern_cd_t>
+CUTLASS_DEVICE void sm100_store_cd_row_scatter(
+    const deep_gemm::utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma_stage_idx,
+    const uint32_t& tmem_base_addr,
+    const uint32_t& base_m_idx, const uint32_t& base_n_idx,
+    const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
+    const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
+    const DownScatterParams& scatter) {
+
+    using namespace deep_gemm;
+
+    constexpr uint32_t kNumBankGroupBytes = 16;
+    constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
+    static_assert(kSwizzleCDMode == 128, "This down-scatter path assumes 128B CD swizzle");
+    static_assert(kNumElemsPerBankGroup == 8, "BF16 down scatter expects 8 BF16 per segment");
+    static_assert(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Only BF16 output is supported");
+    static_assert(STORE_BLOCK_M == 128 && STORE_BLOCK_N == 64 && BLOCK_N == 128,
+                  "Expected current DeepGEMM tile shape");
+
+    auto advance_store_pipeline = [&]() {
+        tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
+    };
+
+    constexpr uint32_t kNumMWaves = BLOCK_M / STORE_BLOCK_M;
+    constexpr uint32_t kSegmentsPerStoreRow = STORE_BLOCK_N / kNumElemsPerBankGroup;
+    constexpr uint32_t kScatterItems = STORE_BLOCK_M * kSegmentsPerStoreRow;
+
+    #pragma unroll
+    for (uint32_t w = 0; w < kNumMWaves; ++w) {
+        constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
+        #pragma unroll
+        for (uint32_t s = 0; s < kNumStores; ++s, advance_store_pipeline()) {
+            auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
+            if (epilogue_warp_idx == 0)
+                cute::tma_store_wait<kNumTMAStoreStages - 1>();
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
+            const auto m_idx = base_m_idx + w * STORE_BLOCK_M;
+            const auto n_idx = epilogue_type_t::template apply_index_n<STORE_BLOCK_N>(base_n_idx + s * STORE_BLOCK_N);
+
+            #pragma unroll
+            for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++i) {
+                auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+                constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+                auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+                auto col = kHasShortcut ? (i) : (bank_group_index % 8);
+                col ^= row % (kSwizzleCDMode / 16);
+
+                uint32_t tmem_addr = tmem_base_addr + w * BLOCK_N + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
+                auto smem_ptr = smem_base_ptr +
+                                epilogue_warp_idx * 32 * kSwizzleCDMode +
+                                row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
+
+                uint32_t values[kNumElemsPerBankGroup];
+                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                    values[0], values[1], values[2], values[3],
+                    values[4], values[5], values[6], values[7]);
+                cutlass::arch::fence_view_async_tmem_load();
+                ptx::st_shared(
+                    smem_ptr,
+                    math::cast_into_bf16_and_pack(values[0], values[1]),
+                    math::cast_into_bf16_and_pack(values[2], values[3]),
+                    math::cast_into_bf16_and_pack(values[4], values[5]),
+                    math::cast_into_bf16_and_pack(values[6], values[7]));
+            }
+
+            if (w == kNumMWaves - 1 && s == kNumStores - 1) {
+                ptx::tcgen05_before_thread_sync();
+                tmem_empty_barrier->arrive(0u);
+            }
+
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
+            const uint32_t epi_tid = epilogue_warp_idx * 32 + lane_idx;
+            for (uint32_t item = epi_tid; item < kScatterItems; item += kNumUMMAStoreThreads) {
+                const uint32_t row_in_store = item / kSegmentsPerStoreRow;
+                const uint32_t seg = item - row_in_store * kSegmentsPerStoreRow;
+                const uint32_t global_row = m_idx + row_in_store;
+                if (global_row >= static_cast<uint32_t>(scatter.valid_rows)) continue;
+
+                const uint32_t row_in_warp = row_in_store & 31u;
+                const uint32_t warp_row_group = row_in_store >> 5;
+                const uint32_t bank_group = seg ^ (row_in_warp & 7u);
+                const auto smem_ptr = smem_base_ptr +
+                    warp_row_group * 32 * kSwizzleCDMode +
+                    row_in_warp * (kNumBankGroupBytes * 8) +
+                    bank_group * kNumBankGroupBytes;
+                const int4 packed = *reinterpret_cast<const int4*>(smem_ptr);
+
+                const int recv_token = scatter.recv_token_idx[global_row];
+                const uint32_t hidden_i4 = (n_idx >> 3) + seg;
+                if (scatter.is_single[global_row]) {
+                    scatter.combine_input_i4[(int64_t)recv_token * scatter.hidden_int4 + hidden_i4] = packed;
+                } else {
+                    scatter.compute_output_slot_i4[(int64_t)(scatter.slot_base + global_row) * scatter.hidden_int4 + hidden_i4] = packed;
+                }
+            }
+
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+            __syncwarp();
+        }
+    }
+}
+
 // ===========================================================================
 // dg_gemm_persistent — DeepGEMM persistent warp-specialized GEMM over a TILE
 // SEQUENCE (not a single tile). barriers/TMEM are init/alloc'd ONCE by the
@@ -880,7 +1018,8 @@ __device__ void dg_gemm_persistent(
     // A-operand row base offset into desc_a's global tensor. Default 0 keeps the
     // legacy behavior (desc_a points at a per-group buffer with M origin at row 0).
     // When A is a shared buffer (e.g. recv_tokens), pass expert_slot_base+start_slot.
-    uint32_t m_base = 0) {
+    uint32_t m_base = 0,
+    const DownScatterParams* scatter_params = nullptr) {
 
     using namespace deep_gemm;
     using L = DgSmemLayout<kNumMulticast>;
@@ -1073,6 +1212,13 @@ __device__ void dg_gemm_persistent(
                 (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0, 0,
                  epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
                  tensor_map_cd, gate_ptr, route_ptr, stride_n);
+            } else if (scatter_params != nullptr) {
+                sm100_store_cd_row_scatter<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    cutlass::bfloat16_t, epilogue::transform::EpilogueIdentity>
+                (smem_cd, tma_stage_idx, tmem_base_addr, m_idx0, n_idx0,
+                 epilogue_warp_idx, lane_idx, tmem_empty_barriers[accum_stage_idx],
+                 *scatter_params);
             } else {
                 epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kDgSwizzleCD, kNumTMAStoreStages, kNumUMMAStoreThreads,
@@ -1247,6 +1393,21 @@ __device__ inline void umma_down_persistent(
         (uint32_t)M, (uint32_t)hidden, (uint32_t)intermediate,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
         nullptr, nullptr, 0);
+}
+
+__device__ inline void umma_down_scatter_persistent(
+    const CUtensorMap* desc_act_a, const CUtensorMap* desc_wdown, const CUtensorMap* desc_down_cd,
+    int M, int hidden, int intermediate,
+    int cluster_idx, int num_clusters,
+    char* cluster_smem, uint32_t& accum_iter,
+    const DownScatterParams& scatter) {
+
+    dg_gemm_persistent<false, kDgRunMulticast>(
+        desc_act_a, desc_wdown, desc_down_cd,
+        (uint32_t)M, (uint32_t)hidden, (uint32_t)intermediate,
+        cluster_idx, num_clusters, cluster_smem, accum_iter,
+        nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0, 0, 0xffffffffu, 0,
+        &scatter);
 }
 
 // Backward dgrad consumes original weights in [K,N] row-major form and asks the
