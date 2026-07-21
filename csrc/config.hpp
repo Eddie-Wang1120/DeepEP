@@ -12,23 +12,18 @@ constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
 constexpr int kComputeSchedulerSms = 1;
 constexpr int kGatherSms = 3;
 constexpr int kCombineStartHeadPercent = 50;  // Combine SM waits until compute_task_head / tail >= this %
-constexpr int kPrioritySchedTidBegin = 576;
 constexpr int kGatherSchedTidBegin = 608;
-constexpr int kNormalSchedThreads = kPrioritySchedTidBegin;
+constexpr int kNormalSchedThreads = 576;  // normal scheduler lanes [0,576); [576,608) reserved; gather [608,800)
 constexpr int kGatherSchedMaxWarps = 6;
 constexpr int kComputeClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
 constexpr int kTimeoutLogBudget = 8;
-constexpr int kPriorityScanWindowTokens = 512;
-constexpr int kPriorityMaxEnqueuePerLoop = 8;
-constexpr int kPriorityAlreadySkipEpochs = 16;
-constexpr int kPriorityNotReadyRetryEpochs = 2;
 constexpr int kDispatchRoleCount = 5;
 constexpr int kPubRingDepth = 128;
 constexpr int kPubConsumeBatch = 16;
 constexpr int kPubProduceBatch = 16;
 
-static_assert(kGatherSchedTidBegin >= kPrioritySchedTidBegin,
-              "gather scheduler threads must begin after priority scheduler threads");
+static_assert(kGatherSchedTidBegin >= kNormalSchedThreads,
+              "gather scheduler lanes must begin after normal scheduler lanes");
 static_assert(kGatherSchedMaxWarps == (800 - kGatherSchedTidBegin) / 32,
               "kGatherSchedMaxWarps must match the scheduler thread partition");
 static_assert(kComputeGroupSize > 0, "kComputeGroupSize must be positive");
