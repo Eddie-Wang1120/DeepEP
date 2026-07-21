@@ -132,14 +132,14 @@ if __name__ == '__main__':
         nvcc_flags.append('-DGATHER_ALIGN')
 
     # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
-    #   0 = WMMA, 1 = 1-CTA UMMA, 2 = 2-CTA UMMA (default)
-    mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '2'))
-    assert mk_compute_kernel in (0, 1, 2), 'MK_COMPUTE_KERNEL must be 0, 1, or 2'
+    #   1 = 1-CTA UMMA (default), 2 = 2-CTA UMMA. (WMMA path removed.)
+    mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '1'))
+    assert mk_compute_kernel in (1, 2), 'MK_COMPUTE_KERNEL must be 1 or 2 (WMMA path removed)'
     cxx_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
     nvcc_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
 
     # Narrow UMMA diagnostics. Defaults keep the production path unchanged.
-    for name in ('MK_UMMA_SAVE_PREACT', 'MK_UMMA_GATEUP', 'MK_UMMA_DOWN'):
+    for name in ('MK_UMMA_GATEUP', 'MK_UMMA_DOWN'):
         value = int(os.getenv(name, '1'))
         assert value in (0, 1), f'{name} must be 0 or 1'
         cxx_flags.append(f'-D{name}={value}')

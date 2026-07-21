@@ -72,9 +72,6 @@ constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
 constexpr int GATHER_SCHED_MAX_WARPS = megakernel_config::kGatherSchedMaxWarps;
 constexpr int MK_COMPUTE_CLUSTER_DIM = megakernel_config::kComputeClusterDim;
 constexpr int COMBINE_START_HEAD_PERCENT = megakernel_config::kCombineStartHeadPercent;
-constexpr int WMMA_M = megakernel_config::kWmmaM;
-constexpr int WMMA_N = megakernel_config::kWmmaN;
-constexpr int WMMA_K = megakernel_config::kWmmaK;
 constexpr int MK_TIMEOUT_LOG_BUDGET = megakernel_config::kTimeoutLogBudget;
 constexpr int MK_PRIORITY_SCAN_WINDOW_TOKENS = megakernel_config::kPriorityScanWindowTokens;
 constexpr int MK_PRIORITY_MAX_ENQUEUE_PER_LOOP = megakernel_config::kPriorityMaxEnqueuePerLoop;
@@ -99,9 +96,6 @@ constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
 #endif
 #ifndef MK_PRIORITY_ENABLE
 #define MK_PRIORITY_ENABLE 0
-#endif
-#ifndef MK_UMMA_SAVE_PREACT
-#define MK_UMMA_SAVE_PREACT 1
 #endif
 #ifndef MK_UMMA_GATEUP
 #define MK_UMMA_GATEUP 1
@@ -336,6 +330,10 @@ struct MegaKernelState {
     umma::ComputeDownTmaAtoms* compute_down_tma;  // device ptr; wdown[e]
     umma::InputTmaAtom_t* group_input_tma;   // device array [num_compute_groups]
     int num_compute_groups;                  // for indexing group_input_tma / barriers
+    // Global TMA A-descriptor over recv_tokens[total_expert_slots + COMPUTE_BATCH_SIZE, hidden].
+    // Used by MK_RECV_DIRECT_STAGING to TMA-feed the gate/up GEMM directly from recv_tokens
+    // (A row base = expert_slot_base+start_slot passed as m_base), skipping the input_buf gather.
+    CUtensorMap recv_tokens_a_tma;
 
     // --- Compute output buffer ---
     __nv_bfloat16* combine_input;     // [max_total_recv_tokens, hidden] DeepEP compact recv-token namespace
@@ -761,207 +759,10 @@ __device__ __forceinline__ bool mk_debug_check_float_vector(
 // ============================================================================
 // FP8 routing helpers
 // ============================================================================
-// Device GEMM using wmma (for compute phase)
+// ============================================================================
+// (WMMA compute helpers removed — UMMA/tcgen05 is the only compute path.)
 // ============================================================================
 
-using namespace nvcuda;
-
-__device__ void device_gemm_bf16(
-    const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
-    const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (transposed access)
-    __nv_bfloat16* __restrict__ C,        // [M, N] row-major
-    int M, int K, int N,
-    int tile_warp_id, int num_tile_warps,
-    int smem_warp_id,
-    float* smem_buf
-) {
-    const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
-    const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
-    const int total_tiles = tiles_m * tiles_n;
-
-    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
-        int tile_row = tile_idx / tiles_n;
-        int tile_col = tile_idx % tiles_n;
-        int row_offset = tile_row * WMMA_M;
-        int col_offset = tile_col * WMMA_N;
-
-        if (row_offset >= M || col_offset >= N) continue;
-
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-        wmma::fill_fragment(c_frag, 0.0f);
-
-        for (int k = 0; k < K; k += WMMA_K) {
-            wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
-            wmma::load_matrix_sync(b_frag, B + col_offset * K + k, K);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-
-        float* c_buf = smem_buf + smem_warp_id * WMMA_M * WMMA_N;
-        wmma::store_matrix_sync(c_buf, c_frag, WMMA_N, wmma::mem_row_major);
-        __syncwarp();
-
-        int lane_id = threadIdx.x % 32;
-        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-            int row = i / WMMA_N;
-            int col = i % WMMA_N;
-            int out_row = row_offset + row;
-            int out_col = col_offset + col;
-            if (out_row < M && out_col < N) {
-                C[out_row * N + out_col] = __float2bfloat16(c_buf[i]);
-            }
-        }
-    }
-}
-
-__device__ void device_gemm_bf16_mn(
-    const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
-    const __nv_bfloat16* __restrict__ B,  // [K, N] row-major
-    __nv_bfloat16* __restrict__ C,        // [M, N] row-major
-    int M, int K, int N,
-    int tile_warp_id, int num_tile_warps,
-    int smem_warp_id,
-    float* smem_buf
-) {
-    const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
-    const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
-    const int total_tiles = tiles_m * tiles_n;
-
-    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
-        int tile_row = tile_idx / tiles_n;
-        int tile_col = tile_idx % tiles_n;
-        int row_offset = tile_row * WMMA_M;
-        int col_offset = tile_col * WMMA_N;
-
-        if (row_offset >= M || col_offset >= N) continue;
-
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-        wmma::fill_fragment(c_frag, 0.0f);
-
-        for (int k = 0; k < K; k += WMMA_K) {
-            wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
-            wmma::load_matrix_sync(b_frag, B + k * N + col_offset, N);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-
-        float* c_buf = smem_buf + smem_warp_id * WMMA_M * WMMA_N;
-        wmma::store_matrix_sync(c_buf, c_frag, WMMA_N, wmma::mem_row_major);
-        __syncwarp();
-
-        int lane_id = threadIdx.x % 32;
-        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-            int row = i / WMMA_N;
-            int col = i % WMMA_N;
-            int out_row = row_offset + row;
-            int out_col = col_offset + col;
-            if (out_row < M && out_col < N) {
-                C[out_row * N + out_col] = __float2bfloat16(c_buf[i]);
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Fused gate+up GEMM with in-register SwiGLU epilogue.
-//
-// Computes act = silu(gate) * up * route_weight in a single pass:
-//   gate = A @ W_gateup[0::2]^T   (A:[M,K], W_gateup:[2N,K])
-//   up   = A @ W_gateup[1::2]^T   (same shapes, N = intermediate)
-// For each N-tile, both gate and up accumulators stay in registers; SwiGLU is
-// applied before any store. Only the activation `act` ([M,N]) is written to GMEM,
-// eliminating the two GMEM round-trips for gate_buf/up_buf and the standalone
-// SwiGLU read-modify-write loop.
-//
-// route_w[row] is the per-token route weight (already gathered by caller);
-// rows >= valid_rows are written as 0 so the downstream W_down GEMM is unaffected.
-// ============================================================================
-__device__ void device_gemm_swiglu_fused(
-    const __nv_bfloat16* __restrict__ A,       // [M, K] row_major
-    const __nv_bfloat16* __restrict__ W_gateup, // [2N, K] rows [g0,u0,g1,u1,...]
-    __nv_bfloat16* __restrict__ act,            // [M, N] row_major output
-    const float* __restrict__ route_w,         // [M] per-row route weight
-    int valid_rows,                            // rows < valid_rows are real tokens
-    int M, int K, int N,
-    int tile_warp_id, int num_tile_warps,
-    int smem_warp_id,
-    float* smem_buf,
-    __nv_bfloat16* __restrict__ preact = nullptr,
-    const int* __restrict__ preact_recv_idx = nullptr,
-    const int* __restrict__ preact_topk_idx = nullptr,
-    int num_topk = 0,
-    int preact_stride = 0
-) {
-    const int tiles_m = (M + WMMA_M - 1) / WMMA_M;
-    const int tiles_n = (N + WMMA_N - 1) / WMMA_N;
-    const int total_tiles = tiles_m * tiles_n;
-    const int lane_id = threadIdx.x % 32;
-
-    // Two separate SMEM scratch regions per warp (gate / up) to avoid races.
-    float* gate_buf = smem_buf + smem_warp_id * (2 * WMMA_M * WMMA_N);
-    float* up_buf   = gate_buf + WMMA_M * WMMA_N;
-
-    for (int tile_idx = tile_warp_id; tile_idx < total_tiles; tile_idx += num_tile_warps) {
-        int tile_row = tile_idx / tiles_n;
-        int tile_col = tile_idx % tiles_n;
-        int row_offset = tile_row * WMMA_M;
-        int col_offset = tile_col * WMMA_N;
-
-        if (row_offset >= M || col_offset >= N) continue;
-
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> bg_frag;
-        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> bu_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> cg_frag;
-        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> cu_frag;
-
-        wmma::fill_fragment(cg_frag, 0.0f);
-        wmma::fill_fragment(cu_frag, 0.0f);
-
-        // A tile is shared between gate and up GEMM (loaded once per K step).
-        for (int k = 0; k < K; k += WMMA_K) {
-            wmma::load_matrix_sync(a_frag, A + row_offset * K + k, K);
-            wmma::load_matrix_sync(bg_frag, W_gateup + (2 * col_offset) * K + k, 2 * K);
-            wmma::load_matrix_sync(bu_frag, W_gateup + (2 * col_offset + 1) * K + k, 2 * K);
-            wmma::mma_sync(cg_frag, a_frag, bg_frag, cg_frag);
-            wmma::mma_sync(cu_frag, a_frag, bu_frag, cu_frag);
-        }
-
-        wmma::store_matrix_sync(gate_buf, cg_frag, WMMA_N, wmma::mem_row_major);
-        wmma::store_matrix_sync(up_buf,   cu_frag, WMMA_N, wmma::mem_row_major);
-        __syncwarp();
-
-        // In-register (SMEM-staged) SwiGLU epilogue: silu(gate) * up * route_w.
-        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-            int row = i / WMMA_N;
-            int col = i % WMMA_N;
-            int out_row = row_offset + row;
-            int out_col = col_offset + col;
-            if (out_row >= M || out_col >= N) continue;
-            if (out_row < valid_rows) {
-                float g = gate_buf[i];
-                float u = up_buf[i];
-                float silu_g = g * (1.0f / (1.0f + __expf(-g)));
-                act[out_row * N + out_col] = __float2bfloat16(silu_g * u * route_w[out_row]);
-                if (preact != nullptr && preact_recv_idx != nullptr && preact_topk_idx != nullptr) {
-                    const int recv_idx = preact_recv_idx[out_row];
-                    const int topk_idx = preact_topk_idx[out_row];
-                    if (recv_idx >= 0 && topk_idx >= 0) {
-                        __nv_bfloat16* preact_row = preact + ((int64_t)recv_idx * num_topk + topk_idx) * preact_stride;
-                        preact_row[2 * out_col] = __float2bfloat16(g);
-                        preact_row[2 * out_col + 1] = __float2bfloat16(u);
-                    }
-                }
-            } else {
-                act[out_row * N + out_col] = __float2bfloat16(0.0f);
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Dispatch Worker v2: Complete copy of DeepEP internode.cu dispatch function
@@ -3993,10 +3794,7 @@ __device__ __forceinline__ void compute_worker_core(
         ComputeUmmaSmemLayout::kNumStages *
             (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
         kComputeUmmaBarrierBytes;
-    constexpr size_t kComputeWmmaScratchBytes =
-        (kNumCombineForwarderWarps + 1) * 2 * WMMA_M * WMMA_N * sizeof(float);
-    constexpr size_t kComputeScratchBytes =
-        kComputeWmmaScratchBytes > kComputeUmmaScratchBytes ? kComputeWmmaScratchBytes : kComputeUmmaScratchBytes;
+    constexpr size_t kComputeScratchBytes = kComputeUmmaScratchBytes;
     constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
 
     constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
@@ -4114,10 +3912,16 @@ __device__ __forceinline__ void compute_worker_core(
         //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
         //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        static_assert(kUseUmmaCompute, "WMMA compute path removed; MK_COMPUTE_KERNEL must be 1 (1-CTA) or 2 (2-CTA UMMA)");
         constexpr bool kUseUmmaGateup = kUseUmmaCompute && (MK_UMMA_GATEUP != 0);
         constexpr bool kUseUmmaDown = kUseUmmaCompute && (MK_UMMA_DOWN != 0);
         const bool use_umma_gateup_for_group = kUseUmmaGateup && group_size == COMPUTE_GROUP_SIZE;
         const bool use_umma_down_for_group = kUseUmmaDown && group_size == COMPUTE_GROUP_SIZE;
+        // WMMA fallback removed: a group that reaches compute MUST be a full UMMA group.
+        // Partial groups (group_size != COMPUTE_GROUP_SIZE) have no compute path now — trap
+        // loudly instead of silently skipping the GEMM. Requires num_compute_sms AND any
+        // combine-precompute SM span to be multiples of COMPUTE_GROUP_SIZE.
+        EP_DEVICE_ASSERT(use_umma_gateup_for_group && use_umma_down_for_group);
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
@@ -4214,22 +4018,15 @@ __device__ __forceinline__ void compute_worker_core(
 #endif
 
         const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
+#if MK_RECV_DIRECT_STAGING
+        // TMA-feed: the gate/up GEMM reads this task's tokens directly from
+        // recv_tokens via TMA (recv_tokens descriptor + m_base = expert_slot_base+
+        // start_slot, set at the umma_gateup call below). No input_buf gather and no
+        // post-gather compute_group_sync are needed — recv_tokens was written and
+        // fenced by dispatch before the task was enqueued.
+#else
         const int input_vec_stride = gemm_m * hidden_int4;
         int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
-#if MK_RECV_DIRECT_STAGING
-        // Direct-staging: dispatch already placed this task's tokens contiguously
-        // in recv_tokens[expert_slot_base + start_slot .. + batch_size). Read them
-        // sequentially (coalesced) instead of gathering scattered combine_input rows.
-        const int rds_slot_base = state->expert_slot_base[expert_id] + start_slot;
-        const int4* recv_tokens_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
-        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
-            int row = idx / hidden_int4;
-            int v = idx - row * hidden_int4;
-            input_buf_i4[idx] = (row < batch_size)
-                ? recv_tokens_i4[(int64_t)(rds_slot_base + row) * hidden_int4 + v]
-                : make_int4(0, 0, 0, 0);
-        }
-#else
         const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
         for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
             int row = idx / hidden_int4;
@@ -4238,8 +4035,8 @@ __device__ __forceinline__ void compute_worker_core(
                 ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
                 : make_int4(0, 0, 0, 0);
         }
-#endif
         compute_group_sync(state, group_id, group_size);
+#endif
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_input_ns = globaltimer_ns();
 #endif
@@ -4278,28 +4075,28 @@ __device__ __forceinline__ void compute_worker_core(
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
             umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
+            // A operand: default per-group input_buf descriptor (m_base=0). Under
+            // direct-staging, TMA-feed straight from recv_tokens with the task's row
+            // base (expert_slot_base+start_slot) so no input_buf gather is needed.
+            const CUtensorMap* gateup_a_desc = &in_atom.a;
+            uint32_t gateup_a_m_base = 0;
+#if MK_RECV_DIRECT_STAGING
+            gateup_a_desc = &state->recv_tokens_a_tma;
+            gateup_a_m_base = (uint32_t)(state->expert_slot_base[expert_id] + start_slot);
+#endif
             umma::umma_gateup_interleaved_persistent(
-                &in_atom.a,
+                gateup_a_desc,
                 &state->compute_tma->wgateup[expert_id],
                 &in_atom.act_cd,
                 s_route_w,
                 gemm_m, intermediate, hidden,
                 cluster_in_group, num_clusters,
                 cluster_smem, umma_accum_iter,
-                (MK_UMMA_SAVE_PREACT != 0) ? reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact) : nullptr,
+                // Always save gate/up preact for backward (WMMA recompute fallback removed).
+                reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact),
                 s_recv_token_idx, s_topk_slot,
                 /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
-                0, 2 * intermediate, batch_size);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_up_body_ns = globaltimer_ns();
-#endif
-            compute_group_sync(state, group_id, group_size);
-        } else {
-            device_gemm_swiglu_fused(input_buf, w_gateup, up_buf, s_route_w,
-                                     batch_size, batch_size, hidden, intermediate,
-                                     group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf,
-                                     state->bwd_preact, s_recv_token_idx, s_topk_slot,
-                                     /* preact num_topk = 0: s_topk_slot carries compact slot */ 0, 2 * intermediate);
+                0, 2 * intermediate, batch_size, gateup_a_m_base);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
@@ -4341,13 +4138,6 @@ __device__ __forceinline__ void compute_worker_core(
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
             compute_group_sync(state, group_id, group_size);
-        } else {
-            device_gemm_bf16(up_buf, w_down, down_buf, batch_size, intermediate, hidden,
-                              group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_down_body_ns = globaltimer_ns();
-#endif
-            compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
@@ -4370,15 +4160,21 @@ __device__ __forceinline__ void compute_worker_core(
         // Merged output scatter + backward activation save: one pass over
         // batch_size*hidden_int4 (shared row/v index math). Output goes to
         // combine_input (single-hit) or compute_output_slot (multi-hit); the fc1
-        // input X (still in input_buf) is saved by recv_token for backward.
+        // input X is saved by recv_token for backward.
         // Multi-hit tokens write the same X, so the by-recv_token store is idempotent.
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
         int4* slot_out_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
         const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         const bool save_bwd = (state->bwd_fc1_input != nullptr);
-        const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
         int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
+#if MK_RECV_DIRECT_STAGING
+        // input_buf is no longer filled (gate/up TMA-fed from recv_tokens); the fc1
+        // input X for backward comes straight from recv_tokens[slot_base+row].
+        const int4* bwd_x_src_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
+#else
+        const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
+#endif
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
@@ -4387,8 +4183,14 @@ __device__ __forceinline__ void compute_worker_core(
                 token_out_i4[(int64_t)rt * hidden_int4 + v] = down_i4[idx];
             else
                 slot_out_i4[(int64_t)(slot_base + row) * hidden_int4 + v] = down_i4[idx];
-            if (save_bwd)
+            if (save_bwd) {
+#if MK_RECV_DIRECT_STAGING
+                bwd_in_i4[(int64_t)rt * hidden_int4 + v] =
+                    bwd_x_src_i4[(int64_t)(slot_base + row) * hidden_int4 + v];
+#else
                 bwd_in_i4[(int64_t)rt * hidden_int4 + v] = bwd_in_src_i4[idx];
+#endif
+            }
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
@@ -8409,8 +8211,17 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&expert_slot_ready, total_expert_slots * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_slot_ready, 0, total_expert_slots * sizeof(int)));
     size_t recv_tokens_bytes = total_expert_slots * hidden_dim * sizeof(__nv_bfloat16);
+    // recv_tokens gets COMPUTE_BATCH_SIZE extra rows of tail padding so the gate/up
+    // GEMM's TMA A-load (m_base + gemm_m, gemm_m rounded up to the 128-row UMMA tile)
+    // for the last expert's tail batch never reads past the buffer. Only the tail
+    // padding is zeroed (real slots are written by dispatch; padding rows are masked
+    // by valid_rows in the epilogue but we keep them defined to avoid NaN/Inf reads).
+    size_t recv_tokens_padded_bytes =
+        ((size_t)total_expert_slots + megakernel_config::kComputeBatchSize) * hidden_dim * sizeof(__nv_bfloat16);
     arena = &transient_arena;
-    CUDA_CHECK(cudaMalloc(&recv_tokens, recv_tokens_bytes));
+    CUDA_CHECK(cudaMalloc(&recv_tokens, recv_tokens_padded_bytes));
+    CUDA_CHECK(cudaMemset(recv_tokens + total_expert_slots * hidden_dim, 0,
+                          (size_t)megakernel_config::kComputeBatchSize * hidden_dim * sizeof(__nv_bfloat16)));
     arena = &persistent_arena;
 
     CUDA_CHECK(cudaMalloc(&expert_token_offsets, num_local_experts * sizeof(int)));
@@ -8979,6 +8790,13 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.compute_down_tma = d_compute_down_tma;
     host_state.group_input_tma = d_group_input_tma;
     host_state.num_compute_groups = num_compute_groups;
+    // Global recv_tokens A-descriptor (padded M so the last expert's tail batch TMA
+    // A-load stays in bounds). Rebuilt every setup (recv_tokens ptr is arena-fresh),
+    // so it is never stale — not routed through the weight-keyed TMA cache.
+    host_state.recv_tokens_a_tma = umma::dg_make_a_desc(
+        recv_tokens,
+        static_cast<int>(total_expert_slots) + megakernel_config::kComputeBatchSize,
+        hidden_dim);
 
     // Compute dimensions
     host_state.hidden_dim = hidden_dim;
@@ -10362,10 +10180,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
         ComputeUmmaSmemLayout::kNumStages *
             (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
         kComputeUmmaBarrierBytes;
-    constexpr size_t kComputeWmmaScratchBytes =
-        (kNumCombineForwarderWarps + 1) * 2 * WMMA_M * WMMA_N * sizeof(float);
-    constexpr size_t kComputeScratchBytes =
-        kComputeWmmaScratchBytes > kComputeUmmaScratchBytes ? kComputeWmmaScratchBytes : kComputeUmmaScratchBytes;
+    constexpr size_t kComputeScratchBytes = kComputeUmmaScratchBytes;
     constexpr size_t kComputeMetaOffset = (kComputeScratchBytes + alignof(int) - 1) & ~(size_t)(alignof(int) - 1);
 
     constexpr size_t kRecvTokenIdxBytes = COMPUTE_BATCH_SIZE * sizeof(int);
@@ -10502,11 +10317,15 @@ __device__ __forceinline__ void compute_backward_worker_core(
 #endif
 
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
+        static_assert(kUseUmmaCompute, "WMMA compute path removed; MK_COMPUTE_KERNEL must be 1 (1-CTA) or 2 (2-CTA UMMA)");
         constexpr bool kUseUmmaBwdGemm = kUseUmmaCompute && (MK_UMMA_DOWN != 0);
         const bool use_umma_bwd_for_group =
             kUseUmmaBwdGemm && group_size == COMPUTE_GROUP_SIZE &&
             state->group_input_tma != nullptr && bs->compute_bwd_tma != nullptr &&
             bs->wgrad_dgu_a_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE;
+        // WMMA fallback removed: backward compute requires the full UMMA path (full group +
+        // built bwd TMA atoms). Trap loudly instead of silently skipping the GEMM.
+        EP_DEVICE_ASSERT(use_umma_bwd_for_group);
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
@@ -10589,20 +10408,13 @@ __device__ __forceinline__ void compute_backward_worker_core(
         const __nv_bfloat16* Wgu_e = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
         const __nv_bfloat16* Wd_e  = &state->W_down[(size_t)expert_id * hidden * intermediate]; // [hidden,I]
 
-        // Saved-PreAct path skips the PreAct->GU gather: dSwiGLU below reads gate/up
-        // directly from bs->bwd_preact by (recv_token, topk_slot) and writes dGU
-        // straight to wgrad_dgu_slot. Fallback (no saved PreAct) recomputes gate/up
-        // into gu_buf via WMMA first.
-        const bool preact_direct = (bs->bwd_preact != nullptr);
+        // Saved-PreAct is mandatory now (WMMA gate/up recompute fallback removed):
+        // dSwiGLU below reads gate/up directly from bs->bwd_preact.
+        EP_DEVICE_ASSERT(bs->bwd_preact != nullptr);
         __nv_bfloat16* dgu_dst = bs->wgrad_dgu_slot + (size_t)slot_base64 * twoI;
-        if (!preact_direct) {
-            device_gemm_bf16(down_buf, Wgu_e, gu_buf, batch_size, hidden, twoI,
-                             group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-        }
         compute_group_sync(state, group_id, group_size);
 
-        // grad_act = grad_down @ W_down -> up_buf [M,I]. Prefer the verified
-        // DeepGEMM/UMMA saved-preact baseline; keep WMMA as descriptor fallback.
+        // grad_act = grad_down @ W_down -> up_buf [M,I]. UMMA saved-preact baseline.
         if (use_umma_bwd_for_group) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
@@ -10626,13 +10438,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
             compute_group_sync(state, group_id, group_size);
-        } else {
-            device_gemm_bf16_mn(input_buf, Wd_e, up_buf, batch_size, hidden, intermediate,
-                                group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_up_body_ns = globaltimer_ns();
-#endif
-            compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
@@ -10652,16 +10457,12 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const int slot = state->expert_slot_base[expert_id] + start_slot + m;
             const int recv_token_m = s_recv_token_idx[m];
             const int topk_slot_m = s_topk_slot[m];
-            // No PreAct gather: read gate/up straight from bwd_preact (slot-major by
-            // (recv_token, topk_slot)) when available, else from the recomputed gu_buf.
-            // Phase 3 (Step 3.3a): translate the cross-pass-stable (recv_token, topk_slot) to
-            // forward's compact preact slot via fwd_slot_map, then read bwd_preact by slot.
-            int fwd_preact_slot = preact_direct
-                ? state->fwd_slot_map[(int64_t)recv_token_m * num_topk + topk_slot_m] : -1;
+            // Saved-PreAct path: read gate/up straight from bs->bwd_preact, slot-major by
+            // the forward compact slot. Phase 3 (Step 3.3a): translate the cross-pass-stable
+            // (recv_token, topk_slot) to forward's compact preact slot via fwd_slot_map.
+            int fwd_preact_slot = state->fwd_slot_map[(int64_t)recv_token_m * num_topk + topk_slot_m];
             if (fwd_preact_slot < 0) fwd_preact_slot = 0;  // safety net; should not occur for a real hit
-            const __nv_bfloat16* gu_src = preact_direct
-                ? bs->bwd_preact + (int64_t)fwd_preact_slot * twoI
-                : gu_buf + (size_t)m * twoI;
+            const __nv_bfloat16* gu_src = bs->bwd_preact + (int64_t)fwd_preact_slot * twoI;
             float route_grad = 0.0f;
             if (dswiglu_packed4) {
                 const int4* gu4 = reinterpret_cast<const int4*>(gu_src);
@@ -10738,13 +10539,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 batch_size, hidden, twoI,
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_x_accum_iter);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_down_body_ns = globaltimer_ns();
-#endif
-            compute_group_sync(state, group_id, group_size);
-        } else {
-            device_gemm_bf16_mn(dgu_dst, Wgu_e, down_buf, batch_size, twoI, hidden,
-                                group_warp_id, group_num_warps, local_warp_id, smem_wmma_buf);
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif

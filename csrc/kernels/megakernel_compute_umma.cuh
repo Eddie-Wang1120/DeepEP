@@ -876,7 +876,11 @@ __device__ void dg_gemm_persistent(
     const int* preact_topk_idx = nullptr,
     uint32_t num_topk = 0,
     uint32_t preact_stride = 0,
-    uint32_t valid_rows = 0xffffffffu) {
+    uint32_t valid_rows = 0xffffffffu,
+    // A-operand row base offset into desc_a's global tensor. Default 0 keeps the
+    // legacy behavior (desc_a points at a per-group buffer with M origin at row 0).
+    // When A is a shared buffer (e.g. recv_tokens), pass expert_slot_base+start_slot.
+    uint32_t m_base = 0) {
 
     using namespace deep_gemm;
     using L = DgSmemLayout<kNumMulticast>;
@@ -947,7 +951,7 @@ __device__ void dg_gemm_persistent(
         while (sched.get_next_block(m_block, n_block)) {
             const uint32_t m_idx0 = m_block * BLOCK_M;
             const uint32_t n_idx0 = n_block * BLOCK_N;
-            const uint32_t load_m_idx = m_idx0 + (kIsMulticastOnA ? cta_rank * LOAD_BLOCK_M : 0);
+            const uint32_t load_m_idx = m_base + m_idx0 + (kIsMulticastOnA ? cta_rank * LOAD_BLOCK_M : 0);
             const uint32_t load_n_idx = n_idx0 + (kIsMulticastOnA ? 0 : cta_rank * LOAD_BLOCK_N);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -1208,14 +1212,15 @@ __device__ inline void umma_gateup_interleaved_persistent(
     const int* preact_topk_idx = nullptr,
     uint32_t num_topk = 0,
     uint32_t preact_stride = 0,
-    uint32_t valid_rows = 0xffffffffu) {
+    uint32_t valid_rows = 0xffffffffu,
+    uint32_t a_m_base = 0) {
 
     dg_gemm_persistent<false, kDgRunMulticast, true>(
         desc_a, desc_wgateup, desc_act_cd,
         (uint32_t)M, (uint32_t)(2 * I), (uint32_t)d,
         cluster_idx, num_clusters, cluster_smem, accum_iter,
         nullptr, route_w, 0, preact_ptr, preact_recv_idx, preact_topk_idx,
-        num_topk, preact_stride, valid_rows);
+        num_topk, preact_stride, valid_rows, a_m_base);
 }
 
 
