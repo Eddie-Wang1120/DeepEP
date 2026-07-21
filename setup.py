@@ -118,13 +118,6 @@ if __name__ == '__main__':
         cxx_flags.append('-DMK_TOKEN_TRACE')
         nvcc_flags.append('-DMK_TOKEN_TRACE')
 
-    # MegaKernel async publish offload: move NVL receiver publish work to dedicated warps
-    mk_async_publish = int(os.getenv('MK_ASYNC_PUBLISH', 0))
-    assert mk_async_publish in (0, 1), 'MK_ASYNC_PUBLISH must be 0 or 1'
-    if mk_async_publish:
-        cxx_flags.append('-DMK_ASYNC_PUBLISH=1')
-        nvcc_flags.append('-DMK_ASYNC_PUBLISH=1')
-
     # MegaKernel gather reduce path:
     #   0 = fast full-block reduce (default), 1 = align with original combine warp reduce
     if int(os.getenv('GATHER_ALIGN', 0)):
@@ -137,14 +130,6 @@ if __name__ == '__main__':
     assert mk_compute_kernel in (1, 2), 'MK_COMPUTE_KERNEL must be 1 or 2 (WMMA path removed)'
     cxx_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
     nvcc_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
-
-    # Narrow UMMA diagnostics. Defaults keep the production path unchanged.
-    for name in ('MK_UMMA_GATEUP', 'MK_UMMA_DOWN'):
-        value = int(os.getenv(name, '1'))
-        assert value in (0, 1), f'{name} must be 0 or 1'
-        cxx_flags.append(f'-D{name}={value}')
-        nvcc_flags.append(f'-D{name}={value}')
-
 
     if int(os.getenv('ENABLE_FAST_DEBUG', 0)):
         cxx_flags.append('-DENABLE_FAST_DEBUG')
