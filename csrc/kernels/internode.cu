@@ -1621,7 +1621,8 @@ void mk_cached_notfy(int hidden_int4,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
                      bool is_cached_dispatch,
-                     bool low_latency_mode) {
+                     bool low_latency_mode,
+                     bool skip_rdma_clean) {
     const int kNumTMABytesPerWarp = 8192;
     const int num_threads = is_cached_dispatch ? 512 : std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
@@ -1630,6 +1631,8 @@ void mk_cached_notfy(int hidden_int4,
 
     auto rdma_clean_meta = get_rdma_clean_meta(
         hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+    if (skip_rdma_clean)
+        rdma_clean_meta = {0, 0};
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4,
                                              num_scales,
                                              num_topk_idx,

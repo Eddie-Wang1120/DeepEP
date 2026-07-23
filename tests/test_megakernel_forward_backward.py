@@ -214,7 +214,9 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=4096, hidden=2048, intermediate=4096, experts_per_rank=8, num_topk=4),
-    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    test(num_tokens=16384, hidden=2048, intermediate=3072, experts_per_rank=8, num_topk=6, num_topk_groups=3),
+    # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6),
     # Add more cases here, for example:
@@ -228,6 +230,7 @@ def nvtx_range(name: str):
     try:
         yield
     finally:
+        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
 
@@ -546,7 +549,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     # Both baselines expose the complete training gradients used by the real routed
     # expert path: dX, expert weight gradients, and route-probability gradients.
     if not args.skip_baseline:
-        for w in range(10):
+        for w in range(100):
             if local_rank == 0:
                 print(
                     f'[Rank {rank}] {baseline_name} warmup {w + 1}/{args.warmup}',
@@ -831,7 +834,7 @@ def parse_args():
         description='Compare megakernel forward/backward with DeepEP + TE or SonicMoE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
-    parser.add_argument('--warmup', type=int, default=10000,
+    parser.add_argument('--warmup', type=int, default=100,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--skip-baseline', action='store_true',
                         help='Skip the selected baseline warmup and measured run (and its precision comparisons); only run the megakernel path')

@@ -2380,17 +2380,14 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 #endif
 
     // Clean the combine region the DeepEP way: a clean-only cached_notify (num_combined_tokens=0,
-    // null heads => no head normalization, just zero the combine head/tail metadata + a cross-rank
-    // barrier inside the collective). This mirrors internode_combine's cached_notify and replaces
-    // the old host-side full-buffer memset + intranode/internode barriers.
-    //   RDMA : reuses the single symmetric region (rdma_buffer_ptr); this pre-launch RDMA clean is
-    //          redundant with the in-kernel combine prelude but kept for the NVL clean + barrier.
+    // null heads => no head normalization). Megakernel keeps this host notify for the NVL combine
+    // metadata clean + cross-rank barrier, while the shared RDMA region is cleaned in-kernel after
+    // dispatch drains.
+    //   RDMA : reuses the single symmetric region (rdma_buffer_ptr); host RDMA clean is skipped.
     //   NVL  combine half : combine_buffer_ptrs_gpu           (base + per_half, see Buffer ctor)
     {
-        // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify is
-        // kept for the NVL combine metadata clean + cross-rank barrier; its RDMA metadata clean on
-        // the shared region is pre-launch and redundant with the in-kernel combine prelude (which
-        // re-clears combine metadata after dispatch drains), so it is harmless.
+        // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify skips
+        // RDMA metadata clean so the in-kernel combine prelude is the single owner of that clear.
         void* combine_rdma_ptr = rdma_buffer_ptr;
         internode::mk_cached_notfy(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
@@ -2416,11 +2413,13 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
                                              // sm_id==1/>=2 head-normalization warps return early
                                              // (internode.cu:1432/1465), so the null head/prefix
                                              // pointers are never dereferenced. Only sm_id==0 runs,
-                                             // which does the RDMA/NVL clean + cross-rank barrier.
+                                             // which does the NVL clean + cross-rank barrier.
                                              // get_nvl_clean_meta ignores this flag, so the combine
                                              // clean range is unchanged. MK does its own head
                                              // normalization inside the combine worker.
-                                 low_latency_mode);
+                                 low_latency_mode,
+                                 true);     // skip_rdma_clean: MK prelude owns the RDMA clean on
+                                             // the shared combine region after dispatch drains.
     }
 
     // Step 3: Allocate and launch megakernel v7

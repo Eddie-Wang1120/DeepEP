@@ -10180,7 +10180,7 @@ static void prepare_megakernel_communication_replay_host(
         hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
         hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
         hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
-        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
+        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false, false);
     internode::mk_cached_notfy(
         combine_hidden_int4, 0, 0, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, hs.num_tokens,
@@ -10189,7 +10189,7 @@ static void prepare_megakernel_communication_replay_host(
         hs.combine_rdma_buffer_ptr, hs.num_max_combine_rdma_chunked_recv_tokens,
         hs.combine_buffer_ptrs, hs.num_max_combine_nvl_chunked_recv_tokens,
         combine_barrier_signal_ptrs, hs.rank, stream, hs.num_rdma_bytes,
-        hs.num_nvl_bytes, false, false);
+        hs.num_nvl_bytes, false, false, false);
 }
 
 void prepare_megakernel_communication_replay(

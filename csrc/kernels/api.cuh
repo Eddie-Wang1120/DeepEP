@@ -261,7 +261,8 @@ void mk_cached_notfy(int hidden_int4,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
                      bool is_cached_dispatch,
-                     bool low_latency_mode);
+                     bool low_latency_mode,
+                     bool skip_rdma_clean);
 
 void combine(cudaDataType_t type,
              void* combined_x,
