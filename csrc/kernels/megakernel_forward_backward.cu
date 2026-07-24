@@ -881,7 +881,12 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             phase_start_ns = now;
         }
 #endif
-        __threadfence();
+        // Use system-scope fence to ensure recv_tokens data written by the
+        // receiver warp (same CTA) is visible to TMA loads on compute SMs.
+        // Device-scope __threadfence() is insufficient because TMA engines may
+        // bypass L1 and observe stale L2 data when the memory subsystem is under
+        // pressure (e.g., concurrent GEMMs on other SMs).
+        __threadfence_system();
 #if MK_PERF_TRACE_ARGS
         if (lane_id == 0) {
             int64_t now = globaltimer_ns();
@@ -2354,7 +2359,7 @@ __device__ void dispatch_worker_v2(
                     ++producer_tail;
                     ++producer_batch_count;
                     if (producer_batch_count >= PUB_PRODUCE_BATCH) {
-                        __threadfence();
+                        __threadfence_system();  // system-scope: recv_tokens stores must be visible to TMA on compute SMs
                         st_na_release(&state->pub_ring_tail[pub_warp_idx], producer_tail);
                         producer_batch_count = 0;
                     }
@@ -2391,7 +2396,7 @@ __device__ void dispatch_worker_v2(
                    pub_warp_idx, producer_batch_count);
 #endif
             if (producer_batch_count > 0) {
-                __threadfence();
+                __threadfence_system();  // system-scope: flush recv_tokens stores for TMA visibility
                 st_na_release(&state->pub_ring_tail[pub_warp_idx], producer_tail);
 #ifdef MK_TOKEN_TRACE
                 printf("[MK-DISPATCH] async publish after rank=%d cta=%d channel=%d round=%d pub_warp=%d tail=%llu\n",
@@ -3413,6 +3418,12 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
+            // FIX: gate/up's SwiGLU epilogue writes up_buf via TMA store. The
+            // tma_store_wait<0>() inside dg_gemm_persistent only runs on epilogue
+            // warp 0. Other threads need a proxy fence to see the TMA store results.
+            // Without this, subsequent reads of up_buf (diagnostics, down-proj TMA
+            // A-load on other SMs) may see stale data.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
@@ -3428,6 +3439,16 @@ __device__ __forceinline__ void compute_worker_core(
         const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
+
+            // FIX: Ensure gate/up TMA store to up_buf is globally visible before
+            // down-proj's TMA A-load reads from it. __threadfence() only fences
+            // normal loads/stores; TMA operations may bypass L1 and require an
+            // explicit fence to guarantee L2 coherence across SM TMA units.
+            // This fence + syncthreads ensures all prior TMA stores (from gate/up
+            // epilogue) are committed to L2 before any TMA load in down-proj begins.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            __syncthreads();
+
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
@@ -3461,6 +3482,11 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
+            // #7: fence async proxy ops + system-scope fence before cross-SM group barrier.
+            // Required: scatter epilogue's st.global.cg must be committed to L2 before
+            // other SMs in the group (or gather/combine SMs) read the data.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            __threadfence_system();
             compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
@@ -3504,9 +3530,14 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
-        // Device-scope fence: the UMMA epilogue has already made the down output visible.
-        // Fence the backward-save writes before any SM publishes ready flags.
-        __threadfence();
+        // Device-scope fence: the UMMA scatter epilogue wrote per-slot data to
+        // compute_output_slot / combine_input. Fence the backward-save writes AND
+        // the scatter stores before any SM publishes ready flags.
+        // RACE #3 DIAG: upgrade to system-scope fence to ensure scatter stores are
+        // visible to gather SMs (which read via plain loads from a different SM).
+        // If NaN disappears with __threadfence_system() but reappears with __threadfence(),
+        // this confirms the cross-SM visibility race on compute_output_slot.
+        __threadfence_system();
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
@@ -5125,7 +5156,7 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
 
         __syncthreads();
         __threadfence();
-        __syncthreads();
+
         if (state->rank == 0 && gather_sm_idx == 0 && tid == 0 && batch_count > 0) {
             const int token_idx = state->gather_ready_queue[token_base];
             const __nv_bfloat16* gathered = state->combine_input + (int64_t)token_idx * hidden;
@@ -9785,15 +9816,26 @@ __device__ __forceinline__ void compute_backward_worker_core(
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
             int slot = slot_base + row;
-            if (s_is_single[row])
-                token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = down_i4[idx];
-            else
-                slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
+            int4 data = down_i4[idx];
+            if (s_is_single[row]) {
+                int4* dst = &token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v];
+                asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
+                    :: "l"(dst), "r"(data.x), "r"(data.y), "r"(data.z), "r"(data.w)
+                    : "memory");
+            } else {
+                int4* dst = &slot_out_i4[(int64_t)slot * hidden_int4 + v];
+                asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
+                    :: "l"(dst), "r"(data.x), "r"(data.y), "r"(data.z), "r"(data.w)
+                    : "memory");
+            }
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
-        __threadfence();
+        // System-scope fence + proxy fence: ensure scatter stores are committed to L2
+        // before the cross-SM group barrier releases other SMs / gather workers to read.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __threadfence_system();
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
