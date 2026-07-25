@@ -461,7 +461,10 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* rdma_reuse_dispatch_quiet_done = nullptr,
     int* rdma_reuse_combine_clear_done = nullptr,
     // Enable the in-kernel combine RDMA-reuse prelude (forward only for now).
-    int rdma_reuse_prelude_enable = 0);
+    int rdma_reuse_prelude_enable = 0,
+    // Runtime-tunable compute parameters (Python-selectable).
+    int compute_batch_size = 4096,
+    int combine_start_head_percent = 70);
 
 void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state = nullptr);
 void free_megakernel_forward_transient(MegaKernelState* device_state);

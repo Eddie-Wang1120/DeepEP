@@ -214,8 +214,8 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=16, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=4096, hidden=2048, intermediate=4096, experts_per_rank=8, num_topk=4),
-    # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
-    test(num_tokens=16384, hidden=2048, intermediate=3072, experts_per_rank=8, num_topk=6, num_topk_groups=3),
+    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=4096, hidden=2048, intermediate=3072, experts_per_rank=8, num_topk=6, num_topk_groups=3),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
     # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6),
@@ -691,6 +691,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
                 num_combine_sms=args.megakernel_comm_sms,
                 total_sms=num_sms,
                 stage=args.stage,
+                compute_batch_size=args.compute_batch_size,
+                combine_start_head_percent=args.combine_start_head_percent,
             )
         with nvtx_range(f'Megakernel backward iter={w} rank={rank}'):
             warmup_mk_output.backward(grad_output)
@@ -713,6 +715,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         num_combine_sms=args.megakernel_comm_sms,
         total_sms=num_sms,
         stage=args.stage,
+        compute_batch_size=args.compute_batch_size,
+        combine_start_head_percent=args.combine_start_head_percent,
     )
 
     megakernel_activation_retained = record_forward_memory(megakernel_mem_start)
@@ -834,7 +838,7 @@ def parse_args():
         description='Compare megakernel forward/backward with DeepEP + TE or SonicMoE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
-    parser.add_argument('--warmup', type=int, default=100,
+    parser.add_argument('--warmup', type=int, default=10000,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--skip-baseline', action='store_true',
                         help='Skip the selected baseline warmup and measured run (and its precision comparisons); only run the megakernel path')
@@ -858,6 +862,11 @@ def parse_args():
     parser.add_argument('--backward-max-abs-tol', type=float, default=2e-1)
     parser.add_argument('--backward-calc-diff-tol', type=float, default=1e-4)
     parser.add_argument('--backward-cos-tol', type=float, default=0.80)
+    parser.add_argument('--compute-batch-size', type=int, default=1024,
+                        choices=[1024, 2048, 4096],
+                        help='Compute batch size per expert before triggering GEMM (default: 4096)')
+    parser.add_argument('--combine-start-head-percent', type=int, default=50,
+                        help='Combine SM starts when compute_task_head/tail >= this %% (0-100, default: 70)')
     parser.add_argument('--mpirun', action='store_true')
     parser.add_argument('--quack-wgrad-selftest', action='store_true',
                         help='Run the standalone QuACK grouped-wgrad precision check and exit '

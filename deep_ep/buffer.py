@@ -707,11 +707,13 @@ class Buffer:
         @staticmethod
         def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
                     num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
-                    dispatch_config, combine_config, grad_topk_weights):
+                    dispatch_config, combine_config, grad_topk_weights,
+                    compute_batch_size, combine_start_head_percent):
             output, handle = runtime.megakernel_debug_forward_train(
                 x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
                 num_dispatch_sms, num_combine_sms, total_sms, stage,
-                dispatch_config, combine_config)
+                dispatch_config, combine_config,
+                compute_batch_size, combine_start_head_percent)
             ctx.runtime = runtime
             ctx.handle = handle
             ctx.grad_topk_weights = grad_topk_weights
@@ -753,7 +755,7 @@ class Buffer:
                     cu_seqlens_k=cu_seqlens_k,
                     tuned=False)
             return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
-                    None, None, None, None, None, None, None, None)
+                    None, None, None, None, None, None, None, None, None, None)
 
     def megakernel_debug_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
                                   topk_weights: torch.Tensor, W_gateup: torch.Tensor,
@@ -762,8 +764,14 @@ class Buffer:
                                   total_sms: int = 148, stage: int = 1,
                                   dispatch_config: Optional[Config] = None,
                                   combine_config: Optional[Config] = None,
-                                  grad_topk_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                                  grad_topk_weights: Optional[torch.Tensor] = None,
+                                  compute_batch_size: int = 4096,
+                                  combine_start_head_percent: int = 70) -> torch.Tensor:
         """Run the BF16 debug megakernel with an input-gradient-only autograd backward."""
+        assert compute_batch_size in (1024, 2048, 4096), \
+            f"compute_batch_size must be 1024, 2048, or 4096, got {compute_batch_size}"
+        assert 0 <= combine_start_head_percent <= 100, \
+            f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         if x.dtype != torch.bfloat16:
             raise ValueError("megakernel debug autograd currently supports BF16 only")
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
@@ -774,7 +782,8 @@ class Buffer:
         return self._MegaKernelDebugFunction.apply(
             self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
-            dispatch_config, combine_config, grad_topk_weights)
+            dispatch_config, combine_config, grad_topk_weights,
+            compute_batch_size, combine_start_head_percent)
 
     def megakernel_debug_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                                  W_gateup: torch.Tensor, W_down: torch.Tensor,
@@ -786,8 +795,14 @@ class Buffer:
                                  W_gateup_fp8: Optional[torch.Tensor] = None,
                                  W_down_fp8: Optional[torch.Tensor] = None,
                                  W_gateup_fp8_sf: Optional[torch.Tensor] = None,
-                                 W_down_fp8_sf: Optional[torch.Tensor] = None) -> torch.Tensor:
+                                 W_down_fp8_sf: Optional[torch.Tensor] = None,
+                                 compute_batch_size: int = 4096,
+                                 combine_start_head_percent: int = 70) -> torch.Tensor:
         """Run the isolated forward snapshot used for backward development."""
+        assert compute_batch_size in (1024, 2048, 4096), \
+            f"compute_batch_size must be 1024, 2048, or 4096, got {compute_batch_size}"
+        assert 0 <= combine_start_head_percent <= 100, \
+            f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
         return self.runtime.megakernel_debug_forward(
@@ -795,4 +810,5 @@ class Buffer:
             num_experts, num_dispatch_sms, num_combine_sms,
             total_sms, stage, dispatch_config, combine_config,
             hidden_states_scales, W_gateup_fp8, W_down_fp8,
-            W_gateup_fp8_sf, W_down_fp8_sf)
+            W_gateup_fp8_sf, W_down_fp8_sf,
+            compute_batch_size, combine_start_head_percent)

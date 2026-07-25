@@ -2075,7 +2075,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     const pybind11::object& W_down_fp8_obj,
     const pybind11::object& W_gateup_fp8_sf_obj,
     const pybind11::object& W_down_fp8_sf_obj,
-    bool retain_state) {
+    bool retain_state,
+    int compute_batch_size,
+    int combine_start_head_percent) {
 #ifndef DISABLE_NVSHMEM
     auto optional_tensor = [](const pybind11::object& obj) -> torch::Tensor {
         if (obj.is_none()) return torch::Tensor();
@@ -2522,7 +2524,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         fwd_host_state_ptr,
         rdma_reuse_dispatch_quiet_done,
         rdma_reuse_combine_clear_done,
-        1 /* rdma_reuse_prelude_enable (forward) */);
+        1 /* rdma_reuse_prelude_enable (forward) */,
+        compute_batch_size,
+        combine_start_head_percent);
     };
 
     void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
@@ -2654,12 +2658,15 @@ torch::Tensor Buffer::megakernel_debug_forward(
     const pybind11::object& W_gateup_fp8_obj,
     const pybind11::object& W_down_fp8_obj,
     const pybind11::object& W_gateup_fp8_sf_obj,
-    const pybind11::object& W_down_fp8_sf_obj) {
+    const pybind11::object& W_down_fp8_sf_obj,
+    int compute_batch_size,
+    int combine_start_head_percent) {
     return std::get<0>(megakernel_debug_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config,
         combine_config, hidden_states_scales_obj, W_gateup_fp8_obj,
-        W_down_fp8_obj, W_gateup_fp8_sf_obj, W_down_fp8_sf_obj, false));
+        W_down_fp8_obj, W_gateup_fp8_sf_obj, W_down_fp8_sf_obj, false,
+        compute_batch_size, combine_start_head_percent));
 }
 
 std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_train(
@@ -2674,12 +2681,15 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     int total_sms,
     int stage,
     const Config& dispatch_config,
-    const Config& combine_config) {
+    const Config& combine_config,
+    int compute_batch_size,
+    int combine_start_head_percent) {
     pybind11::object none = pybind11::none();
     return megakernel_debug_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage,
-        dispatch_config, combine_config, none, none, none, none, none, true);
+        dispatch_config, combine_config, none, none, none, none, none, true,
+        compute_batch_size, combine_start_head_percent);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -2858,14 +2868,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("W_gateup_fp8") = py::none(),
              py::arg("W_down_fp8") = py::none(),
              py::arg("W_gateup_fp8_sf") = py::none(),
-             py::arg("W_down_fp8_sf") = py::none())
+             py::arg("W_down_fp8_sf") = py::none(),
+             py::arg("compute_batch_size") = 4096,
+             py::arg("combine_start_head_percent") = 70)
         .def("megakernel_debug_forward_train", &deep_ep::Buffer::megakernel_debug_forward_train,
              py::arg("x"), py::arg("topk_idx"), py::arg("topk_weights"),
              py::arg("W_gateup"), py::arg("W_down"), py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24, py::arg("num_combine_sms") = 24,
              py::arg("total_sms") = 148, py::arg("stage") = 1,
              py::arg("dispatch_config") = deep_ep::Config(20, 6, 256, 6, 128),
-             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128))
+             py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
+             py::arg("compute_batch_size") = 4096,
+             py::arg("combine_start_head_percent") = 70)
         .def("megakernel_debug_backward", &deep_ep::Buffer::megakernel_debug_backward,
              py::arg("context"), py::arg("grad_output"), py::arg("grad_topk_weights") = py::none(),
              py::arg("total_sms") = 148, py::arg("stage") = 1)

@@ -376,7 +376,9 @@ public:
         const pybind11::object& W_gateup_fp8,
         const pybind11::object& W_down_fp8,
         const pybind11::object& W_gateup_fp8_sf,
-        const pybind11::object& W_down_fp8_sf);
+        const pybind11::object& W_down_fp8_sf,
+        int compute_batch_size,
+        int combine_start_head_percent);
 
     std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_debug_forward_train(
         const torch::Tensor& x,
@@ -390,7 +392,9 @@ public:
         int total_sms,
         int stage,
         const Config& dispatch_config,
-        const Config& combine_config);
+        const Config& combine_config,
+        int compute_batch_size,
+        int combine_start_head_percent);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
@@ -418,7 +422,9 @@ public:
         const pybind11::object& W_down_fp8,
         const pybind11::object& W_gateup_fp8_sf,
         const pybind11::object& W_down_fp8_sf,
-        bool retain_state);
+        bool retain_state,
+        int compute_batch_size,
+        int combine_start_head_percent);
 
 #if MK_PERF_TRACE_ENABLED
     // Baseline trace events use the same Perfetto JSON format as megakernel traces.

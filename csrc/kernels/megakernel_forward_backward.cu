@@ -60,7 +60,14 @@ namespace umma = ::deep_ep::megakernel::umma;
 // Configuration
 // ============================================================================
 
-constexpr int COMPUTE_BATCH_SIZE = megakernel_config::kComputeBatchSize;
+// COMPUTE_BATCH_SIZE: device code reads state->compute_batch_size at runtime.
+// Host-side allocation uses the passed-in compute_batch_size parameter.
+// The old compile-time constant is removed; use state->compute_batch_size everywhere in device code,
+// and the local `compute_batch_size` variable in host allocation functions.
+// COMPUTE_BATCH_SIZE macro kept as an alias to state->compute_batch_size for device code
+// that is called with a MegaKernelState* named `state` in scope.
+// Host-side code must #undef and use a local variable instead.
+#define COMPUTE_BATCH_SIZE (state->compute_batch_size)
 constexpr int COMPUTE_GROUP_SIZE = megakernel_config::kComputeGroupSize;
 constexpr int COMPUTE_SCHEDULER_SMS = megakernel_config::kComputeSchedulerSms;
 constexpr int GATHER_SMS = megakernel_config::kGatherSms;
@@ -68,7 +75,7 @@ constexpr int GATHER_SCHED_TID_BEGIN = megakernel_config::kGatherSchedTidBegin;
 constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
 constexpr int GATHER_SCHED_MAX_WARPS = megakernel_config::kGatherSchedMaxWarps;
 constexpr int MK_COMPUTE_CLUSTER_DIM = megakernel_config::kComputeClusterDim;
-constexpr int COMBINE_START_HEAD_PERCENT = megakernel_config::kCombineStartHeadPercent;
+// COMBINE_START_HEAD_PERCENT is now a runtime field in MegaKernelState.
 constexpr int MK_TIMEOUT_LOG_BUDGET = megakernel_config::kTimeoutLogBudget;
 constexpr int MK_DISPATCH_ROLE_COUNT = megakernel_config::kDispatchRoleCount;
 constexpr int PUB_RING_DEPTH = megakernel_config::kPubRingDepth;
@@ -360,6 +367,8 @@ struct MegaKernelState {
     int max_tokens_per_expert;
     int total_expert_slots;           // Σ expert_count[le] = size of the per-expert-slot buffers
     int max_total_recv_tokens;
+    int compute_batch_size;           // Runtime-selected: 1024, 2048, or 4096
+    int combine_start_head_percent;   // Runtime-tunable: combine SM waits until head/tail >= this %
 
     // --- SM allocation ---
     int num_dispatch_sms;
@@ -3163,7 +3172,7 @@ __device__ __forceinline__ void compute_worker_core(
                     if (enqueue_done) {
                         int tail = ld_acquire_global(state->compute_task_tail);
                         int head = ld_acquire_global(state->compute_task_head);
-                        if (tail == 0 || head * 100 >= tail * COMBINE_START_HEAD_PERCENT) {
+                        if (tail == 0 || head * 100 >= tail * state->combine_start_head_percent) {
                             task_idx = -3;
                             break;
                         }
@@ -7340,6 +7349,10 @@ static inline cudaError_t free_arena_chunks(void** chunks, int count) {
 
 }  // anonymous namespace
 
+// Host-side functions cannot use the COMPUTE_BATCH_SIZE macro (which dereferences `state`).
+// Undefine it and use a local variable / function parameter instead.
+#undef COMPUTE_BATCH_SIZE
+
 MegaKernelState* allocate_megakernel_state_v7(
     // --- Dispatch input data (from PyTorch tensors) ---
     const int4* x,
@@ -7409,7 +7422,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     MegaKernelState* host_state_out,
     int* rdma_reuse_dispatch_quiet_done,
     int* rdma_reuse_combine_clear_done,
-    int rdma_reuse_prelude_enable
+    int rdma_reuse_prelude_enable,
+    int compute_batch_size,
+    int combine_start_head_percent
 ) {
     MegakernelArenaAllocator persistent_arena;
     MegakernelArenaAllocator transient_arena;
@@ -7460,6 +7475,8 @@ MegaKernelState* allocate_megakernel_state_v7(
 
     // Mirror DeepEP host-side launch invariants before allocating state. These
     // protect the producer/consumer queue geometry used by dispatch and combine.
+    EP_HOST_ASSERT(compute_batch_size == 1024 || compute_batch_size == 2048 || compute_batch_size == 4096);
+    EP_HOST_ASSERT(combine_start_head_percent >= 0 && combine_start_head_percent <= 100);
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
     EP_HOST_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_HOST_ASSERT(hidden_int4 > 0);
@@ -7548,11 +7565,11 @@ MegaKernelState* allocate_megakernel_state_v7(
     // padding is zeroed (real slots are written by dispatch; padding rows are masked
     // by valid_rows in the epilogue but we keep them defined to avoid NaN/Inf reads).
     size_t recv_tokens_padded_bytes =
-        ((size_t)total_expert_slots + megakernel_config::kComputeBatchSize) * hidden_dim * sizeof(__nv_bfloat16);
+        ((size_t)total_expert_slots + compute_batch_size) * hidden_dim * sizeof(__nv_bfloat16);
     arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&recv_tokens, recv_tokens_padded_bytes));
     CUDA_CHECK(cudaMemset(recv_tokens + total_expert_slots * hidden_dim, 0,
-                          (size_t)megakernel_config::kComputeBatchSize * hidden_dim * sizeof(__nv_bfloat16)));
+                          (size_t)compute_batch_size * hidden_dim * sizeof(__nv_bfloat16)));
     arena = &persistent_arena;
 
     CUDA_CHECK(cudaMalloc(&expert_token_offsets, num_local_experts * sizeof(int)));
@@ -7577,7 +7594,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     {
         size_t launch_total_sms = (size_t)num_dispatch_sms + num_combine_sms + num_compute_sms
                                   + COMPUTE_SCHEDULER_SMS + GATHER_SMS;
-        size_t meta_rows = launch_total_sms * megakernel_config::kComputeBatchSize;
+        size_t meta_rows = launch_total_sms * compute_batch_size;
         CUDA_CHECK(cudaMalloc(&g_meta_route_w, meta_rows * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_meta_recv_idx, meta_rows * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&g_meta_topk_slot, meta_rows * sizeof(int)));
@@ -7588,7 +7605,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&compute_group_phase, num_compute_groups * sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_group_phase, 0, num_compute_groups * sizeof(int)));
 
-    int max_compute_tasks = num_local_experts * (max_tokens_per_expert / COMPUTE_BATCH_SIZE + 2);
+    int max_compute_tasks = num_local_experts * (max_tokens_per_expert / compute_batch_size + 2);
     CUDA_CHECK(cudaMalloc(&compute_tasks, (size_t)max_compute_tasks * sizeof(ComputeTask)));
     CUDA_CHECK(cudaMalloc(&compute_task_head, sizeof(int)));
     CUDA_CHECK(cudaMemset(compute_task_head, 0, sizeof(int)));
@@ -7747,7 +7764,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(token_nhits, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&token_slot_list, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
     CUDA_CHECK(cudaMemset(token_slot_list, 0xff, (size_t)max_total_recv_tokens * num_topk * sizeof(int)));
-    const int max_batches_per_expert = (max_tokens_per_expert + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
+    const int max_batches_per_expert = (max_tokens_per_expert + compute_batch_size - 1) / compute_batch_size;
     CUDA_CHECK(cudaMalloc(&expert_batch_enqueued, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_batch_enqueued, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
 #if MK_PERF_TRACE_ARGS
@@ -7778,10 +7795,10 @@ MegaKernelState* allocate_megakernel_state_v7(
 #if MK_RECV_DIRECT_STAGING
     const size_t per_group_input_elems = 0;
 #else
-    const size_t per_group_input_elems = (size_t)COMPUTE_BATCH_SIZE * hidden_dim;
+    const size_t per_group_input_elems = (size_t)compute_batch_size * hidden_dim;
 #endif
     size_t per_group_elems = per_group_input_elems +
-        (size_t)COMPUTE_BATCH_SIZE * (hidden_dim + 3 * intermediate_dim);
+        (size_t)compute_batch_size * (hidden_dim + 3 * intermediate_dim);
     size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
     arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
@@ -7830,10 +7847,10 @@ MegaKernelState* allocate_megakernel_state_v7(
             for (int g = 0; g < num_compute_groups; ++g) {
                 const __nv_bfloat16* in_g = gemm_workspace + (size_t)g * per_group_elems;
                 const __nv_bfloat16* gu_g   = in_g + per_group_input_elems;
-                const __nv_bfloat16* act_g  = gu_g + (size_t)COMPUTE_BATCH_SIZE * (2 * intermediate_dim);
-                const __nv_bfloat16* down_g = act_g + (size_t)COMPUTE_BATCH_SIZE * intermediate_dim;
+                const __nv_bfloat16* act_g  = gu_g + (size_t)compute_batch_size * (2 * intermediate_dim);
+                const __nv_bfloat16* down_g = act_g + (size_t)compute_batch_size * intermediate_dim;
                 h_in.push_back(umma::make_input_group_atoms(in_g, gu_g, act_g, down_g,
-                                                            COMPUTE_BATCH_SIZE, hidden_dim,
+                                                            compute_batch_size, hidden_dim,
                                                             intermediate_dim, hidden_dim));
             }
             CUDA_CHECK(mk_cache_alloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
@@ -8054,7 +8071,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     // so it is never stale — not routed through the weight-keyed TMA cache.
     host_state.recv_tokens_a_tma = umma::dg_make_a_desc(
         recv_tokens,
-        static_cast<int>(total_expert_slots) + megakernel_config::kComputeBatchSize,
+        static_cast<int>(total_expert_slots) + compute_batch_size,
         hidden_dim);
 
     // Compute dimensions
@@ -8064,6 +8081,8 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.max_tokens_per_expert = max_tokens_per_expert;
     host_state.total_expert_slots = static_cast<int>(total_expert_slots);
     host_state.max_total_recv_tokens = max_total_recv_tokens;
+    host_state.compute_batch_size = compute_batch_size;
+    host_state.combine_start_head_percent = combine_start_head_percent;
 
     // SM allocation
     host_state.num_dispatch_sms = num_dispatch_sms;
@@ -9156,7 +9175,7 @@ void free_megakernel_forward_transient_from_host(MegaKernelState* host_state) {
 }
 
 int get_megakernel_compute_batch_size() {
-    return COMPUTE_BATCH_SIZE;
+    return megakernel_config::kComputeBatchSizeDefault;
 }
 
 void get_megakernel_expert_counts(
@@ -9356,6 +9375,9 @@ __device__ __forceinline__ void mk_bwd_dswiglu_pair2_side_f32x2(
 
 // Expert-compute backward for one compute SM. Mirrors the forward compute_worker's
 // task-queue / gather / output-scatter / signaling protocol EXACTLY (so the reused
+
+// Re-enable COMPUTE_BATCH_SIZE macro for backward device code (was #undef'd for host functions above).
+#define COMPUTE_BATCH_SIZE (state->compute_batch_size)
 // combine handshake works), swapping only the GEMM math for the backward pass.
 // state == bs->bwd_device_state: combine_input holds grad_down (filled by the re-run
 // dispatch of grad_output), compute_output_slot/combine_input receive grad_xperm.
@@ -9462,7 +9484,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
                     if (enqueue_done) {
                         int tail = ld_acquire_global(state->compute_task_tail);
                         int head = ld_acquire_global(state->compute_task_head);
-                        if (tail == 0 || head * 100 >= tail * COMBINE_START_HEAD_PERCENT) {
+                        if (tail == 0 || head * 100 >= tail * state->combine_start_head_percent) {
                             task_idx = -3;
                             break;
                         }
@@ -10023,6 +10045,8 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // Build the backward state with an independent v7 allocation. Only the saved forward
 // activation is shared; routing inputs and Buffer-owned transport pointers are reused as
 // allocator inputs, while all derived routing, workspace, FIFO, and counter storage is new.
+// Host-side backward allocation uses fs.compute_batch_size from the forward state directly.
+#undef COMPUTE_BATCH_SIZE
 MegaKernelBackwardState* allocate_megakernel_backward_state(
     MegaKernelState* fwd_device_state,
     const void* grad_output,
@@ -10129,8 +10153,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.grad_w_down = reinterpret_cast<__nv_bfloat16*>(grad_w_down);
     hs.grad_topk_weights = reinterpret_cast<float*>(grad_topk_weights);
     // Compact Family B (wgrad) scratch: Σ count, same per-expert slot layout as the backward
-    // state. wgrad_dgu_slot gets one extra COMPUTE_BATCH_SIZE of padding so the last batch's
+    // state. wgrad_dgu_slot gets one extra compute_batch_size of padding so the last batch's
     // CBS-row TMA descriptor tile stays within the allocation.
+    const int cbs = fs.compute_batch_size;
     const size_t num_dgu_batch_tmas =
         (size_t)fs.num_local_experts * fs.max_batches_per_expert;
     EP_HOST_ASSERT(wgrad_x_slot != nullptr && wgrad_act_slot != nullptr);
@@ -10143,13 +10168,13 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
         const int ebase = h_bwd_expert_slot_base[expert];
         const int ecnt = h_bwd_expert_count[expert];
-        const int active_batches = (ecnt + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
+        const int active_batches = (ecnt + cbs - 1) / cbs;
         EP_HOST_ASSERT(active_batches <= fs.max_batches_per_expert);
         for (int batch = 0; batch < active_batches; ++batch) {
-            const int row = ebase + batch * COMPUTE_BATCH_SIZE;
+            const int row = ebase + batch * cbs;
             const __nv_bfloat16* dgu_batch = hs.wgrad_dgu_slot + (size_t)row * twoI;
             host_ctx->wgrad_dgu_a_tma[(size_t)expert * fs.max_batches_per_expert + batch] =
-                umma::dg_make_a_desc(dgu_batch, COMPUTE_BATCH_SIZE, twoI);
+                umma::dg_make_a_desc(dgu_batch, cbs, twoI);
         }
     }
     CUtensorMap* d_wgrad_dgu_a_tma = nullptr;
@@ -10421,7 +10446,7 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     const int NLC = hs.num_logical_channels;
     const int NPC = hs.num_dispatch_channels;
     const int NPUB = hs.num_pub_warps_total;
-    const int MBE = (hs.max_tokens_per_expert + COMPUTE_BATCH_SIZE - 1) / COMPUTE_BATCH_SIZE;
+    const int MBE = (hs.max_tokens_per_expert + hs.compute_batch_size - 1) / hs.compute_batch_size;
     // Per-expert-slot buffers are sized by the compact Σ expert_count (see allocator);
     // reset must cover exactly that, not the legacy num_local_experts*max_tpe.
     const size_t total_slots = (size_t)hs.total_expert_slots;
