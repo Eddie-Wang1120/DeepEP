@@ -2319,27 +2319,12 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     EP_HOST_ASSERT(get_nvl_bytes(num_topk + 1, num_topk, dispatch_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
     EP_HOST_ASSERT(get_nvl_bytes(0, num_topk, combine_num_max_nvl_chunked_recv_tokens) <= num_nvl_bytes);
 
-    // printf("[MK-HOST][NOTIFY-DISPATCH][AFTER-LAUNCH] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
-    //        rank, *moe_recv_counter, *moe_recv_rdma_counter);
-
     // Busy-wait for metadata exchange to complete
     auto wait_start = std::chrono::steady_clock::now();
-    int last_logged_recv_counter = *moe_recv_counter;
     while (*moe_recv_counter == -1) {
-        if (*moe_recv_counter != last_logged_recv_counter) {
-            printf("[MK-HOST][NOTIFY-DISPATCH][WAIT] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d\n",
-                   rank, *moe_recv_counter, *moe_recv_rdma_counter);
-            last_logged_recv_counter = *moe_recv_counter;
-        }
         auto elapsed = std::chrono::steady_clock::now() - wait_start;
         EP_HOST_ASSERT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 30);
     }
-
-    // printf("[MK-HOST][NOTIFY-DISPATCH][DONE] rank=%d moe_recv_counter=%d moe_recv_rdma_counter=%d local_expert_counts=[",
-        //    rank, *moe_recv_counter, *moe_recv_rdma_counter);
-    // for (int i = 0; i < num_local_experts; ++i)
-        // printf("%s%d", i == 0 ? "" : ",", moe_recv_expert_counter[i]);
-    // printf("]\n");
 
 #if MK_PERF_TRACE_ENABLED
     // Emit the megakernel-path notify_dispatch cost as its own Perfetto track so it can be

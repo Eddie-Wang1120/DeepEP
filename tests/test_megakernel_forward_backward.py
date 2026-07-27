@@ -549,7 +549,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     # Both baselines expose the complete training gradients used by the real routed
     # expert path: dX, expert weight gradients, and route-probability gradients.
     if not args.skip_baseline:
-        for w in range(100):
+        for w in range(10):
             if local_rank == 0:
                 print(
                     f'[Rank {rank}] {baseline_name} warmup {w + 1}/{args.warmup}',
@@ -696,6 +696,88 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             )
         with nvtx_range(f'Megakernel backward iter={w} rank={rank}'):
             warmup_mk_output.backward(grad_output)
+
+        # --check-warmup-precision: compare megakernel with baseline after each warmup iter
+        if args.check_warmup_precision and not args.skip_baseline:
+            if local_rank == 0:
+                print(f'[Rank {rank}] Warmup {w + 1} precision check vs {baseline_name}', flush=True)
+            # Run baseline with same inputs
+            if args.baseline_backend == 'te':
+                clear_parameter_grads(te_experts)
+            else:
+                sonicmoe_w_gateup.grad = None
+                sonicmoe_w_down.grad = None
+            check_x = x.detach().clone().requires_grad_(True)
+            check_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+            if args.baseline_backend == 'te':
+                check_output = run_megatron_fused_baseline(
+                    check_x, topk_idx, check_topk_weights, num_experts,
+                    case.experts_per_rank, buffer, te_experts,
+                )
+            else:
+                check_output = run_deepep_sonicmoe_baseline(
+                    check_x, topk_idx, check_topk_weights, num_experts,
+                    case.experts_per_rank, buffer,
+                    sonicmoe_w_gateup, sonicmoe_w_down,
+                )
+            check_output.backward(grad_output)
+            check_grad_x = check_x.grad.detach()
+
+            # Compare forward output
+            compare_tensor(
+                f'warmup[{w+1}] forward', check_output.detach(), warmup_mk_output.detach(), rank,
+                args.forward_max_abs_tol, args.forward_calc_diff_tol, args.forward_cos_tol,
+            )
+            # Compare backward dX
+            compare_tensor(
+                f'warmup[{w+1}] Backward dX', check_grad_x, warmup_mk_x.grad.detach(), rank,
+                args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+            )
+            # Compare backward dW_gateup
+            if args.baseline_backend == 'te':
+                ewg = [p.grad.detach() for p in te_experts.parameters() if p.grad is not None]
+                check_fc1_grad = ewg[0]
+                check_grad_w_gate = torch.empty_like(W_gate)
+                check_grad_w_up = torch.empty_like(W_up)
+                chunk_base = 0
+                for start in range(0, case.intermediate, 32):
+                    rows = min(32, case.intermediate - start)
+                    check_grad_w_gate[:, start:start + rows, :] = check_fc1_grad[
+                        :, chunk_base:chunk_base + rows, :]
+                    check_grad_w_up[:, start:start + rows, :] = check_fc1_grad[
+                        :, chunk_base + rows:chunk_base + 2 * rows, :]
+                    chunk_base += 2 * rows
+                check_grad_w_gateup = torch.empty_like(W_gateup)
+                check_grad_w_gateup[:, 0::2, :] = check_grad_w_gate
+                check_grad_w_gateup[:, 1::2, :] = check_grad_w_up
+                check_grad_w_gateup = check_grad_w_gateup.contiguous()
+                check_grad_w_down = ewg[1].detach()
+            else:
+                check_grad_w_gateup = sonicmoe_w_gateup.grad.detach()
+                check_grad_w_down = sonicmoe_w_down.grad.detach()
+            compare_tensor(
+                f'warmup[{w+1}] Backward dW_gateup', check_grad_w_gateup,
+                warmup_mk_w_gateup.grad.detach(), rank,
+                args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+            )
+            compare_tensor(
+                f'warmup[{w+1}] Backward dW_down', check_grad_w_down,
+                warmup_mk_w_down.grad.detach(), rank,
+                args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+            )
+            # Compare backward dTopKWeights
+            compare_tensor(
+                f'warmup[{w+1}] Backward dTopKWeights', check_topk_weights.grad.detach(),
+                warmup_mk_topk_weights.grad.detach(), rank,
+                args.backward_max_abs_tol, args.backward_calc_diff_tol, args.backward_cos_tol,
+            )
+            if args.baseline_backend == 'te':
+                clear_parameter_grads(te_experts)
+            else:
+                sonicmoe_w_gateup.grad = None
+                sonicmoe_w_down.grad = None
+            del check_x, check_topk_weights, check_output
+
     if args.warmup > 0:
         dist.barrier(group=group)
         torch.cuda.synchronize()
@@ -838,7 +920,7 @@ def parse_args():
         description='Compare megakernel forward/backward with DeepEP + TE or SonicMoE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
-    parser.add_argument('--warmup', type=int, default=10000,
+    parser.add_argument('--warmup', type=int, default=1000,
                         help='Number of warmup iterations for both baseline and megakernel before the measured run')
     parser.add_argument('--skip-baseline', action='store_true',
                         help='Skip the selected baseline warmup and measured run (and its precision comparisons); only run the megakernel path')
@@ -862,11 +944,14 @@ def parse_args():
     parser.add_argument('--backward-max-abs-tol', type=float, default=2e-1)
     parser.add_argument('--backward-calc-diff-tol', type=float, default=1e-4)
     parser.add_argument('--backward-cos-tol', type=float, default=0.80)
-    parser.add_argument('--compute-batch-size', type=int, default=1024,
+    parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
                         help='Compute batch size per expert before triggering GEMM (default: 4096)')
-    parser.add_argument('--combine-start-head-percent', type=int, default=50,
+    parser.add_argument('--combine-start-head-percent', type=int, default=70,
                         help='Combine SM starts when compute_task_head/tail >= this %% (0-100, default: 70)')
+    parser.add_argument('--check-warmup-precision', action='store_true',
+                        help='After each megakernel warmup iteration, run the baseline (DeepEP + TE/SonicMoE) '
+                             'with the same inputs and compare precision alignment')
     parser.add_argument('--mpirun', action='store_true')
     parser.add_argument('--quack-wgrad-selftest', action='store_true',
                         help='Run the standalone QuACK grouped-wgrad precision check and exit '
