@@ -17,7 +17,7 @@ import torch.distributed as dist
 from .buffer import Buffer
 
 COMPUTE_BATCH_SIZES = [1024, 2048, 4096]
-COMBINE_START_HEAD_PERCENTS = [40, 50, 60, 70, 80]
+COMBINE_START_HEAD_PERCENTS = [50, 60, 70, 80]
 
 
 def _run_autotune_megakernel_forward(
@@ -118,11 +118,6 @@ def autotune_megakernel(
                 batch_size=batch_size,
                 percent=percent,
             )
-            if verbose and (wi == 0 or (wi + 1) % 5 == 0):
-                torch.cuda.synchronize()
-                print(f'  [autotune] [{config_idx+1}/{total_configs}] '
-                      f'batch_size={batch_size}, percent={percent}% warmup iter {wi+1}/{warmup_iters} done',
-                      flush=True)
         torch.cuda.synchronize()
 
         # Synchronize after warmup before timed region
@@ -145,13 +140,13 @@ def autotune_megakernel(
                 batch_size=batch_size,
                 percent=percent,
             )
-            if verbose and (ti + 1) % 100 == 0:
-                torch.cuda.synchronize()
-                print(f'  [autotune] [{config_idx+1}/{total_configs}] '
-                      f'batch_size={batch_size}, percent={percent}% timed iter {ti+1}/{num_iters}',
-                      flush=True)
         end_event.record()
         torch.cuda.synchronize()
+
+        if verbose:
+            print(f'  [autotune] [{config_idx+1}/{total_configs}] '
+                  f'batch_size={batch_size}, percent={percent}% timed {num_iters} iters done',
+                  flush=True)
 
         elapsed_ms = start_event.elapsed_time(end_event)
         avg_ms = elapsed_ms / num_iters

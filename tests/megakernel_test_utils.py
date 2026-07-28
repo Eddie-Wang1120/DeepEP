@@ -4,6 +4,7 @@ import os
 from unittest.mock import MagicMock
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from packaging import version
 
@@ -204,6 +205,125 @@ def build_te_grouped_experts(W_gate, W_up, W_down, experts_per_rank):
                 getattr(fc2, f'weight{e}').copy_(W_down[e].contiguous())
 
     return te_ops.Sequential(fc1, act, fc2)
+
+
+class MegatronFusedDispatch(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, token_indices, token_probs, num_experts, buffer):
+        layout = buffer.get_dispatch_layout(token_indices, num_experts)
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = layout
+        recv_x, recv_indices, recv_probs, tokens_per_expert, handle, _ = buffer.dispatch(
+            x=x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+        )
+        ctx.buffer = buffer
+        ctx.handle = handle
+        return recv_x, recv_indices, recv_probs, torch.tensor(tokens_per_expert), handle
+
+    @staticmethod
+    def backward(ctx, grad_x, _grad_indices, grad_probs, _grad_tokens_per_expert, _grad_handle):
+        combined_x, combined_probs, _ = ctx.buffer.combine(
+            grad_x.contiguous(), ctx.handle,
+            topk_weights=None if grad_probs is None else grad_probs.float(),
+        )
+        return combined_x, None, combined_probs, None, None
+
+
+class MegatronFusedCombine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, buffer, handle):
+        output, _, _ = buffer.combine(x=x, handle=handle)
+        ctx.buffer = buffer
+        ctx.handle = handle
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_x, _, _, _, _, _ = ctx.buffer.dispatch(
+            grad_output.contiguous(), handle=ctx.handle)
+        return grad_x, None, None
+
+
+def run_megatron_fused_baseline(x, topk_idx, topk_weights, num_experts,
+                                 experts_per_rank, buffer, te_experts):
+    recv_x, recv_idx, recv_probs, tokens_per_expert, handle = MegatronFusedDispatch.apply(
+        x, topk_idx, topk_weights, num_experts, buffer)
+    local_output = moe_compute_on_recv_te(
+        recv_x, recv_idx, recv_probs, tokens_per_expert,
+        te_experts, {}, experts_per_rank, use_fp8=False)
+    return MegatronFusedCombine.apply(local_output, buffer, handle)
+
+
+def start_memory_measurement():
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    return torch.cuda.memory_allocated()
+
+
+def record_forward_memory(start_allocated):
+    torch.cuda.synchronize()
+    return max(0, torch.cuda.memory_allocated() - start_allocated)
+
+
+def finish_memory_measurement(start_allocated, activation_retained, phase):
+    torch.cuda.synchronize()
+    peak_allocated = max(0, torch.cuda.max_memory_allocated() - start_allocated)
+    peak_reserved = torch.cuda.max_memory_reserved()
+    print(
+        f'  [{phase} memory] forward activation retained: '
+        f'{activation_retained / 1024 ** 2:.2f} MiB, '
+        f'peak allocated increment (fwd+bwd): {peak_allocated / 1024 ** 2:.2f} MiB, '
+        f'peak reserved (absolute): {peak_reserved / 1024 ** 2:.2f} MiB, '
+        f'allocated before forward: {start_allocated / 1024 ** 2:.2f} MiB',
+        flush=True,
+    )
+    return activation_retained, peak_allocated, peak_reserved
+
+
+def report_memory_comparison(baseline_memory, megakernel_memory, baseline_name):
+    names = ('forward activation retained', 'peak allocated increment (fwd+bwd)', 'peak reserved')
+    print(f'  [Memory comparison] Megakernel - {baseline_name}:', flush=True)
+    for name, baseline_value, megakernel_value in zip(names, baseline_memory, megakernel_memory):
+        delta = megakernel_value - baseline_value
+        ratio = 100.0 * delta / baseline_value if baseline_value else float('nan')
+        print(f'    {name}: {delta / 1024 ** 2:+.2f} MiB ({ratio:+.2f}%)', flush=True)
+
+
+def clear_parameter_grads(module):
+    for parameter in module.parameters():
+        parameter.grad = None
+
+
+def benchmark_cuda_events(fn, warmup_iters, repeat_iters, group=None):
+    if warmup_iters < 0:
+        raise ValueError(f'warmup_iters must be >= 0, got {warmup_iters}')
+    if repeat_iters <= 0:
+        raise ValueError(f'repeat_iters must be > 0, got {repeat_iters}')
+
+    if group is not None:
+        dist.barrier(group=group)
+    torch.cuda.synchronize()
+
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+
+    if group is not None:
+        dist.barrier(group=group)
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(repeat_iters):
+        fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    return start_event.elapsed_time(end_event) / repeat_iters
 
 
 def get_te_grouped_expert_weight_grads(te_experts, experts_per_rank):

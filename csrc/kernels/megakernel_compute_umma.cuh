@@ -956,12 +956,6 @@ CUTLASS_DEVICE void sm100_store_cd_row_scatter(
                 tmem_empty_barrier->arrive(0u);
             }
 
-            // FIX #4: fence async proxy operations (TMEM loads → st_shared) before the
-            // barrier that gates the scatter reads. Without this, other threads in
-            // the NamedBarrier group may read stale smem (TMEM→smem stores not yet
-            // committed). The original DeepGEMM epilogue uses cute::tma_store_fence()
-            // here which serves the same proxy-fence role for the TMA store path.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
             const uint32_t epi_tid = epilogue_warp_idx * 32 + lane_idx;
@@ -982,19 +976,10 @@ CUTLASS_DEVICE void sm100_store_cd_row_scatter(
 
                 const int recv_token = scatter.recv_token_idx[global_row];
                 const uint32_t hidden_i4 = (n_idx >> 3) + seg;
-                // FIX #5: Use st.global.cg (cache-global, bypass L1 allocate) so that
-                // consumer SMs (gather worker, combine sender) never see stale L1
-                // cache lines for these addresses.
                 if (scatter.is_single[global_row]) {
-                    int4* dst = &scatter.combine_input_i4[(int64_t)recv_token * scatter.hidden_int4 + hidden_i4];
-                    asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "l"(dst), "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w)
-                        : "memory");
+                    scatter.combine_input_i4[(int64_t)recv_token * scatter.hidden_int4 + hidden_i4] = packed;
                 } else {
-                    int4* dst = &scatter.compute_output_slot_i4[(int64_t)(scatter.slot_base + global_row) * scatter.hidden_int4 + hidden_i4];
-                    asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                        :: "l"(dst), "r"(packed.x), "r"(packed.y), "r"(packed.z), "r"(packed.w)
-                        : "memory");
+                    scatter.compute_output_slot_i4[(int64_t)(scatter.slot_base + global_row) * scatter.hidden_int4 + hidden_i4] = packed;
                 }
             }
 

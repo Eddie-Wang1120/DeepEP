@@ -895,7 +895,6 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
         // Device-scope __threadfence() is insufficient because TMA engines may
         // bypass L1 and observe stale L2 data when the memory subsystem is under
         // pressure (e.g., concurrent GEMMs on other SMs).
-        __threadfence_system();
 #if MK_PERF_TRACE_ARGS
         if (lane_id == 0) {
             int64_t now = globaltimer_ns();
@@ -2307,7 +2306,6 @@ __device__ void dispatch_worker_v2(
                     ++producer_tail;
                     ++producer_batch_count;
                     if (producer_batch_count >= PUB_PRODUCE_BATCH) {
-                        __threadfence_system();  // system-scope: recv_tokens stores must be visible to TMA on compute SMs
                         st_na_release(&state->pub_ring_tail[pub_warp_idx], producer_tail);
                         producer_batch_count = 0;
                     }
@@ -2339,7 +2337,6 @@ __device__ void dispatch_worker_v2(
         __syncwarp();
         if (lane_id == 0) {
             if (producer_batch_count > 0) {
-                __threadfence_system();  // system-scope: flush recv_tokens stores for TMA visibility
                 st_na_release(&state->pub_ring_tail[pub_warp_idx], producer_tail);
 #if MK_PERF_TRACE_ARGS
                 int round_idx = target_rank / NUM_MAX_NVL_PEERS;
@@ -2642,115 +2639,43 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     const int tid = threadIdx.x;
     if (tid < GATHER_SCHED_TID_BEGIN)
         return;
-
-    constexpr int kGatherBatchTokens = 64;
-    constexpr int kGatherTailBatchTokens = 8;
     const int gather_tid = tid - GATHER_SCHED_TID_BEGIN;
     const int gather_threads = blockDim.x - GATHER_SCHED_TID_BEGIN;
     if (gather_threads <= 0)
         return;
 
-    const int gather_lane = gather_tid & 31;
-    const int gather_warp_idx = gather_tid >> 5;
-    const int gather_num_warps = (gather_threads + 31) / 32;
-    if (gather_warp_idx >= GATHER_SCHED_MAX_WARPS)
-        return;
-
-    __shared__ int s_gather_batch_tokens[GATHER_SCHED_MAX_WARPS][kGatherBatchTokens];
-    __shared__ int s_gather_batch_count[GATHER_SCHED_MAX_WARPS];
-
-    if (gather_lane == 0)
-        s_gather_batch_count[gather_warp_idx] = 0;
-    __syncwarp();
-
     const int total_tokens = state->combine_num_tokens;
-    const int cursor_idx = scheduler_id * GATHER_SCHED_MAX_WARPS + gather_warp_idx;
-    const int cursor_start = scheduler_id + gather_warp_idx * num_schedulers * 32;
-    const int warp_stride = gather_num_warps * num_schedulers * 32;
-    const int lane_stride = num_schedulers;
-    int cursor = ld_nc_global(&state->gather_scan_cursor[cursor_idx]);
-    if (cursor < cursor_start || cursor >= total_tokens)
-        cursor = cursor_start;
 
-    const int scan_groups = (total_tokens > cursor_start) ? ((total_tokens - cursor_start + warp_stride - 1) / warp_stride) : 0;
-    const bool dispatch_finished = ld_acquire_global(state->publish_all_done) != 0;
-    const int target_batch_tokens = dispatch_finished ? kGatherTailBatchTokens : kGatherBatchTokens;
-    const int max_scan_groups = scan_groups;
-    int scan_steps = 0;
+    // Each gather-scheduler thread independently scans a strided slice of tokens.
+    // No warp collectives and no shared-memory batching, so there is no divergence
+    // hazard: a ready multi-hit token is claimed exactly once via CAS and pushed as
+    // a single-token entry into the FIFO (gather_ready_queue), whose visible length
+    // is gather_ready_reserve_tail. The consumer (gather_worker) detects a not-yet
+    // written slot via the -1 sentinel.
+    for (int token = gather_tid; token < total_tokens; token += gather_threads) {
+        if (ld_acquire_global(&state->gather_claimed[token]) != 0)
+            continue;
+        const int nhits = ld_acquire_global(&state->token_nhits[token]);
+        if (nhits <= 1)
+            continue;
+        const int expected = ld_acquire_global(&state->token_compute_expected[token]);
+        const int done = ld_acquire_global(&state->token_done_count[token]);
+        if (expected != nhits || done < nhits)
+            continue;
+        if (atomicCAS(&state->gather_claimed[token], 0, 1) != 0)
+            continue;
 
-    // Interleave by token index so scheduler SM0 scans token_idx % 2 == 0 and
-    // scheduler SM1 scans token_idx % 2 == 1. All lanes in a gather scheduler
-    // warp scan in parallel and compact ready multi-hit tokens into one task.
-    while (scan_steps < max_scan_groups && s_gather_batch_count[gather_warp_idx] < target_batch_tokens) {
-        const int token = cursor + gather_lane * lane_stride;
-        bool ready = false;
-        if (token < total_tokens && ld_nc_global(&state->gather_claimed[token]) == 0) {
-            int nhits = ld_acquire_global(&state->token_nhits[token]);
-            if (nhits > 1) {
-                int expected = ld_acquire_global(&state->token_compute_expected[token]);
-                int done = ld_acquire_global(&state->token_done_count[token]);
-                ready = (expected == nhits && done >= nhits);
-            }
+        const int slot = atomicAdd(state->gather_ready_reserve_tail, 1);
+        if (slot >= state->max_total_recv_tokens) {
+            printf("MK gather ready queue overflow, rank=%d slot=%d max=%d\n",
+                   state->rank, slot, state->max_total_recv_tokens);
+            __threadfence_system(); trap();
         }
-
-        unsigned ready_mask = __ballot_sync(0xffffffff, ready);
-        const int ready_count = __popc(ready_mask);
-        int base = 0;
-        int space = 0;
-        if (gather_lane == 0) {
-            base = s_gather_batch_count[gather_warp_idx];
-            space = max(target_batch_tokens - base, 0);
-        }
-        base = __shfl_sync(0xffffffff, base, 0);
-        space = __shfl_sync(0xffffffff, space, 0);
-
-        const int ready_rank = __popc(ready_mask & ((1u << gather_lane) - 1));
-        bool claimed = ready && ready_rank < space && atomicCAS(&state->gather_claimed[token], 0, 1) == 0;
-        unsigned claimed_mask = __ballot_sync(0xffffffff, claimed);
-        const int claimed_count = __popc(claimed_mask);
-        const int claimed_rank = __popc(claimed_mask & ((1u << gather_lane) - 1));
-        if (claimed)
-            s_gather_batch_tokens[gather_warp_idx][base + claimed_rank] = token;
-        if (gather_lane == 0)
-            s_gather_batch_count[gather_warp_idx] = base + claimed_count;
-
-        cursor += warp_stride;
-        if (cursor >= total_tokens)
-            cursor = cursor_start;
-        ++scan_steps;
-    }
-    __syncwarp();
-
-    int batch_count = s_gather_batch_count[gather_warp_idx];
-    if (batch_count > kGatherBatchTokens)
-        batch_count = kGatherBatchTokens;
-    if (gather_lane == 0)
-        state->gather_scan_cursor[cursor_idx] = cursor;
-    if (batch_count == 0 || gather_lane != 0)
-        return;
-
-    int token_base = atomicAdd(state->gather_ready_reserve_tail, batch_count);
-    if (token_base + batch_count > state->max_total_recv_tokens) {
-        printf("MK gather task token queue overflow, rank=%d base=%d count=%d max=%d\n",
-               state->rank, token_base, batch_count, state->max_total_recv_tokens);
-        __threadfence_system(); trap();
-    }
-    for (int i = 0; i < batch_count; ++i)
-        state->gather_ready_queue[token_base + i] = s_gather_batch_tokens[gather_warp_idx][i];
-
-    int task_idx = atomicAdd(state->gather_task_count, 1);
-    if (task_idx >= state->max_total_recv_tokens) {
-        printf("MK gather task queue overflow, rank=%d task=%d max=%d\n",
-               state->rank, task_idx, state->max_total_recv_tokens);
-        __threadfence_system(); trap();
-    }
-    state->gather_task_tokens[task_idx] = token_base;
-    state->gather_task_nhits[task_idx] = batch_count;
-    __threadfence();
-    while (atomicCAS(state->gather_ready_tail, task_idx, task_idx + 1) != task_idx) {
-        if (ld_acquire_global(state->combine_all_done) != 0)
-            break;
-        __nanosleep(32);
+        // Publish the token: make the store globally visible, then write it. The
+        // reserve counter was bumped before this store, so a consumer that sees
+        // head < reserve_tail spins on the -1 sentinel until this write lands.
+        __threadfence_system();
+        st_na_global(&state->gather_ready_queue[slot], token);
     }
 }
 
@@ -3302,12 +3227,6 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_up_body_ns = globaltimer_ns();
 #endif
-            // FIX: gate/up's SwiGLU epilogue writes up_buf via TMA store. The
-            // tma_store_wait<0>() inside dg_gemm_persistent only runs on epilogue
-            // warp 0. Other threads need a proxy fence to see the TMA store results.
-            // Without this, subsequent reads of up_buf (diagnostics, down-proj TMA
-            // A-load on other SMs) may see stale data.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
@@ -3323,16 +3242,6 @@ __device__ __forceinline__ void compute_worker_core(
         const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
-
-            // FIX: Ensure gate/up TMA store to up_buf is globally visible before
-            // down-proj's TMA A-load reads from it. __threadfence() only fences
-            // normal loads/stores; TMA operations may bypass L1 and require an
-            // explicit fence to guarantee L2 coherence across SM TMA units.
-            // This fence + syncthreads ensures all prior TMA stores (from gate/up
-            // epilogue) are committed to L2 before any TMA load in down-proj begins.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            __syncthreads();
-
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
@@ -3366,11 +3275,6 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
             if (perf_leader) perf_down_body_ns = globaltimer_ns();
 #endif
-            // #7: fence async proxy ops + system-scope fence before cross-SM group barrier.
-            // Required: scatter epilogue's st.global.cg must be committed to L2 before
-            // other SMs in the group (or gather/combine SMs) read the data.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            __threadfence_system();
             compute_group_sync(state, group_id, group_size);
         }
 #if MK_PERF_TRACE_ARGS
@@ -3414,14 +3318,9 @@ __device__ __forceinline__ void compute_worker_core(
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
-        // Device-scope fence: the UMMA scatter epilogue wrote per-slot data to
-        // compute_output_slot / combine_input. Fence the backward-save writes AND
-        // the scatter stores before any SM publishes ready flags.
-        // RACE #3 DIAG: upgrade to system-scope fence to ensure scatter stores are
-        // visible to gather SMs (which read via plain loads from a different SM).
-        // If NaN disappears with __threadfence_system() but reappears with __threadfence(),
-        // this confirms the cross-SM visibility race on compute_output_slot.
-        __threadfence_system();
+        // Device-scope fence: the UMMA epilogue has already made the down output visible.
+        // Fence the backward-save writes before any SM publishes ready flags.
+        __threadfence();
         compute_group_sync(state, group_id, group_size);
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
@@ -4735,9 +4634,11 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
     const int total_tokens = state->combine_num_tokens;
     if (total_tokens == 0) return;
 
-    __shared__ int s_token_base;
+    constexpr int kGatherBatch = 64;   // max tokens claimed per iteration
+    __shared__ int s_head_base;
     __shared__ int s_batch_count;
     __shared__ int s_has_task;
+    __shared__ int s_tokens[kGatherBatch];
 
     while (true) {
 #if MK_PERF_TRACE_ENABLED
@@ -4750,30 +4651,54 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
 #endif
         if (tid == 0) {
             s_has_task = 0;
-            s_token_base = 0;
+            s_head_base = 0;
             s_batch_count = 0;
-            while (ld_acquire_global(state->combine_all_done) == 0) {
-                int head = ld_acquire_global(state->gather_ready_head);
-                int tail = ld_acquire_global(state->gather_ready_tail);
-                if (head < tail && atomicCAS(state->gather_ready_head, head, head + 1) == head) {
-                    s_token_base = ld_acquire_global(&state->gather_task_tokens[head]);
-                    s_batch_count = ld_acquire_global(&state->gather_task_nhits[head]);
-                    s_has_task = (s_batch_count > 0) ? 1 : 0;
-                    break;
+            // Claim a contiguous range [head, head+batch) of the single-token FIFO via CAS.
+            // batch is bounded by the visible reserve_tail, so we never advance head past
+            // produced entries; competing gather SMs get disjoint ranges.
+            while (true) {
+                const int tail = ld_acquire_global(state->gather_ready_reserve_tail);
+                const int head = ld_acquire_global(state->gather_ready_head);
+                if (head < tail) {
+                    int batch = tail - head;
+                    if (batch > kGatherBatch) batch = kGatherBatch;
+                    if (atomicCAS(state->gather_ready_head, head, head + batch) == head) {
+                        s_head_base = head;
+                        s_batch_count = batch;
+                        s_has_task = 1;
+                        break;
+                    }
+                    // Lost the range race; retry with a fresh snapshot.
+                } else {
+                    if (ld_acquire_global(state->combine_all_done) != 0)
+                        break;
+                    __nanosleep(64);
                 }
-                __nanosleep(64);
             }
         }
         __syncthreads();
         if (!s_has_task)
             break;
+
+        const int head_base = s_head_base;
+        const int batch_count = s_batch_count;
+
+        // Resolve the batch's token ids, spinning on the -1 sentinel until each producer's
+        // store lands (reserve counter is bumped before the token write).
+        for (int batch_idx = tid; batch_idx < batch_count; batch_idx += blockDim.x) {
+            int token = ld_acquire_global(&state->gather_ready_queue[head_base + batch_idx]);
+            while (token < 0) {
+                __nanosleep(32);
+                token = ld_acquire_global(&state->gather_ready_queue[head_base + batch_idx]);
+            }
+            s_tokens[batch_idx] = token;
+        }
+        __syncthreads();
 #if MK_PERF_TRACE_ARGS
         if (tid == 0)
             perf_scan_done_ns = globaltimer_ns();
 #endif
 
-        const int token_base = s_token_base;
-        const int batch_count = s_batch_count;
         constexpr int kElemsPerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
         constexpr int kBfloat162PerInt4 = kElemsPerInt4 / 2;
         const int hidden = state->combine_hidden;
@@ -4782,18 +4707,12 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
 #if MK_PERF_TRACE_ARGS
-        int first_token = -1;
-        int last_token = -1;
+        int first_token = batch_count > 0 ? s_tokens[0] : -1;
+        int last_token = batch_count > 0 ? s_tokens[batch_count - 1] : -1;
         int nhit_sum = 0;
         if (tid == 0) {
-            for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
-                const int token_idx = state->gather_ready_queue[token_base + batch_idx];
-                const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
-                if (batch_idx == 0)
-                    first_token = token_idx;
-                last_token = token_idx;
-                nhit_sum += nhits;
-            }
+            for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx)
+                nhit_sum += ld_acquire_global(&state->token_nhits[s_tokens[batch_idx]]);
         }
 #endif
 
@@ -4808,7 +4727,7 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         for (int work = warp_id; work < total_work; work += num_warps) {
             const int batch_idx = work / chunks_per_token;
             const int chunk = work - batch_idx * chunks_per_token;
-            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+            const int token_idx = s_tokens[batch_idx];
             const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
             const int chunk_base = chunk * kGatherChunkInt4;
             const int chunk_end = min(chunk_base + kGatherChunkInt4, hidden_int4);
@@ -4851,10 +4770,13 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         }
 
         __syncthreads();
-        __threadfence();
+        // System-scope fence: combine_input[token] is consumed by the combine sender via
+        // TMA on a different SM, which can bypass L1 and observe stale L2 under a device
+        // fence. Publish readiness only after the reduce is globally visible.
+        __threadfence_system();
 
         for (int batch_idx = tid; batch_idx < batch_count; batch_idx += blockDim.x) {
-            const int token_idx = state->gather_ready_queue[token_base + batch_idx];
+            const int token_idx = s_tokens[batch_idx];
             atomicExch(&state->combine_token_ready[token_idx], 1);
         }
         __syncthreads();
@@ -5305,7 +5227,7 @@ static void dump_perf_trace_perfetto(const MegaKernelState& host_state, int tota
         int group_id = static_cast<int>(rec[3]);
         int batch_size = static_cast<int>(rec[5]);
         int tid = compute_tid_base + group_id;
-        const bool is_partial_batch = batch_size < COMPUTE_BATCH_SIZE;
+        const bool is_partial_batch = batch_size < host_state.compute_batch_size;
         const char* task_color = is_partial_batch ? "terrible" : "good";
         const char* task_name = is_partial_batch ? "compute_task_partial" : "compute_task_full";
         emit_colored_event(task_name, "compute_group", task_color,
@@ -7315,7 +7237,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMalloc(&combine_token_ready, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_token_ready, 0, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_ready_queue, (size_t)max_total_recv_tokens * sizeof(int)));
-    CUDA_CHECK(cudaMemset(gather_ready_queue, 0, (size_t)max_total_recv_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMemset(gather_ready_queue, 0xff, (size_t)max_total_recv_tokens * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_ready_head, sizeof(int)));
     CUDA_CHECK(cudaMemset(gather_ready_head, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&gather_ready_tail, sizeof(int)));
@@ -9226,8 +9148,20 @@ __device__ __forceinline__ void compute_backward_worker_core(
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
             int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
             int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
+            // while (__builtin_expect(recv_token < 0 || recv_token >= state->max_total_recv_tokens, 0)) {
+            //     __nanosleep(32);
+            //     recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
+            // }
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+            // while (__builtin_expect(topk_slot < 0 || topk_slot >= state->num_topk, 0)) {
+                // __nanosleep(32);
+                // topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
+            // }
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
+            // while (__builtin_expect(expected <= 0, 0)) {
+            //     __nanosleep(32);
+            //     expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
+            // }
             s_recv_token_idx[i] = recv_token;
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
@@ -9442,26 +9376,15 @@ __device__ __forceinline__ void compute_backward_worker_core(
             int v = idx - row * hidden_int4;
             int slot = slot_base + row;
             int4 data = down_i4[idx];
-            if (s_is_single[row]) {
-                int4* dst = &token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v];
-                asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "l"(dst), "r"(data.x), "r"(data.y), "r"(data.z), "r"(data.w)
-                    : "memory");
-            } else {
-                int4* dst = &slot_out_i4[(int64_t)slot * hidden_int4 + v];
-                asm volatile("st.global.cg.v4.b32 [%0], {%1,%2,%3,%4};"
-                    :: "l"(dst), "r"(data.x), "r"(data.y), "r"(data.z), "r"(data.w)
-                    : "memory");
-            }
+            if (s_is_single[row])
+                token_out_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v] = down_i4[idx];
+            else
+                slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_out_body_ns = globaltimer_ns();
 #endif
-        // System-scope fence + proxy fence: ensure scatter stores are committed to L2
-        // before the cross-SM group barrier releases other SMs / gather workers to read.
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        __threadfence_system();
-        compute_group_sync(state, group_id, group_size);
+        __threadfence();
 #if MK_PERF_TRACE_ARGS
         if (perf_leader) perf_ph_output_ns = globaltimer_ns();
 #endif
@@ -10071,7 +9994,7 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.token_done_count, MTR * sizeof(int));
     z(hs.gather_claimed, MTR * sizeof(int));
     z(hs.combine_token_ready, MTR * sizeof(int));
-    z(hs.gather_ready_queue, MTR * sizeof(int));
+    f(hs.gather_ready_queue, MTR * sizeof(int));
     z(hs.gather_ready_head, sizeof(int));
     z(hs.gather_ready_tail, sizeof(int));
     z(hs.gather_ready_reserve_tail, sizeof(int));
