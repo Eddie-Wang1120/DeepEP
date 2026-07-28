@@ -275,7 +275,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             buffer, x, topk_idx, topk_weights, grad_output, num_experts,
             args, W_gateup, W_down, num_sms,
         )
-        if args.check_warmup_precision and baseline_reference is not None:
+        if args.check_warmup_precision:
             compare_against_baseline(f'warmup[{w + 1}]', warmup_result)
         dist.barrier(group=group)
         torch.cuda.synchronize()
@@ -291,8 +291,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             buffer, x, topk_idx, topk_weights, grad_output, num_experts,
             args, W_gateup, W_down, num_sms,
         )
-        if baseline_reference is not None:
-            compare_against_baseline(f'repeat[{repeat_idx + 1}]', result)
+        compare_against_baseline(f'repeat[{repeat_idx + 1}]', result)
         dist.barrier(group=group)
         torch.cuda.synchronize()
 
@@ -374,12 +373,12 @@ def parse_args():
         default='sigmoid')
     parser.add_argument('--router-num-groups', type=int, default=0)
     parser.add_argument('--router-group-topk', type=int, default=0)
-    parser.add_argument('--forward-max-abs-tol', type=float, default=1e-1)
+    parser.add_argument('--forward-max-abs-tol', type=float, default=1e-2)
     parser.add_argument('--forward-calc-diff-tol', type=float, default=1e-5)
-    parser.add_argument('--forward-cos-tol', type=float, default=0.85)
-    parser.add_argument('--backward-max-abs-tol', type=float, default=2e-1)
-    parser.add_argument('--backward-calc-diff-tol', type=float, default=1e-4)
-    parser.add_argument('--backward-cos-tol', type=float, default=0.80)
+    parser.add_argument('--forward-cos-tol', type=float, default=0.99)
+    parser.add_argument('--backward-max-abs-tol', type=float, default=1e-2)
+    parser.add_argument('--backward-calc-diff-tol', type=float, default=1e-5)
+    parser.add_argument('--backward-cos-tol', type=float, default=0.99)
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
                         help='Megakernel compute batch size per expert')
