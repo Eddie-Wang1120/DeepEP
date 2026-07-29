@@ -17,7 +17,7 @@ import torch.distributed as dist
 from .buffer import Buffer
 
 COMPUTE_BATCH_SIZES = [1024, 2048, 4096]
-COMBINE_START_HEAD_PERCENTS = [50, 60, 70, 80]
+COMBINE_START_HEAD_PERCENTS = [40, 50, 60, 70, 80, 90]
 
 
 def _run_autotune_gigamoe_forward(

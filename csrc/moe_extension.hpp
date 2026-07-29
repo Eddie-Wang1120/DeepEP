@@ -19,7 +19,7 @@
 #include "kernels/exception.cuh"
 
 #ifndef TORCH_EXTENSION_NAME
-#define TORCH_EXTENSION_NAME deep_ep_cpp
+#define TORCH_EXTENSION_NAME gigamoe_cpp
 #endif
 
 namespace shared_memory {

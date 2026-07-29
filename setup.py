@@ -157,7 +157,7 @@ if __name__ == '__main__':
                      version='0.0.1' + revision,
                      packages=setuptools.find_packages(include=['gigamoe']),
                      ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
+                         CUDAExtension(name='gigamoe_cpp',
                                        include_dirs=include_dirs,
                                        library_dirs=library_dirs,
                                        sources=sources,

@@ -4,9 +4,9 @@ import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
-import deep_ep_cpp
+import gigamoe_cpp
 # noinspection PyUnresolvedReferences
-from deep_ep_cpp import Config, EventHandle
+from gigamoe_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
 
@@ -89,7 +89,7 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
-        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
+        self.runtime = gigamoe_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
         # Synchronize device IDs
@@ -148,7 +148,7 @@ class Buffer:
 
     @staticmethod
     def is_sm90_compiled():
-        return deep_ep_cpp.is_sm90_compiled()
+        return gigamoe_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -186,7 +186,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return gigamoe_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     def get_comm_stream(self) -> torch.Stream:
         """

@@ -91,7 +91,7 @@ GigaMOE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/REA
 
 ```bash
 NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-ln -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
+ln -s build/lib.linux-x86_64-cpython-38/gigamoe_cpp.cpython-38-x86_64-linux-gnu.so
 ```
 
 ### Install
