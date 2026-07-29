@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 # Under mpirun each process must bind its own GPU BEFORE anything creates a CUDA
-# context. Module-level imports below (torch, deep_ep, and megakernel_test_utils
+# context. Module-level imports below (torch, deep_ep, and gigamoe_test_utils
 # which calls torch.cuda.is_available() at import) can initialize CUDA on
 # physical device 0 for every local rank, which later makes NCCL raise
 # "Duplicate GPU detected". Pin CUDA_VISIBLE_DEVICES from the MPI local-rank
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 from utils import calc_diff, init_dist
 
-from megakernel_test_utils import (
+from gigamoe_test_utils import (
     build_te_grouped_experts,
     clear_parameter_grads,
     get_te_grouped_expert_weight_grads,

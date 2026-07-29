@@ -238,31 +238,6 @@ void cached_notify(int hidden_int4,
                    bool is_cached_dispatch,
                    bool low_latency_mode);
 
-// Megakernel-specific cached notify launcher. Original DeepEP paths should keep using
-// cached_notify so baseline behavior stays isolated.
-void mk_cached_notfy(int hidden_int4,
-                     int num_scales,
-                     int num_topk_idx,
-                     int num_topk_weights,
-                     int num_ranks,
-                     int num_channels,
-                     int num_combined_tokens,
-                     int* combined_rdma_head,
-                     const int* rdma_channel_prefix_matrix,
-                     const int* rdma_rank_prefix_sum,
-                     int* combined_nvl_head,
-                     void* rdma_buffer_ptr,
-                     int num_max_rdma_chunked_recv_tokens,
-                     void** buffer_ptrs,
-                     int num_max_nvl_chunked_recv_tokens,
-                     int** barrier_signal_ptrs,
-                     int rank,
-                     cudaStream_t stream,
-                     int64_t num_rdma_bytes,
-                     int64_t num_nvl_bytes,
-                     bool is_cached_dispatch,
-                     bool low_latency_mode,
-                     bool skip_rdma_clean);
 
 void combine(cudaDataType_t type,
              void* combined_x,
@@ -541,3 +516,30 @@ void free_host(megakernel_debug::MegaKernelState* ptr);
 }  // namespace megakernel_state_cache
 
 }  // namespace deep_ep
+
+namespace gigamoe {
+
+void mk_cached_notfy(int hidden_int4,
+                     int num_scales,
+                     int num_topk_idx,
+                     int num_topk_weights,
+                     int num_ranks,
+                     int num_channels,
+                     int num_combined_tokens,
+                     int* combined_rdma_head,
+                     const int* rdma_channel_prefix_matrix,
+                     const int* rdma_rank_prefix_sum,
+                     int* combined_nvl_head,
+                     void* rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens,
+                     void** buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens,
+                     int** barrier_signal_ptrs,
+                     int rank,
+                     cudaStream_t stream,
+                     int64_t num_rdma_bytes,
+                     int64_t num_nvl_bytes,
+                     bool is_cached_dispatch,
+                     bool skip_rdma_clean);
+
+}  // namespace gigamoe

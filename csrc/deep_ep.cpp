@@ -2376,7 +2376,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify skips
         // RDMA metadata clean so the in-kernel combine prelude is the single owner of that clear.
         void* combine_rdma_ptr = rdma_buffer_ptr;
-        internode::mk_cached_notfy(hidden_int4,
+        ::gigamoe::mk_cached_notfy(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
                                  num_topk,   // num_topk_weights
@@ -2398,13 +2398,12 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
                                  num_nvl_bytes,
                                  true,       // is_cached_dispatch: clean-only. Makes cached_notify's
                                              // sm_id==1/>=2 head-normalization warps return early
-                                             // (internode.cu:1432/1465), so the null head/prefix
-                                             // pointers are never dereferenced. Only sm_id==0 runs,
+                                            // (gigamoe_notify.cu cached_notify), so the null head/prefix
+                                            // pointers are never dereferenced. Only sm_id==0 runs,
                                              // which does the NVL clean + cross-rank barrier.
                                              // get_nvl_clean_meta ignores this flag, so the combine
                                              // clean range is unchanged. MK does its own head
                                              // normalization inside the combine worker.
-                                 low_latency_mode,
                                  true);     // skip_rdma_clean: MK prelude owns the RDMA clean on
                                              // the shared combine region after dispatch drains.
     }

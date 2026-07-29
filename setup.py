@@ -26,7 +26,7 @@ if __name__ == '__main__':
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
             print(
-                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
+                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode features are disabled\n'
             )
             disable_nvshmem = True
     else:
@@ -35,23 +35,31 @@ if __name__ == '__main__':
     if not disable_nvshmem:
         assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
 
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/kernels/megakernel_forward_backward.cu']
-    include_dirs = ['csrc/']
-    # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute (S4.4 / MEGAKERNEL_COMPUTE_DESIGN.md I.9.10).
-    # Header-only; only adds include paths. cutlass_ref is the cloned NVIDIA/cutlass v4.5.2.
-    _cutlass_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cutlass_ref')
+    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/gigamoe/gigamoe_orchestrator.cu']
+    include_dirs = [os.path.join(_repo_root, 'csrc')]
+    _third_party_root = os.path.join(_repo_root, 'third-party')
+
+    # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute.
+    # Header-only; only adds include paths from the vendored third-party tree.
+    _cutlass_root = os.path.join(_third_party_root, 'cutlass')
     if os.path.isdir(os.path.join(_cutlass_root, 'include')):
         include_dirs.append(os.path.join(_cutlass_root, 'include'))
         include_dirs.append(os.path.join(_cutlass_root, 'tools', 'util', 'include'))
-    _deepgemm_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'DeepGEMM')
+
+    _deepgemm_root = os.path.join(_third_party_root, 'DeepGEMM')
     _deepgemm_include = os.path.join(_deepgemm_root, 'deep_gemm', 'include')
     _deepgemm_cutlass_include = os.path.join(_deepgemm_root, 'third-party', 'cutlass', 'include')
     if os.path.isdir(_deepgemm_include):
         include_dirs.append(_deepgemm_include)
     if os.path.isdir(_deepgemm_cutlass_include):
         include_dirs.append(_deepgemm_cutlass_include)
+
+    _quack_root = os.path.join(_third_party_root, 'quack')
+    if os.path.isdir(os.path.join(_quack_root, 'quack')):
+        include_dirs.append(_quack_root)
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
@@ -61,7 +69,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu', 'csrc/gigamoe/gigamoe_notify.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
         # CCCL (libcudacxx) headers needed by nvshmem_tensor.h for cuda/std/tuple
         cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')

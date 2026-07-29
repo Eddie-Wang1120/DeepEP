@@ -52,7 +52,7 @@ GigaMOE uses one persistent kernel to coordinate five types of workers.
 
 ### SM Role Layout
 
-![GigaMOE SM role timeline](docs/SM_role.png)
+![GigaMOE SM role timeline](figures/SM_role.png)
 
 - **Dispatch**: routes tokens to remote experts, writes received expert inputs, and publishes token-ready signals for downstream compute.
 - **Scheduler**: observes per-expert token readiness, forms compute batches, and flushes the remaining tail work after dispatch completes.
@@ -62,7 +62,7 @@ GigaMOE uses one persistent kernel to coordinate five types of workers.
 
 ### Execution Flow
 
-![GigaMOE signal passing](docs/signal_pass.png)
+![GigaMOE signal passing](figures/signal_pass.png)
 
 The workers communicate through lightweight readiness signals. Dispatch publishes `token ready` signals, the scheduler groups ready tokens into compute batches, and compute publishes results to combine. When a token has multiple local expert hits (`nhit > 1`), gather reduces those partial results before combine consumes them.
 

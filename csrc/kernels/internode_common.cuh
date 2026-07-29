@@ -3,6 +3,7 @@
 #include "configs.cuh"
 #include "exception.cuh"
 #include "utils.cuh"
+#include <utility>
 
 namespace deep_ep {
 namespace internode {
@@ -33,6 +34,38 @@ __host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4,
     return static_cast<int>(align_up(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) +
                                          num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float),
                                      sizeof(int4)));
+}
+
+__host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(int hidden_int4,
+                                                                            int num_scales,
+                                                                            int num_topk_idx,
+                                                                            int num_topk_weights,
+                                                                            int num_rdma_ranks,
+                                                                            int num_rdma_recv_buffer_tokens,
+                                                                            int num_channels) {
+    return {(get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens *
+             num_rdma_ranks * 2 * num_channels) /
+                sizeof(int),
+            (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
+}
+
+__host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int hidden_int4,
+                                                                           int num_scales,
+                                                                           int num_topk_idx,
+                                                                           int num_topk_weights,
+                                                                           int num_rdma_ranks,
+                                                                           int num_nvl_ranks,
+                                                                           int num_nvl_recv_buffer_tokens,
+                                                                           int num_channels,
+                                                                           bool is_dispatch) {
+    EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+
+    return {
+        (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks *
+         num_channels) /
+            sizeof(int),
+        num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels,
+    };
 }
 
 template <bool kLowLatencyMode>

@@ -1,5 +1,5 @@
 /**
- * megakernel_forward_backward.cu: Fused dispatch, compute, combine, and backward debug path
+ * gigamoe_orchestrator.cu: Fused dispatch, compute, combine, and backward debug path
  *
  * Architecture:
  *   Single persistent kernel with overlapping phases:
@@ -19,18 +19,18 @@
  *   - Flush: dispatch_done flag -> compute processes tail < 128
  */
 
-#include "../config.hpp"
-#include "api.cuh"
-#include "buffer.cuh"
-#include "configs.cuh"
-#include "exception.cuh"
-#include "ibgda_device.cuh"
-#include "internode_common.cuh"
-#include "launch.cuh"
-#include "utils.cuh"
+#include "config.hpp"
+#include "kernels/api.cuh"
+#include "kernels/buffer.cuh"
+#include "kernels/configs.cuh"
+#include "kernels/exception.cuh"
+#include "kernels/ibgda_device.cuh"
+#include "kernels/internode_common.cuh"
+#include "kernels/launch.cuh"
+#include "kernels/utils.cuh"
 // S4.4 (route B2): Blackwell UMMA + 2CTA multicast TMA compute (CuTe). Isolated
 // header; only included here (nvcc TU), never by deep_ep.cpp (g++).
-#include "megakernel_compute_umma.cuh"
+#include "gigamoe_wrapper.cuh"
 
 #include <cute/arch/simd_sm100.hpp>
 
@@ -44,9 +44,6 @@
 #include <cstdlib>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
-#if MK_PERF_TRACE_ENABLED
-#include <cstdio>
-#endif
 
 namespace deep_ep {
 namespace megakernel_debug {
@@ -81,16 +78,6 @@ constexpr int MK_DISPATCH_ROLE_COUNT = megakernel_config::kDispatchRoleCount;
 constexpr int PUB_RING_DEPTH = megakernel_config::kPubRingDepth;
 constexpr int PUB_CONSUME_BATCH = megakernel_config::kPubConsumeBatch;
 constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
-// MK_RECV_DIRECT_STAGING: when enabled, the NVL receiver allocates the expert
-// slot inline and writes token data directly into the per-expert-contiguous
-// `recv_tokens[slot]` staging buffer (and stashes the slot into `pending_slot`
-// for the publisher), instead of only writing the global `combine_input`
-// namespace. This lets the compute worker read its GEMM input contiguously
-// (Step 3) rather than gathering scattered rows from `combine_input`.
-// Default 0 = original behavior (combine_input gather).
-#ifndef MK_RECV_DIRECT_STAGING
-#define MK_RECV_DIRECT_STAGING 1
-#endif
 
 enum TimeoutLogSite {
     kTimeoutLogComputeRoundFlush = 0,
@@ -256,10 +243,6 @@ struct MegaKernelState {
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
     int* token_slot_list;               // [max_total_recv_tokens * num_topk] absolute slot ids per hit
     int* expert_batch_enqueued;         // [num_local_experts * max_batches_per_expert] enqueue source: 0=none, 1=normal(combine-key), 3=tail
-#if MK_PERF_TRACE_ARGS
-    int64_t* expert_batch_enqueue_ts;   // [num_local_experts * max_batches_per_expert] publish timestamp for source attribution
-    int* token_priority_dep_count;      // [max_total_recv_tokens] number of token hit batches first enqueued by priority
-#endif
     int max_batches_per_expert;
     int* compute_group_barrier;         // [num_compute_groups] reusable global barrier counters
     int* compute_group_phase;           // [num_compute_groups] reusable global barrier phase flags
@@ -313,8 +296,8 @@ struct MegaKernelState {
     umma::InputTmaAtom_t* group_input_tma;   // device array [num_compute_groups]
     int num_compute_groups;                  // for indexing group_input_tma / barriers
     // Global TMA A-descriptor over recv_tokens[total_expert_slots + COMPUTE_BATCH_SIZE, hidden].
-    // Used by MK_RECV_DIRECT_STAGING to TMA-feed the gate/up GEMM directly from recv_tokens
-    // (A row base = expert_slot_base+start_slot passed as m_base), skipping the input_buf gather.
+    // Feeds the gate/up GEMM directly from recv_tokens (A row base = expert_slot_base+start_slot passed as m_base),
+    // skipping the input_buf gather.
     CUtensorMap recv_tokens_a_tma;
 
     // --- Compute output buffer ---
@@ -402,7 +385,7 @@ struct MegaKernelState {
     float* pending_topk_weights;      // [max_total_recv_tokens * num_topk] receiver-stashed routing weights
     internode::SourceMeta* pending_meta; // [max_total_recv_tokens] receiver-stashed SourceMeta
     // [max_total_recv_tokens * num_topk] receiver-allocated expert abs-slot per topk hit
-    // (MK_RECV_DIRECT_STAGING): -1 for non-hit topk slots, else expert_slot_base+slot.
+    // -1 for non-hit topk slots, else expert_slot_base+slot.
     int* pending_slot;
     int* pub_ring;                    // [num_pub_warps_total * PUB_RING_DEPTH] recv_token_idx queue
     int* pub_ring_head;               // [num_pub_warps_total] consumer cursor (publisher)
@@ -422,268 +405,6 @@ struct MegaKernelState {
     void* transient_arena_chunks[kMegakernelArenaChunkCap];
     int transient_arena_chunk_count;
 
-#if MK_PERF_TRACE_ENABLED
-    // Per-logical-channel timing. Each logical channel has sender and forwarder rows
-    // for both dispatch and combine so channel-level overlap is visible in Perfetto.
-    // Dispatch phases: 0=enter, 1=channel_barrier_start, 2=round_barrier_start, 3=exit
-    // Combine phases:  0=enter, 1=dispatch_done_acquired, 2=head_norm_done, 3=protocol_start, 4=exit
-    static constexpr int MK_PERF_NUM_LCH_PHASES = 5;
-    int64_t* perf_dispatch_lch_ts;     // [num_logical_channels * 2 * MK_PERF_NUM_LCH_PHASES]
-    int64_t* perf_combine_lch_ts;      // [num_logical_channels * 2 * MK_PERF_NUM_LCH_PHASES]
-    int64_t* perf_async_pub_start_ts;  // [num_pub_warps_total] publisher warp first active timestamp
-    int64_t* perf_async_pub_end_ts;    // [num_pub_warps_total] publisher warp exit timestamp
-    int64_t* perf_async_publish_all_done_ts; // [1] timestamp when publish_all_done is released
-    int64_t* perf_sched_ts;            // [2] scheduler start/end
-#endif
-#if MK_PERF_TRACE_ARGS
-    struct DispatchRoundTrace {
-        int64_t sender_work_begin_ns, sender_work_end_ns;
-        int64_t forwarder_wait_begin_ns, forwarder_wait_end_ns;
-        int64_t forwarder_work_begin_ns, forwarder_work_end_ns;
-        int64_t channel_barrier_arrival_ns, round_barrier_arrival_ns, async_publish_ns;
-        int64_t actual_token_count, rdma_packet_slot_count, polling_iteration_count;
-        int64_t ready_wait_ns, tail_head_wait_ns;
-    };
-    // Fixed round dimension: num_ranks / NUM_MAX_NVL_PEERS.
-    DispatchRoundTrace* perf_dispatch_round_trace;
-
-    // Accumulated semaphore-interaction times (ns), indexed [logical_ch * 2 + role].
-    // Rendered as args on existing dispatch/combine rows (no new rows added).
-    int64_t* perf_disp_wait_nvl_ns;        // NVL data-wait spin in dispatch NVL receiver
-    int64_t* perf_disp_publish_ns;         // publish expected/slot/source_info to compute
-    int64_t* perf_disp_wait_recvcount_ns;  // expert_recv_count ordered-advance spin
-    // publish breakdown (subset of perf_disp_publish_ns), all [logical_ch * 2 + role]
-    int64_t* perf_disp_pub_scan_ns;        // first topk scan + write topk weights
-    int64_t* perf_disp_pub_atomic_ns;      // atomicAdd(expected) + atomicAdd(expert_token_offsets)
-    int64_t* perf_disp_pub_fence_ns;       // __threadfence()
-    int64_t* perf_disp_pub_store_ns;       // st_release writes of source_info
-    int64_t* perf_disp_cta_barrier_ns;     // first CTA barrier after dispatch role work
-    int64_t* perf_disp_channel_barrier_ns; // logical-channel dispatch barrier wait
-    int64_t* perf_disp_round_barrier_ns;   // dispatch round barrier wait
-    int64_t* perf_disp_tokens;             // tokens processed by measured NVL receiver warp
-    int64_t* perf_disp_local_hit_tokens;   // tokens with local expert hits
-    int64_t* perf_disp_local_hits;         // total local expert hits
-    int64_t* perf_disp_cta_release_ts;     // [lch * 2] timestamp after first CTA barrier releases
-    int64_t* perf_disp_role_arrive_ts;     // [lch * 2 * role_count * NUM_MAX_NVL_PEERS] CTA barrier arrival timestamps
-    int64_t* perf_disp_role_work_ns;       // [lch * 2 * role_count * NUM_MAX_NVL_PEERS] role work time before first CTA barrier
-    int64_t* perf_disp_allrecv_wait_nvl_ns; // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver wait data
-    int64_t* perf_disp_allrecv_prefix_wait_ns;
-    int64_t* perf_disp_allrecv_prefix_wait_start_ts;
-    int64_t* perf_disp_allrecv_prefix_observe_ts;
-    int64_t* perf_disp_allrecv_prefix_done_ts;
-    int64_t* perf_disp_allrecv_prefix_start_first_negative_ts;
-    int64_t* perf_disp_allrecv_prefix_end_first_negative_ts;
-    int64_t* perf_disp_allrecv_prefix_pair_ready_ts;
-    int64_t* perf_disp_allrecv_prefix_poll_count;
-    int64_t* perf_disp_allrecv_prefix_mixed_poll_count;
-    int64_t* perf_disp_allrecv_prefix_slowest_rdma;
-    int64_t* perf_disp_allrecv_prefix_src_nvl;
-    int64_t* perf_disp_allrecv_prefix_raw_start;
-    int64_t* perf_disp_allrecv_prefix_raw_end;
-    int64_t* perf_disp_allrecv_token_loop_ns;
-    int64_t* perf_disp_allrecv_retire_ns;
-    int64_t* perf_disp_sender_meta_build_start_ts; // [lch * 2 * kNumRDMARanks]
-    int64_t* perf_disp_sender_meta_ready_ts;
-    int64_t* perf_disp_sender_meta_put_begin_ts;
-    int64_t* perf_disp_sender_meta_put_end_ts;
-    int64_t* perf_disp_sender_meta_raw_2;
-    int64_t* perf_disp_sender_meta_raw_3;
-    int64_t* perf_disp_prefix_meta_wait_start_ts; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks]
-    int64_t* perf_disp_prefix_meta_ready_ts;
-    int64_t* perf_disp_prefix_meta_first_negative_ts; // [... * 4], one timestamp per metadata word
-    int64_t* perf_disp_prefix_meta_mixed_poll_count;
-    int64_t* perf_disp_prefix_meta_poll_count;
-    int64_t* perf_disp_prefix_meta_raw_0;
-    int64_t* perf_disp_prefix_meta_raw_1;
-    int64_t* perf_disp_prefix_meta_raw_2;
-    int64_t* perf_disp_prefix_meta_raw_3;
-    int64_t* perf_disp_prefix_store_start_done_ts;
-    int64_t* perf_disp_prefix_store_begin_ts; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer before prefix stores
-    int64_t* perf_disp_prefix_publish_ts;   // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer after prefix stores
-    int64_t* perf_disp_prefix_fence_done_ts;
-    int64_t* perf_disp_prefix_store_to_fence_ns;
-    int64_t* perf_disp_prefix_meta_wait_ns; // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer wait for RDMA meta
-    int64_t* perf_disp_prefix_raw_start;
-    int64_t* perf_disp_prefix_raw_end;
-    int64_t* perf_disp_prefix_tokens;       // [lch * 2 * NUM_MAX_NVL_PEERS * kNumRDMARanks] producer token count
-    int64_t* perf_disp_prefix_producer_rank;
-    int64_t* perf_disp_prefix_producer_nvl;
-    int64_t* perf_disp_prefix_producer_dst_nvl;
-    int64_t* perf_disp_prefix_producer_src_rdma;
-    int64_t* perf_disp_allrecv_publish_ns;  // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver publish time
-    int64_t* perf_disp_allrecv_tokens;      // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver tokens
-    int64_t* perf_disp_allrecv_local_hits;  // [lch * 2 * NUM_MAX_NVL_PEERS] all NVL receiver local hits
-    int64_t* perf_async_pub_wait_ring_ns;   // [num_pub_warps_total] empty-ring sleep time
-    int64_t* perf_async_pub_poll_ns;        // [num_pub_warps_total] ring tail/done polling overhead
-    int64_t* perf_async_pub_gap_ns;         // [num_pub_warps_total] non-work gap between consumed tokens
-    int64_t* perf_async_pub_start_gap_ns;   // [num_pub_warps_total] worker-entry to first loop gap
-    int64_t* perf_async_pub_empty_gap_ns;   // [num_pub_warps_total] empty-loop sleep end to next loop gap
-    int64_t* perf_async_pub_done_recheck_ns; // [num_pub_warps_total] final done-path tail recheck time
-    int64_t* perf_async_pub_ring_load_ns;   // [num_pub_warps_total] pub_ring entry load time
-    int64_t* perf_async_pub_head_release_ns; // [num_pub_warps_total] pub_ring_head release time
-    int64_t* perf_async_pub_syncwarp_ns;    // [num_pub_warps_total] post-token syncwarp time
-    int64_t* perf_async_pub_batch_wall_ns;  // [num_pub_warps_total] non-empty batch wall time
-    int64_t* perf_async_pub_batch_accounted_ns; // [num_pub_warps_total] accounted time inside non-empty batches
-    int64_t* perf_async_pub_batch_unattributed_ns; // [num_pub_warps_total] residual time inside non-empty batches
-    int64_t* perf_async_pub_token_gap_ns;   // [num_pub_warps_total] gap between tokens inside non-empty batches
-    int64_t* perf_async_pub_helper_unattributed_ns; // [num_pub_warps_total] publish helper wall minus phase timers
-    int64_t* perf_async_pub_finish_ns;      // [num_pub_warps_total] final done-count/publish_all_done overhead
-    int64_t* perf_async_pub_work_ns;        // [num_pub_warps_total] total publish token work time
-    int64_t* perf_async_pub_scan_ns;        // [num_pub_warps_total] pending topk scan + weight publish
-    int64_t* perf_async_pub_atomic_ns;      // [num_pub_warps_total] token/expert atomic slot allocation
-    int64_t* perf_async_pub_fence_ns;       // [num_pub_warps_total] publish threadfence time
-    int64_t* perf_async_pub_store_ns;       // [num_pub_warps_total] source-info/ready stores
-    int64_t* perf_async_pub_drain_ns;       // [num_pub_warps_total] time after receiver-done observed
-    int64_t* perf_async_pub_tokens;         // [num_pub_warps_total] tokens consumed by publisher
-    int64_t* perf_async_pub_batch_count;    // [num_pub_warps_total] non-empty consume batches
-    int64_t* perf_async_pub_head_release_count; // [num_pub_warps_total] pub_ring_head release count
-    int64_t* perf_async_pub_max_batch;      // [num_pub_warps_total] max tokens consumed in one batch
-    int64_t* perf_async_pub_local_hit_tokens; // [num_pub_warps_total] tokens with local expert hits
-    int64_t* perf_async_pub_local_hits;     // [num_pub_warps_total] total local expert hits
-    int64_t* perf_comb_tma_wait_ns;        // sum: combine sender tma_store_wait before reusing smem buffer
-    int64_t* perf_comb_wait_ready_ns;      // sum: combine sender wait on per-token combine_token_ready
-    int64_t* perf_comb_wait_ready_single_ns; // sum: ready wait for nh==1 tokens
-    int64_t* perf_comb_wait_ready_multi_ns;  // sum: ready wait for nh>1 tokens
-    int64_t* perf_comb_wait_ready_flush_ns;  // sum: per-slot ready wait for slots computed by final flush tasks
-    int64_t* perf_comb_wait_ready_full_ns;   // sum: per-slot ready wait for slots computed by full-batch tasks
-    int64_t* perf_comb_wait_ready_flush_count; // number of waited slots from final flush tasks
-    int64_t* perf_comb_wait_ready_full_count;  // number of waited slots from full-batch tasks
-    int64_t* perf_comb_gather_reduce_ns;   // sum: gather per-slot outputs + fp32 reduce + bf16 pack
-    int64_t* perf_comb_gather_single_ns;   // sum: nh==1 gather/copy path
-    int64_t* perf_comb_gather_multi_ns;    // sum: nh>1 gather/reduce path
-    int64_t* perf_comb_pack_meta_ns;       // sum: write SourceMeta/topk_weights/padding into TMA packet
-    int64_t* perf_comb_pack_meta_work_ns;  // sum: metadata writes without trailing syncwarp
-    int64_t* perf_comb_pack_meta_sync_ns;  // sum: trailing syncwarp after metadata writes
-    int64_t* perf_comb_tma_store_ns;       // sum: tma_store_fence + tma_store_1d issue
-    int64_t* perf_comb_tma_wait_max_ns;        // max per sender warp/token phase, comparable to wall time
-    int64_t* perf_comb_wait_ready_max_ns;
-    int64_t* perf_comb_wait_ready_single_max_ns;
-    int64_t* perf_comb_wait_ready_multi_max_ns;
-    int64_t* perf_comb_wait_ready_flush_max_ns;
-    int64_t* perf_comb_wait_ready_full_max_ns;
-    int64_t* perf_comb_wait_top_ns;
-    int64_t* perf_comb_wait_top_token;
-    int64_t* perf_comb_wait_top_slot;
-    int64_t* perf_comb_wait_top_expert;
-    int64_t* perf_comb_wait_top_from_flush;
-    int64_t* perf_comb_wait_top_nhits;
-    int64_t* perf_comb_wait_top_priority_deps;
-    int64_t* perf_comb_gather_reduce_max_ns;
-    int64_t* perf_comb_gather_single_max_ns;
-    int64_t* perf_comb_gather_multi_max_ns;
-    int64_t* perf_comb_pack_meta_max_ns;
-    int64_t* perf_comb_pack_meta_work_max_ns;
-    int64_t* perf_comb_pack_meta_sync_max_ns;
-    int64_t* perf_comb_tma_store_max_ns;
-    int64_t* perf_comb_nhit_sum;           // sum of token_nhits processed by combine sender
-    int64_t* perf_comb_token_count;        // number of tokens processed by combine sender
-    int64_t* perf_comb_single_token_count; // number of nh==1 tokens processed by combine sender
-    int64_t* perf_comb_multi_token_count;  // number of nh>1 tokens processed by combine sender
-    // Scheduler bridge timing: our expert_slot_ready -> expert_recv_count -> compute task queue layer.
-    int64_t* perf_sched_scan_ns;           // ready bitmap scan + expert_recv_count publish
-    int64_t* perf_sched_enqueue_ns;        // compute task queue publish
-    int64_t* perf_sched_idle_ns;           // poll sleep while waiting for more ready slots
-    int64_t* perf_sched_priority_ns;       // priority token window scan + enqueue attempts
-    int64_t* perf_sched_normal_ns;         // normal full-batch enqueue path
-    int64_t* perf_sched_tail_flush_ns;     // final dispatch_done full/tail enqueue path
-    int64_t* perf_sched_publish_total_ns;  // scheduler_publish_task total time
-    int64_t* perf_sched_publish_wait_ns;   // waiting for compute_task_tail ordered publish
-    int64_t* perf_sched_publish_wait_max_ns;
-    int64_t* perf_sched_publish_wait_max_tail;
-    int64_t* perf_sched_publish_wait_max_visible_tail;
-    int64_t* perf_sched_priority_scan_tokens;
-    int64_t* perf_sched_priority_ready_tokens;
-    int64_t* perf_sched_priority_full_batch_hits;
-    int64_t* perf_sched_priority_batch_already_enqueued;
-    int64_t* perf_sched_priority_already_normal;
-    int64_t* perf_sched_priority_already_priority;
-    int64_t* perf_sched_priority_already_tail;
-    int64_t* perf_sched_normal_after_priority_ns;
-    int64_t* perf_sched_normal_after_priority_count;
-    int64_t* perf_sched_priority_not_full;
-    int64_t* perf_sched_normal_full_batch_enqueues;
-    int64_t* perf_sched_flush_tail_enqueues;
-    int64_t* perf_sched_queue_empty_count;
-    int64_t* perf_sched_queue_empty_after_dispatch_count;
-    int64_t* perf_sched_max_ready_tail_gap;
-    int64_t* perf_sched_stall_expert;
-    int64_t* perf_sched_stall_recv_count;
-    int64_t* perf_sched_stall_alloc_count;
-    int64_t* perf_sched_stall_enqueue_cursor;
-    int64_t* perf_sched_stall_first_unready_slot;
-    int64_t* perf_sched_stall_first_unready_ready;
-    int64_t* perf_sched_stall_dispatch_done;
-    int64_t* perf_sched_first_done_seen_ts;
-    int64_t* perf_sched_first_recv_count_advance_ts;
-    int64_t* perf_sched_first_recv_count_advance_expert;
-    int64_t* perf_sched_first_recv_count_advance_old;
-    int64_t* perf_sched_first_recv_count_advance_new;
-    int64_t* perf_sched_first_normal_enqueue_attempt_ts;
-    int64_t* perf_sched_first_normal_enqueue_success_ts;
-    int64_t* perf_sched_first_task_publish_ts;
-    int64_t* perf_sched_first_task_source;
-    int64_t* perf_sched_first_task_expert;
-    int64_t* perf_sched_first_task_batch;
-    int64_t* perf_sched_first_task_start_slot;
-    int64_t* perf_sched_first_task_num_tokens;
-#endif
-#if MK_PERF_TRACE_ENABLED
-    // Per-compute-task timing buffer (own Perfetto rows per compute group).
-    // Fields 0..7  : start, end, sm_id, group_id, expert_id, batch_size, hidden, intermediate
-    // Fields 8..13 : coarse phase boundary timestamps (ns) captured by group leader:
-    //   8  = ts after token metadata load   (gather meta done)
-    //   9  = ts after input_buf gather + sync
-    //   10 = ts after gate+up GEMM + SwiGLU + sync (up phase done)
-    //   11 = ts after down GEMM + sync           (down phase done)
-    //   12 = ts after output write/reduce + sync  (output phase done)
-    //   13 = ts after completion signaling        (== end, signal done)
-    // Fields 14..21 : finer breakpoints to separate compute vs group-barrier wait
-    //                 and to split the signaling phase. All captured by leader.
-    //   14 = ts after up-proj GEMM body, BEFORE its group barrier  (up compute end)
-    //   15 = ts after down-proj GEMM body, BEFORE its group barrier (down compute end)
-    //   16 = ts after output write loop, BEFORE the first signaling barrier (output compute end)
-    //   17 = ts after done-count atomic phase + sync
-    //   18 = ts after fp32->bf16 finalize phase + sync
-    //   19 = ts after the post-finalize threadfence_system + sync
-    //   20 = ts after token-ready publish + sync (== signal done)
-    //   21 = compute task queue index
-    //   22 = expert-local start_slot
-    //   23 = expert-local end_slot (exclusive)
-    //   24 = absolute slot base (= expert_id * max_tokens_per_expert + start_slot)
-    //   25 = is_flush task flag
-    //   26 = valid record flag
-    static constexpr int MK_PERF_NUM_COMPUTE_FIELDS = 27;
-    int64_t* perf_compute_task;        // [max_compute_tasks * MK_PERF_NUM_COMPUTE_FIELDS], indexed by queue task_idx
-    int* perf_compute_task_count;      // legacy counter; trace export scans valid records by task_idx
-#endif
-#if MK_PERF_TRACE_ARGS
-    // Root-cause diagnostics, parallel arrays indexed by the same compute-task slot.
-    // Rendered as args on each compute X-event (no extra COMPUTE_FIELDS).
-    int* perf_compute_multi_expert_rows;  // [max_compute_tasks]
-    int* perf_compute_task_has_multi;     // [max_compute_tasks] output-phase multi-expert flag
-#endif
-#if MK_PERF_TRACE_ENABLED
-    // Per-gather-batch timing buffer. Fields:
-    // 0=start, 1=end, 2=gather_sm_idx, 3=batch_size, 4=first_token, 5=last_token,
-    // 6=nhit_sum, 7=scan_done_ts, 8=reduce_done_ts, 9=signal_done_ts
-    static constexpr int MK_PERF_NUM_GATHER_FIELDS = 10;
-    int64_t* perf_gather_task;            // [max_compute_tasks * MK_PERF_NUM_GATHER_FIELDS]
-    int* perf_gather_task_count;          // atomic write cursor into perf_gather_task
-#endif
-#if MK_PERF_TRACE_ARGS
-    // Queue handoff diagnostics, indexed by compute task queue index.
-    int64_t* perf_task_publish_ts;        // scheduler published task tail
-    int* perf_task_source;                // [max_compute_tasks] 1=normal, 2=priority, 3=tail
-    int64_t* perf_task_pop_start_ts;      // compute group leader started dequeue loop
-    int64_t* perf_task_pop_done_ts;       // compute group leader acquired this task
-    int64_t* perf_task_bcast_done_ts;     // task_idx broadcast sync done for the group
-    int64_t* perf_task_start_ts;          // compute task body timing start
-    int64_t* perf_task_prev_end_ts;       // previous task end timestamp in the same compute group
-    int64_t* perf_task_prev_gap_ns;       // this group's task_start - previous task end
-    int* perf_task_pop_attempts;          // number of queue polls/CAS attempts for this task
-    int* perf_task_cas_failures;          // failed CAS attempts before acquiring this task
-    int* perf_task_group_id;              // group that popped this task
-#endif
 };
 
 __device__ __forceinline__ bool mk_debug_bad_float(float v) {
@@ -790,16 +511,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
     int local_expert_begin,
     int num_topk,
     int lane_id
-#if MK_PERF_TRACE_ARGS
-    , int64_t* scan_ns,
-    int64_t* atomic_ns,
-    int64_t* fence_ns,
-    int64_t* store_ns
-#endif
 ) {
-#if MK_PERF_TRACE_ARGS
-    int64_t phase_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
     const int local_expert_end = local_expert_begin + state->num_local_experts;
     int expert_id = -1;
     float route_w = 0.0f;
@@ -815,13 +527,6 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
 
     const unsigned hit_mask = __ballot_sync(0xffffffff, is_local_hit);
     const int num_hits = __popc(hit_mask);
-#if MK_PERF_TRACE_ARGS
-    if (lane_id == 0) {
-        int64_t now = globaltimer_ns();
-        *scan_ns += now - phase_start_ns;
-        phase_start_ns = now;
-    }
-#endif
     int hit_base = 0;
     int hit_abs_slot = -1;
     int hit_slot = -1;
@@ -841,40 +546,13 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
 
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
-#if MK_RECV_DIRECT_STAGING
             // Slot was already allocated by the NVL receiver (inline staging).
             // Read it back instead of doing our own atomicAdd, so expert_token_offsets
             // is advanced exactly once (by the receiver).
             hit_abs_slot = ld_nc_global(&state->pending_slot[recv_token_idx * num_topk + lane_id]);
             hit_slot = hit_abs_slot - state->expert_slot_base[local_expert_id];
-#else
-            unsigned same_expert_mask = __match_any_sync(hit_mask, local_expert_id) & hit_mask;
-            int leader_lane = __ffs(same_expert_mask) - 1;
-            int group_count = __popc(same_expert_mask);
-            int rank_in_expert = __popc(same_expert_mask & ((1u << lane_id) - 1));
-
-            int group_base_slot = 0;
-            if (lane_id == leader_lane) {
-                group_base_slot = atomicAdd(&state->expert_token_offsets[local_expert_id], group_count);
-                if (group_base_slot + group_count > state->expert_count[local_expert_id]) {
-                    printf("MK publish expert slot overflow, rank=%d recv_token=%d expert=%d slot=%d count=%d max_tpe=%d\n",
-                           state->rank, recv_token_idx, expert_id, group_base_slot, group_count, state->max_tokens_per_expert);
-                    __threadfence_system(); trap();
-                }
-            }
-            group_base_slot = __shfl_sync(same_expert_mask, group_base_slot, leader_lane);
-            hit_slot = group_base_slot + rank_in_expert;
-            hit_abs_slot = state->expert_slot_base[local_expert_id] + hit_slot;
-#endif
         }
 
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0) {
-            int64_t now = globaltimer_ns();
-            *atomic_ns += now - phase_start_ns;
-            phase_start_ns = now;
-        }
-#endif
 
         if (is_local_hit) {
             int* dst_ptr = &state->recv_token_source_info[hit_abs_slot * 2];
@@ -883,25 +561,11 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             state->token_slot_list[recv_token_idx * num_topk + hit_base + hit_rank] = hit_abs_slot;
         }
 
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0) {
-            int64_t now = globaltimer_ns();
-            *store_ns += now - phase_start_ns;
-            phase_start_ns = now;
-        }
-#endif
         // Use system-scope fence to ensure recv_tokens data written by the
         // receiver warp (same CTA) is visible to TMA loads on compute SMs.
         // Device-scope __threadfence() is insufficient because TMA engines may
         // bypass L1 and observe stale L2 data when the memory subsystem is under
         // pressure (e.g., concurrent GEMMs on other SMs).
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0) {
-            int64_t now = globaltimer_ns();
-            *fence_ns += now - phase_start_ns;
-            phase_start_ns = now;
-        }
-#endif
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
             st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + hit_slot], 1);
@@ -921,10 +585,6 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
                 st_na_release(&state->ready_batch_queue[qpos], enc);
             }
         }
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0)
-            *store_ns += globaltimer_ns() - phase_start_ns;
-#endif
     }
     __syncwarp();
     return num_hits;
@@ -936,68 +596,17 @@ __device__ void publish_worker_v2(int dispatch_sm_idx, int src_nvl_rank, MegaKer
     const int local_expert_begin = state->rank * state->num_local_experts;
     const int num_topk = state->num_topk;
     int head = 0;
-#if MK_PERF_TRACE_ARGS
-    int64_t worker_start_ns = 0;
-#endif
-#if MK_PERF_TRACE_ENABLED
-    if (lane_id == 0) {
-        int64_t start_ns = globaltimer_ns();
-        state->perf_async_pub_start_ts[pw] = start_ns;
-#if MK_PERF_TRACE_ARGS
-        worker_start_ns = start_ns;
-#endif
-    }
-#endif
-#if MK_PERF_TRACE_ARGS
-    int64_t recv_done_observe_ns = 0;
-    int64_t last_token_done_ns = 0;
-    int64_t last_empty_sleep_end_ns = 0;
-#endif
 
     while (true) {
-#if MK_PERF_TRACE_ARGS
-        int64_t loop_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-        if (lane_id == 0) {
-            if (worker_start_ns != 0) {
-                state->perf_async_pub_start_gap_ns[pw] += loop_start_ns - worker_start_ns;
-                worker_start_ns = 0;
-            }
-            if (last_empty_sleep_end_ns != 0 && loop_start_ns > last_empty_sleep_end_ns) {
-                state->perf_async_pub_empty_gap_ns[pw] += loop_start_ns - last_empty_sleep_end_ns;
-                last_empty_sleep_end_ns = 0;
-            }
-        }
         int recv_done_snapshot = ld_acquire_global(&state->recv_warp_done[pw]);
-        if (lane_id == 0 && recv_done_observe_ns == 0 && recv_done_snapshot != 0)
-            recv_done_observe_ns = loop_start_ns;
-#else
-        int recv_done_snapshot = ld_acquire_global(&state->recv_warp_done[pw]);
-#endif
         int tail = ld_acquire_global(&state->pub_ring_tail[pw]);
         if (head == tail) {
             if (recv_done_snapshot != 0) {
                 tail = ld_acquire_global(&state->pub_ring_tail[pw]);
-#if MK_PERF_TRACE_ARGS
-                if (lane_id == 0) {
-                    int64_t recheck_done_ns = globaltimer_ns();
-                    state->perf_async_pub_done_recheck_ns[pw] += recheck_done_ns - loop_start_ns;
-                }
-#endif
                 if (head == tail)
                     break;
             }
-#if MK_PERF_TRACE_ARGS
-            int64_t sleep_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
             __nanosleep(32);
-#if MK_PERF_TRACE_ARGS
-            if (lane_id == 0) {
-                int64_t sleep_end_ns = globaltimer_ns();
-                state->perf_async_pub_poll_ns[pw] += sleep_start_ns - loop_start_ns;
-                state->perf_async_pub_wait_ring_ns[pw] += sleep_end_ns - sleep_start_ns;
-                last_empty_sleep_end_ns = sleep_end_ns;
-            }
-#endif
             continue;
         }
 
@@ -1005,131 +614,30 @@ __device__ void publish_worker_v2(int dispatch_sm_idx, int src_nvl_rank, MegaKer
         if (batch_count > PUB_CONSUME_BATCH)
             batch_count = PUB_CONSUME_BATCH;
 
-#if MK_PERF_TRACE_ARGS
-        int64_t batch_start_ns = 0;
-        int64_t batch_poll_ns = 0;
-        int64_t batch_ring_load_ns = 0;
-        int64_t batch_work_ns = 0;
-        int64_t batch_token_gap_ns = 0;
-        int64_t last_helper_done_ns = 0;
-        int64_t batch_head_release_ns = 0;
-        int64_t batch_syncwarp_ns = 0;
-        if (lane_id == 0) {
-            batch_start_ns = globaltimer_ns();
-            if (last_token_done_ns != 0 && loop_start_ns > last_token_done_ns)
-                state->perf_async_pub_gap_ns[pw] += loop_start_ns - last_token_done_ns;
-            batch_poll_ns = batch_start_ns - loop_start_ns;
-            state->perf_async_pub_poll_ns[pw] += batch_poll_ns;
-            state->perf_async_pub_batch_count[pw] += 1;
-            if (batch_count > state->perf_async_pub_max_batch[pw])
-                state->perf_async_pub_max_batch[pw] = batch_count;
-        }
-#endif
 
         for (int i = 0; i < batch_count; ++i) {
-#if MK_PERF_TRACE_ARGS
-            int64_t token_load_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-            if (lane_id == 0 && last_helper_done_ns != 0 && token_load_start_ns > last_helper_done_ns)
-                batch_token_gap_ns += token_load_start_ns - last_helper_done_ns;
-#endif
             int recv_token_idx = ld_acquire_global(&state->pub_ring[pw * PUB_RING_DEPTH + ((head + i) % PUB_RING_DEPTH)]);
-#if MK_PERF_TRACE_ARGS
-            int64_t work_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-            if (lane_id == 0) {
-                int64_t ring_load_ns = work_start_ns - token_load_start_ns;
-                state->perf_async_pub_ring_load_ns[pw] += ring_load_ns;
-                batch_ring_load_ns += ring_load_ns;
-            }
-            int64_t scan_ns = 0, atomic_ns = 0, fence_ns = 0, store_ns = 0;
-#endif
             int num_hits = publish_recv_token_from_pending(state, recv_token_idx, local_expert_begin, num_topk, lane_id
-#if MK_PERF_TRACE_ARGS
-                                                           , &scan_ns, &atomic_ns, &fence_ns, &store_ns
-#endif
             );
             if (lane_id == 0) {
-#if MK_PERF_TRACE_ARGS
-                int64_t helper_done_ns = globaltimer_ns();
-                int64_t work_ns = helper_done_ns - work_start_ns;
-                int64_t helper_accounted_ns = scan_ns + atomic_ns + fence_ns + store_ns;
-                int64_t helper_unattributed_ns = work_ns > helper_accounted_ns ? work_ns - helper_accounted_ns : 0;
-                state->perf_async_pub_work_ns[pw] += work_ns;
-                state->perf_async_pub_helper_unattributed_ns[pw] += helper_unattributed_ns;
-                batch_work_ns += work_ns;
-                last_helper_done_ns = helper_done_ns;
-                state->perf_async_pub_scan_ns[pw] += scan_ns;
-                state->perf_async_pub_atomic_ns[pw] += atomic_ns;
-                state->perf_async_pub_fence_ns[pw] += fence_ns;
-                state->perf_async_pub_store_ns[pw] += store_ns;
-                state->perf_async_pub_tokens[pw] += 1;
-                state->perf_async_pub_local_hit_tokens[pw] += (num_hits > 0 ? 1 : 0);
-                state->perf_async_pub_local_hits[pw] += num_hits;
-#endif
             }
         }
 
         head += batch_count;
         if (lane_id == 0) {
-#if MK_PERF_TRACE_ARGS
-            last_token_done_ns = globaltimer_ns();
-#endif
             st_na_release(&state->pub_ring_head[pw], head);
-#if MK_PERF_TRACE_ARGS
-            int64_t release_done_ns = globaltimer_ns();
-            int64_t head_release_ns = release_done_ns - last_token_done_ns;
-            state->perf_async_pub_head_release_ns[pw] += head_release_ns;
-            batch_head_release_ns += head_release_ns;
-            state->perf_async_pub_head_release_count[pw] += 1;
-            last_token_done_ns = release_done_ns;
-#endif
         }
-#if MK_PERF_TRACE_ARGS
-        int64_t sync_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
         __syncwarp();
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0) {
-            int64_t sync_done_ns = globaltimer_ns();
-            int64_t syncwarp_ns = sync_done_ns - sync_start_ns;
-            state->perf_async_pub_syncwarp_ns[pw] += syncwarp_ns;
-            batch_syncwarp_ns += syncwarp_ns;
-            int64_t batch_wall_ns = sync_done_ns - batch_start_ns;
-            int64_t batch_accounted_ns = batch_poll_ns + batch_ring_load_ns + batch_work_ns +
-                batch_token_gap_ns + batch_head_release_ns + batch_syncwarp_ns;
-            state->perf_async_pub_token_gap_ns[pw] += batch_token_gap_ns;
-            state->perf_async_pub_batch_wall_ns[pw] += batch_wall_ns;
-            state->perf_async_pub_batch_accounted_ns[pw] += batch_accounted_ns;
-            if (batch_wall_ns > batch_accounted_ns)
-                state->perf_async_pub_batch_unattributed_ns[pw] += batch_wall_ns - batch_accounted_ns;
-            last_token_done_ns = sync_done_ns;
-        }
-#endif
     }
 
     if (lane_id == 0) {
-#if MK_PERF_TRACE_ARGS
-        int64_t finish_start_ns = globaltimer_ns();
-#endif
         __threadfence();
         st_na_release(&state->publish_warp_done[pw], 1);
         int done = atomicAdd(state->publish_done_count, 1) + 1;
         if (done == state->num_pub_warps_total) {
             __threadfence();
-#if MK_PERF_TRACE_ENABLED
-            int64_t all_done_ts = globaltimer_ns();
-            *state->perf_async_publish_all_done_ts = all_done_ts;
-#endif
             st_na_release(state->publish_all_done, 1);
         }
-#if MK_PERF_TRACE_ENABLED
-        int64_t end_ns = globaltimer_ns();
-        state->perf_async_pub_end_ts[pw] = end_ns;
-#endif
-#if MK_PERF_TRACE_ARGS
-        state->perf_async_pub_finish_ns[pw] = end_ns - finish_start_ns;
-        if (recv_done_observe_ns != 0 && end_ns > recv_done_observe_ns)
-            state->perf_async_pub_drain_ns[pw] = end_ns - recv_done_observe_ns;
-#endif
     }
 }
 
@@ -1327,9 +835,6 @@ __device__ void dispatch_worker_v2(
     auto tma_buffer = smem_buffer + target_rank * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
     uint32_t tma_phase = 0;
-#if MK_PERF_TRACE_ARGS
-    int64_t recv_retire_start_ns = 0;
-#endif
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
         // printf("enter v2 role\n");
         mbarrier_init(tma_mbarrier, 1);
@@ -1352,11 +857,6 @@ __device__ void dispatch_worker_v2(
 
     for (int logical_stage = 0; logical_stage < num_logical_channels_per_physical; ++logical_stage) {
         const int logical_channel_id = channel_id * num_logical_channels_per_physical + logical_stage;
-#if MK_PERF_TRACE_ARGS
-        int dispatch_lch_role_for_perf = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int dispatch_acc_idx_for_perf = logical_channel_id * 2 + dispatch_lch_role_for_perf;
-        int64_t dispatch_role_work_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
         auto rdma_channel_data = SymBuffer<uint8_t>(
             rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token,
             kNumRDMARanks, logical_channel_id, num_logical_channels);
@@ -1399,23 +899,6 @@ __device__ void dispatch_worker_v2(
         forwarder_rdma_nvl_token_idx = 0;
         receiver_cached_channel_head_idx = 0;
         receiver_cached_channel_tail_idx = 0;
-#if MK_PERF_TRACE_ENABLED
-        if (thread_id == 0) {
-            int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-            int trace_idx = (logical_channel_id * 2 + dispatch_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-            int64_t now_ns = globaltimer_ns();
-            state->perf_dispatch_lch_ts[trace_idx + 0] = now_ns;
-#if MK_PERF_TRACE_ARGS
-            int round_idx = target_rank / NUM_MAX_NVL_PEERS;
-            auto* round_trace = &state->perf_dispatch_round_trace[
-                logical_channel_id * kNumRDMARanks + round_idx];
-            if (dispatch_lch_role == 0)
-                round_trace->sender_work_begin_ns = now_ns;
-            else
-                round_trace->forwarder_wait_begin_ns = now_ns;
-#endif
-        }
-#endif
     // ========== kRDMASender ==========
     if (warp_role == WarpRole::kRDMASender) {
         // printf("enter v3 role\n");
@@ -1425,10 +908,6 @@ __device__ void dispatch_worker_v2(
         // Send channel prefix metadata
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
-#if MK_PERF_TRACE_ARGS
-            int sender_meta_idx = dispatch_acc_idx_for_perf * kNumRDMARanks + dst_rdma_rank;
-            int64_t sender_meta_build_start_ts = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
             auto dst_ptr =
                 dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
             if (lane_id < NUM_MAX_NVL_PEERS) {
@@ -1451,17 +930,6 @@ __device__ void dispatch_worker_v2(
                 dst_ptr[lane_id] = -rdma_channel_prefix_matrix[prefix_idx] - 1;
             }
             __syncwarp();
-#if MK_PERF_TRACE_ARGS
-            if (lane_id == 0) {
-                state->perf_disp_sender_meta_build_start_ts[sender_meta_idx] = sender_meta_build_start_ts;
-                state->perf_disp_sender_meta_ready_ts[sender_meta_idx] = globaltimer_ns();
-                state->perf_disp_sender_meta_raw_2[sender_meta_idx] = dst_ptr[NUM_MAX_NVL_PEERS * 2];
-                state->perf_disp_sender_meta_raw_3[sender_meta_idx] = dst_ptr[NUM_MAX_NVL_PEERS * 2 + 1];
-            }
-            __syncwarp();
-            if (lane_id == 0)
-                state->perf_disp_sender_meta_put_begin_ts[sender_meta_idx] = globaltimer_ns();
-#endif
 
             if (dst_rdma_rank != rdma_rank) {
                 nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
@@ -1470,11 +938,6 @@ __device__ void dispatch_worker_v2(
                                                   translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                   channel_id, lane_id, 0);
             }
-#if MK_PERF_TRACE_ARGS
-            __syncwarp();
-            if (lane_id == 0)
-                state->perf_disp_sender_meta_put_end_ts[sender_meta_idx] = globaltimer_ns();
-#endif
         }
         sync_rdma_sender_smem();
 
@@ -1496,25 +959,10 @@ __device__ void dispatch_worker_v2(
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
-#if MK_PERF_TRACE_ARGS
-            if (is_token_in_rank_uint64 != 0 && lane_id < kNumRDMARanks) {
-                auto* lane_round_trace = &state->perf_dispatch_round_trace[
-                    logical_channel_id * kNumRDMARanks + lane_id];
-                atomicAdd(reinterpret_cast<unsigned long long*>(&lane_round_trace->actual_token_count), 1ULL);
-                atomicAdd(reinterpret_cast<unsigned long long*>(&lane_round_trace->rdma_packet_slot_count), 1ULL);
-            }
-#endif
 
             // Wait buffer release
             auto start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-            int64_t head_wait_begin_ns = globaltimer_ns();
-            int64_t head_poll_count = 0;
-#endif
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
-#if MK_PERF_TRACE_ARGS
-                ++head_poll_count;
-#endif
                 cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
                 if (clock64() - start_time >= NUM_TIMEOUT_CYCLES) {
                     printf("MK dispatch RDMA sender timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA lane: %d, head: %d, tail: %d\n",
@@ -1522,15 +970,6 @@ __device__ void dispatch_worker_v2(
                     __threadfence_system(); trap();
                 }
             }
-#if MK_PERF_TRACE_ARGS
-            if (lane_id == 0 && head_poll_count != 0) {
-                int round_idx = target_rank / NUM_MAX_NVL_PEERS;
-                auto* round_trace = &state->perf_dispatch_round_trace[
-                    logical_channel_id * kNumRDMARanks + round_idx];
-                round_trace->polling_iteration_count += head_poll_count;
-                round_trace->tail_head_wait_ns += globaltimer_ns() - head_wait_begin_ns;
-            }
-#endif
             __syncwarp();
 
             // Store RDMA head for combine in this logical channel's independent namespace.
@@ -1706,84 +1145,24 @@ __device__ void dispatch_worker_v2(
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-        int64_t fwd_prefix_meta_wait_start_ns = (lane_id < kNumRDMARanks) ? globaltimer_ns() : 0;
-        int64_t fwd_prefix_meta_first_negative_ts[4] = {0, 0, 0, 0};
-        int64_t fwd_prefix_meta_mixed_poll_count = 0;
-        int64_t fwd_prefix_meta_poll_count = 0;
-#endif
         if (lane_id < kNumRDMARanks) {
             while (true) {
-#if MK_PERF_TRACE_ARGS
-                ++fwd_prefix_meta_poll_count;
-#endif
                 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
                 auto meta_1 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS + dst_nvl_rank);
                 auto meta_2 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2);
                 auto meta_3 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + NUM_MAX_NVL_PEERS * 2 + 1);
-#if MK_PERF_TRACE_ARGS
-                int meta_ready_mask = (meta_0 < 0 ? 1 : 0) | (meta_1 < 0 ? 2 : 0) |
-                                      (meta_2 < 0 ? 4 : 0) | (meta_3 < 0 ? 8 : 0);
-                if (meta_ready_mask != 0) {
-                    int64_t meta_observe_ts = globaltimer_ns();
-                    if ((meta_ready_mask & 1) && fwd_prefix_meta_first_negative_ts[0] == 0)
-                        fwd_prefix_meta_first_negative_ts[0] = meta_observe_ts;
-                    if ((meta_ready_mask & 2) && fwd_prefix_meta_first_negative_ts[1] == 0)
-                        fwd_prefix_meta_first_negative_ts[1] = meta_observe_ts;
-                    if ((meta_ready_mask & 4) && fwd_prefix_meta_first_negative_ts[2] == 0)
-                        fwd_prefix_meta_first_negative_ts[2] = meta_observe_ts;
-                    if ((meta_ready_mask & 8) && fwd_prefix_meta_first_negative_ts[3] == 0)
-                        fwd_prefix_meta_first_negative_ts[3] = meta_observe_ts;
-                    if (meta_ready_mask != 0xf)
-                        ++fwd_prefix_meta_mixed_poll_count;
-                }
-#endif
                 if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
                     int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-#if MK_PERF_TRACE_ARGS
-                    int prefix_prod_idx = (dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + dst_nvl_rank) * kNumRDMARanks + lane_id;
-                    int64_t prefix_meta_ready_ts = globaltimer_ns();
-                    int64_t prefix_store_begin_ts = globaltimer_ns();
-#endif
                     // The receiver treats end as the publication flag for the prefix pair.
                     // Publish start first, then release end at system scope so a matching
                     // acquire observes both values without relying on a later unrelated fence.
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
-#if MK_PERF_TRACE_ARGS
-                    int64_t prefix_store_start_done_ts = globaltimer_ns();
-#endif
                     st_release_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
                     src_rdma_channel_prefix = -meta_2 - 1;
                     auto src_rdma_channel_prefix_1 = -meta_3 - 1;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
-#if MK_PERF_TRACE_ARGS
-                    int64_t prefix_publish_ts = globaltimer_ns();
-                    state->perf_disp_prefix_meta_wait_start_ts[prefix_prod_idx] = fwd_prefix_meta_wait_start_ns;
-                    state->perf_disp_prefix_meta_ready_ts[prefix_prod_idx] = prefix_meta_ready_ts;
-                    #pragma unroll
-                    for (int meta_word = 0; meta_word < 4; ++meta_word)
-                        state->perf_disp_prefix_meta_first_negative_ts[prefix_prod_idx * 4 + meta_word] =
-                            fwd_prefix_meta_first_negative_ts[meta_word];
-                    state->perf_disp_prefix_meta_mixed_poll_count[prefix_prod_idx] = fwd_prefix_meta_mixed_poll_count;
-                    state->perf_disp_prefix_meta_poll_count[prefix_prod_idx] = fwd_prefix_meta_poll_count;
-                    state->perf_disp_prefix_meta_raw_0[prefix_prod_idx] = meta_0;
-                    state->perf_disp_prefix_meta_raw_1[prefix_prod_idx] = meta_1;
-                    state->perf_disp_prefix_meta_raw_2[prefix_prod_idx] = meta_2;
-                    state->perf_disp_prefix_meta_raw_3[prefix_prod_idx] = meta_3;
-                    state->perf_disp_prefix_store_start_done_ts[prefix_prod_idx] = prefix_store_start_done_ts;
-                    state->perf_disp_prefix_store_begin_ts[prefix_prod_idx] = prefix_store_begin_ts;
-                    state->perf_disp_prefix_publish_ts[prefix_prod_idx] = prefix_publish_ts;
-                    state->perf_disp_prefix_meta_wait_ns[prefix_prod_idx] += prefix_meta_ready_ts - fwd_prefix_meta_wait_start_ns;
-                    state->perf_disp_prefix_raw_start[prefix_prod_idx] = -start_sum - 1;
-                    state->perf_disp_prefix_raw_end[prefix_prod_idx] = -end_sum - 1;
-                    state->perf_disp_prefix_tokens[prefix_prod_idx] = num_tokens_to_recv_from_rdma;
-                    state->perf_disp_prefix_producer_rank[prefix_prod_idx] = state->rank;
-                    state->perf_disp_prefix_producer_nvl[prefix_prod_idx] = nvl_rank;
-                    state->perf_disp_prefix_producer_dst_nvl[prefix_prod_idx] = dst_nvl_rank;
-                    state->perf_disp_prefix_producer_src_rdma[prefix_prod_idx] = lane_id;
-#endif
                     // if (blockIdx.x == 16 && lane_id == 0) {
                     // printf("lane_id: %d, src_rdma_channel_prefix: %d, src_rdma_channel_prefix_1: %d, num_tokens_to_recv_from_rdma: %d num_channels: %d channel_id: %d\n", lane_id, src_rdma_channel_prefix, src_rdma_channel_prefix_1, num_tokens_to_recv_from_rdma, num_channels, channel_id);
                     // }
@@ -1791,13 +1170,6 @@ __device__ void dispatch_worker_v2(
                     // Save per-logical-channel token count (non-cumulative) for diagnostics and bounds checks.
                     state->recv_rdma_channel_token_count[lane_id * num_logical_channels + logical_channel_id] = num_tokens_to_recv_from_rdma;
                     // __threadfence_system();
-#if MK_PERF_TRACE_ARGS
-                    {
-                        int64_t prefix_fence_done_ts = globaltimer_ns();
-                        state->perf_disp_prefix_fence_done_ts[prefix_prod_idx] = prefix_fence_done_ts;
-                        state->perf_disp_prefix_store_to_fence_ns[prefix_prod_idx] += prefix_fence_done_ts - prefix_publish_ts;
-                    }
-#endif
                     // Match original DeepEP's combine-head namespace inside this logical channel:
                     // rank prefix + cumulative channel prefix, with the outer allocation already sliced by logical_channel_id.
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
@@ -1823,16 +1195,6 @@ __device__ void dispatch_worker_v2(
         // Wait shared memory to be cleaned
         sync_forwarder_smem();
 
-#if MK_PERF_TRACE_ENABLED
-        // [EXPERIMENT 3b] Batch-flush the prefixes published by this forwarder's warps
-        // ONCE (system scope) before starting bulk token forwarding. v320 showed the
-        // relaxed st.sys prefix writes are not visible to peers until the producer hits
-        // its next system fence (the round barrier, ~1.5ms later), so consumers spin
-        // for milliseconds. A single per-physical-channel fence here (24x for stage=1,
-        // not 384x like the per-store fence in v315) should make prefixes visible to
-        // peers at ~publish time. Not a named barrier, so no deadlock risk.
-        // __threadfence_system();
-#endif
 
         // Forward tokens from RDMA buffer
         int src_rdma_rank = dispatch_sm_idx % kNumRDMARanks;
@@ -1844,14 +1206,7 @@ __device__ void dispatch_worker_v2(
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check NVL destination queue
             start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-            int64_t nvl_head_wait_start_ns = globaltimer_ns();
-            int64_t nvl_head_poll_count = 0;
-#endif
             while (true) {
-#if MK_PERF_TRACE_ARGS
-                ++nvl_head_poll_count;
-#endif
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
                     break;
@@ -1864,25 +1219,10 @@ __device__ void dispatch_worker_v2(
                     __threadfence_system(); trap();
                 }
             }
-#if MK_PERF_TRACE_ARGS
-            if (elect_one_sync() && nvl_head_poll_count > 1) {
-                auto* round_trace = &state->perf_dispatch_round_trace[
-                    logical_channel_id * kNumRDMARanks + src_rdma_rank];
-                round_trace->polling_iteration_count += nvl_head_poll_count - 1;
-                round_trace->tail_head_wait_ns += globaltimer_ns() - nvl_head_wait_start_ns;
-            }
-#endif
 
             // Find next source RDMA rank
             start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-            int64_t ready_wait_start_ns = globaltimer_ns();
-            int64_t ready_poll_count = 0;
-#endif
             while (true) {
-#if MK_PERF_TRACE_ARGS
-                ++ready_poll_count;
-#endif
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
@@ -1897,14 +1237,6 @@ __device__ void dispatch_worker_v2(
                     __threadfence_system(); trap();
                 }
             }
-#if MK_PERF_TRACE_ARGS
-            if (elect_one_sync() && ready_poll_count > 1) {
-                auto* round_trace = &state->perf_dispatch_round_trace[
-                    logical_channel_id * kNumRDMARanks + src_rdma_rank];
-                round_trace->polling_iteration_count += ready_poll_count - 1;
-                round_trace->ready_wait_ns += globaltimer_ns() - ready_wait_start_ns;
-            }
-#endif
             auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
 
@@ -2007,11 +1339,6 @@ __device__ void dispatch_worker_v2(
     } else {
         // printf("enter v7 role\n");
         int src_nvl_rank = target_rank, total_offset = 0;
-#if MK_PERF_TRACE_ARGS
-        int recv_perf_idx_for_role = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + src_nvl_rank;
-        int64_t recv_prefix_wait_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-        int64_t recv_token_loop_start_ns = 0;
-#endif
         const int local_expert_begin = state->rank * (num_experts / num_ranks);
 
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
@@ -2020,48 +1347,13 @@ __device__ void dispatch_worker_v2(
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
-#if MK_PERF_TRACE_ARGS
-        int64_t recv_prefix_lane_start_ns = (lane_id < kNumRDMARanks) ? globaltimer_ns() : 0;
-        int64_t recv_prefix_lane_observe_ts = 0;
-        int64_t recv_prefix_lane_start_first_negative_ts = 0;
-        int64_t recv_prefix_lane_end_first_negative_ts = 0;
-        int64_t recv_prefix_lane_pair_ready_ts = 0;
-        int64_t recv_prefix_lane_poll_count = 0;
-        int64_t recv_prefix_lane_mixed_poll_count = 0;
-        int64_t recv_prefix_lane_wait_ns = 0;
-        int recv_prefix_lane_src_rdma = -1;
-        int recv_prefix_lane_raw_start = 0;
-        int recv_prefix_lane_raw_end = 0;
-#endif
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
             end_offset = ld_acquire_sys_global(nvl_channel_prefix_end.buffer() + lane_id);
             start_offset = end_offset < 0
                 ? ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id)
                 : 0;
-#if MK_PERF_TRACE_ARGS
-            bool recv_prefix_lane_start_negative = start_offset < 0;
-            bool recv_prefix_lane_end_negative = end_offset < 0;
-            ++recv_prefix_lane_poll_count;
-            int64_t recv_prefix_lane_poll_ts = 0;
-            if (recv_prefix_lane_start_negative || recv_prefix_lane_end_negative)
-                recv_prefix_lane_poll_ts = globaltimer_ns();
-            if (recv_prefix_lane_start_negative && recv_prefix_lane_start_first_negative_ts == 0)
-                recv_prefix_lane_start_first_negative_ts = recv_prefix_lane_poll_ts;
-            if (recv_prefix_lane_end_negative && recv_prefix_lane_end_first_negative_ts == 0)
-                recv_prefix_lane_end_first_negative_ts = recv_prefix_lane_poll_ts;
-            if (recv_prefix_lane_start_negative != recv_prefix_lane_end_negative)
-                ++recv_prefix_lane_mixed_poll_count;
-#endif
             if (start_offset < 0 and end_offset < 0) {
-#if MK_PERF_TRACE_ARGS
-                recv_prefix_lane_pair_ready_ts = recv_prefix_lane_poll_ts;
-                recv_prefix_lane_observe_ts = recv_prefix_lane_poll_ts;
-                recv_prefix_lane_wait_ns = recv_prefix_lane_observe_ts - recv_prefix_lane_start_ns;
-                recv_prefix_lane_src_rdma = lane_id;
-                recv_prefix_lane_raw_start = start_offset;
-                recv_prefix_lane_raw_end = end_offset;
-#endif
                 start_offset = -start_offset - 1, end_offset = -end_offset - 1;
                 total_offset += start_offset;
                 break;
@@ -2082,63 +1374,6 @@ __device__ void dispatch_worker_v2(
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
-#if MK_PERF_TRACE_ARGS
-        int64_t prefix_slowest_wait_ns = recv_prefix_lane_wait_ns;
-        int64_t prefix_slowest_start_ts = recv_prefix_lane_start_ns;
-        int64_t prefix_slowest_observe_ts = recv_prefix_lane_observe_ts;
-        int64_t prefix_slowest_start_first_negative_ts = recv_prefix_lane_start_first_negative_ts;
-        int64_t prefix_slowest_end_first_negative_ts = recv_prefix_lane_end_first_negative_ts;
-        int64_t prefix_slowest_pair_ready_ts = recv_prefix_lane_pair_ready_ts;
-        int64_t prefix_slowest_poll_count = recv_prefix_lane_poll_count;
-        int64_t prefix_slowest_mixed_poll_count = recv_prefix_lane_mixed_poll_count;
-        int prefix_slowest_src_rdma = recv_prefix_lane_src_rdma;
-        int prefix_slowest_raw_start = recv_prefix_lane_raw_start;
-        int prefix_slowest_raw_end = recv_prefix_lane_raw_end;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            int64_t other_wait = __shfl_down_sync(0xffffffff, prefix_slowest_wait_ns, offset);
-            int64_t other_start_ts = __shfl_down_sync(0xffffffff, prefix_slowest_start_ts, offset);
-            int64_t other_observe_ts = __shfl_down_sync(0xffffffff, prefix_slowest_observe_ts, offset);
-            int64_t other_start_first_negative_ts = __shfl_down_sync(0xffffffff, prefix_slowest_start_first_negative_ts, offset);
-            int64_t other_end_first_negative_ts = __shfl_down_sync(0xffffffff, prefix_slowest_end_first_negative_ts, offset);
-            int64_t other_pair_ready_ts = __shfl_down_sync(0xffffffff, prefix_slowest_pair_ready_ts, offset);
-            int64_t other_poll_count = __shfl_down_sync(0xffffffff, prefix_slowest_poll_count, offset);
-            int64_t other_mixed_poll_count = __shfl_down_sync(0xffffffff, prefix_slowest_mixed_poll_count, offset);
-            int other_src = __shfl_down_sync(0xffffffff, prefix_slowest_src_rdma, offset);
-            int other_raw_start = __shfl_down_sync(0xffffffff, prefix_slowest_raw_start, offset);
-            int other_raw_end = __shfl_down_sync(0xffffffff, prefix_slowest_raw_end, offset);
-            if (other_wait > prefix_slowest_wait_ns) {
-                prefix_slowest_wait_ns = other_wait;
-                prefix_slowest_start_ts = other_start_ts;
-                prefix_slowest_observe_ts = other_observe_ts;
-                prefix_slowest_start_first_negative_ts = other_start_first_negative_ts;
-                prefix_slowest_end_first_negative_ts = other_end_first_negative_ts;
-                prefix_slowest_pair_ready_ts = other_pair_ready_ts;
-                prefix_slowest_poll_count = other_poll_count;
-                prefix_slowest_mixed_poll_count = other_mixed_poll_count;
-                prefix_slowest_src_rdma = other_src;
-                prefix_slowest_raw_start = other_raw_start;
-                prefix_slowest_raw_end = other_raw_end;
-            }
-        }
-        if (lane_id == 0) {
-            int64_t now = globaltimer_ns();
-            state->perf_disp_allrecv_prefix_wait_ns[recv_perf_idx_for_role] += now - recv_prefix_wait_start_ns;
-            state->perf_disp_allrecv_prefix_wait_start_ts[recv_perf_idx_for_role] = prefix_slowest_start_ts;
-            state->perf_disp_allrecv_prefix_observe_ts[recv_perf_idx_for_role] = prefix_slowest_observe_ts;
-            state->perf_disp_allrecv_prefix_done_ts[recv_perf_idx_for_role] = now;
-            state->perf_disp_allrecv_prefix_start_first_negative_ts[recv_perf_idx_for_role] = prefix_slowest_start_first_negative_ts;
-            state->perf_disp_allrecv_prefix_end_first_negative_ts[recv_perf_idx_for_role] = prefix_slowest_end_first_negative_ts;
-            state->perf_disp_allrecv_prefix_pair_ready_ts[recv_perf_idx_for_role] = prefix_slowest_pair_ready_ts;
-            state->perf_disp_allrecv_prefix_poll_count[recv_perf_idx_for_role] = prefix_slowest_poll_count;
-            state->perf_disp_allrecv_prefix_mixed_poll_count[recv_perf_idx_for_role] = prefix_slowest_mixed_poll_count;
-            state->perf_disp_allrecv_prefix_slowest_rdma[recv_perf_idx_for_role] = prefix_slowest_src_rdma;
-            state->perf_disp_allrecv_prefix_src_nvl[recv_perf_idx_for_role] = src_nvl_rank;
-            state->perf_disp_allrecv_prefix_raw_start[recv_perf_idx_for_role] = prefix_slowest_raw_start;
-            state->perf_disp_allrecv_prefix_raw_end[recv_perf_idx_for_role] = prefix_slowest_raw_end;
-            recv_token_loop_start_ns = now;
-        }
-#endif
 
         // Save for combine usage
         if (lane_id < kNumRDMARanks) {
@@ -2166,9 +1401,6 @@ __device__ void dispatch_worker_v2(
         while (num_tokens_to_recv > 0) {
             // Wait for data
             start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-            int64_t wait_nvl_start = (lane_id == 0) ? globaltimer_ns() : 0;
-#endif
             while (true) {
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
@@ -2180,15 +1412,6 @@ __device__ void dispatch_worker_v2(
                     __threadfence_system(); trap();
                 }
             }
-#if MK_PERF_TRACE_ARGS
-            if (lane_id == 0) {
-                int64_t wait_nvl_ns = globaltimer_ns() - wait_nvl_start;
-                int recv_idx = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                state->perf_disp_allrecv_wait_nvl_ns[recv_idx] += wait_nvl_ns;
-                if (target_rank == 0)
-                    state->perf_disp_wait_nvl_ns[dispatch_acc_idx_for_perf] += wait_nvl_ns;
-            }
-#endif
 
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
@@ -2215,26 +1438,13 @@ __device__ void dispatch_worker_v2(
                 auto weight_data_ptr = reinterpret_cast<float*>(topk_data_ptr + num_topk);
                 auto* src_data = reinterpret_cast<const __nv_bfloat16*>(tma_buffer);
 
-                // Token data placement.
-                //   MK_RECV_DIRECT_STAGING off: write the global combine_input[recv_token]
-                //     namespace; compute gathers from there.
-                //   on: skip the combine_input INPUT write entirely (compute now reads
-                //     recv_tokens); allocate the expert slot inline and stage the token
-                //     into per-expert-contiguous recv_tokens[slot], stashing the slot in
-                //     pending_slot for the publisher. This is where the gather copy is saved.
-                //   NOTE: combine_input is still used as the OUTPUT namespace (compute /
-                //     gather write results there for the combine sender); only the input
-                //     write is elided here.
+                // Token data placement under direct staging: allocate the expert slot
+                // inline and stage the token into per-expert-contiguous recv_tokens[slot],
+                // stashing the slot in pending_slot for the publisher. combine_input is
+                // still used as the OUTPUT namespace later in the pipeline.
                 const int hidden_int4 = state->hidden_dim * sizeof(__nv_bfloat16) / sizeof(int4);
                 const int4* src_i4 = reinterpret_cast<const int4*>(src_data);
-#if !MK_RECV_DIRECT_STAGING
-                int4* dst_i4 = reinterpret_cast<int4*>(state->combine_input) +
-                    (int64_t)recv_token_idx * hidden_int4;
-                for (int v = lane_id; v < hidden_int4; v += 32)
-                    dst_i4[v] = src_i4[v];
-#endif
 
-#if MK_RECV_DIRECT_STAGING
                 // --- Inline expert-slot allocation (mirrors publish_recv_token_from_pending) ---
                 // Each lane owns one topk slot; group same-expert hits so the leader
                 // lane does a single grouped atomicAdd on expert_token_offsets.
@@ -2286,7 +1496,6 @@ __device__ void dispatch_worker_v2(
                             rds_dst[v] = src_i4[v];
                     }
                 }
-#endif
 
 
                 // Fill topk weights/src_meta, publish this token's local expert count, then
@@ -2323,13 +1532,6 @@ __device__ void dispatch_worker_v2(
                 st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
         }
 
-#if MK_PERF_TRACE_ARGS
-        if (lane_id == 0) {
-            int64_t now = globaltimer_ns();
-            state->perf_disp_allrecv_token_loop_ns[recv_perf_idx_for_role] += now - recv_token_loop_start_ns;
-            recv_retire_start_ns = now;
-        }
-#endif
 
         // Signal dispatch done after all NVL receiver warps on this rank have finished.
         // This is the correct location: NVL Receiver writes gbl_channel_prefix_matrix and
@@ -2338,11 +1540,6 @@ __device__ void dispatch_worker_v2(
         if (lane_id == 0) {
             if (producer_batch_count > 0) {
                 st_na_release(&state->pub_ring_tail[pub_warp_idx], producer_tail);
-#if MK_PERF_TRACE_ARGS
-                int round_idx = target_rank / NUM_MAX_NVL_PEERS;
-                state->perf_dispatch_round_trace[
-                    logical_channel_id * kNumRDMARanks + round_idx].async_publish_ns = globaltimer_ns();
-#endif
                 producer_batch_count = 0;
             }
             __threadfence();
@@ -2356,43 +1553,12 @@ __device__ void dispatch_worker_v2(
         }
     }
 
-#if MK_PERF_TRACE_ARGS
-    int64_t dispatch_cta_barrier_start_ns = (lane_id == 0) ? globaltimer_ns() : 0;
-    if (lane_id == 0 && dispatch_role_id == 4) {
-        int recv_idx = dispatch_acc_idx_for_perf * NUM_MAX_NVL_PEERS + dispatch_role_slot;
-        state->perf_disp_allrecv_retire_ns[recv_idx] += dispatch_cta_barrier_start_ns - recv_retire_start_ns;
-    }
-    if (lane_id == 0) {
-        int role_idx = (((dispatch_acc_idx_for_perf * MK_DISPATCH_ROLE_COUNT + dispatch_role_id) * NUM_MAX_NVL_PEERS) + dispatch_role_slot);
-        state->perf_disp_role_arrive_ts[role_idx] = dispatch_cta_barrier_start_ns;
-        state->perf_disp_role_work_ns[role_idx] = dispatch_cta_barrier_start_ns - dispatch_role_work_start_ns;
-    }
-#endif
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
-#if MK_PERF_TRACE_ARGS
-    if (thread_id == 0) {
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
-        int64_t cta_release_ns = globaltimer_ns();
-        state->perf_disp_cta_barrier_ns[acc_idx] += cta_release_ns - dispatch_cta_barrier_start_ns;
-        state->perf_disp_cta_release_ts[acc_idx] = cta_release_ns;
-    }
-#endif
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + dispatch_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        state->perf_dispatch_lch_ts[trace_idx + 1] = globaltimer_ns();
-    }
-#endif
     if (thread_id == 0)
         atomicAdd(&state->dispatch_channel_barrier[logical_channel_id], 1);
     if (thread_id == 0) {
         auto start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-        int64_t barrier_start_ns = globaltimer_ns();
-#endif
         uint64_t wait_polls = 0;
         while (ld_acquire_sys_global(&state->dispatch_channel_barrier[logical_channel_id]) < 2) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2402,20 +1568,8 @@ __device__ void dispatch_worker_v2(
             }
             __nanosleep(32);
         }
-#if MK_PERF_TRACE_ARGS
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
-        state->perf_disp_channel_barrier_ns[acc_idx] += globaltimer_ns() - barrier_start_ns;
-#endif
     }
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + dispatch_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        state->perf_dispatch_lch_ts[trace_idx + 2] = globaltimer_ns();
-    }
-#endif
 
     if (thread_id == 0 && dispatch_sm_idx % 2 == 0) {
         const int round_idx = logical_stage;
@@ -2425,9 +1579,6 @@ __device__ void dispatch_worker_v2(
     if (thread_id == 0) {
         const int round_idx = logical_stage;
         auto start_time = clock64();
-#if MK_PERF_TRACE_ARGS
-        int64_t barrier_start_ns = globaltimer_ns();
-#endif
         uint64_t wait_polls = 0;
         while (ld_acquire_sys_global(&state->dispatch_round_barrier[round_idx]) < num_channels) {
             if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2438,35 +1589,8 @@ __device__ void dispatch_worker_v2(
             }
             __nanosleep(32);
         }
-#if MK_PERF_TRACE_ARGS
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int acc_idx = logical_channel_id * 2 + dispatch_lch_role;
-        state->perf_disp_round_barrier_ns[acc_idx] += globaltimer_ns() - barrier_start_ns;
-#endif
     }
     asm volatile("barrier.sync 2, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32));
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int dispatch_lch_role = (dispatch_sm_idx % 2 == 0) ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + dispatch_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        int64_t now_ns = globaltimer_ns();
-        state->perf_dispatch_lch_ts[trace_idx + 3] = now_ns;
-#if MK_PERF_TRACE_ARGS
-        int round_idx = target_rank / NUM_MAX_NVL_PEERS;
-        auto* round_trace = &state->perf_dispatch_round_trace[
-            logical_channel_id * kNumRDMARanks + round_idx];
-        round_trace->channel_barrier_arrival_ns = dispatch_cta_barrier_start_ns;
-        round_trace->round_barrier_arrival_ns = now_ns;
-        if (dispatch_lch_role == 0)
-            round_trace->sender_work_end_ns = dispatch_cta_barrier_start_ns;
-        else {
-            round_trace->forwarder_wait_end_ns = dispatch_cta_barrier_start_ns;
-            round_trace->forwarder_work_begin_ns = round_trace->forwarder_wait_end_ns;
-            round_trace->forwarder_work_end_ns = now_ns;
-        }
-#endif
-    }
-#endif
 
     }
 
@@ -2505,12 +1629,6 @@ __device__ __forceinline__ void scheduler_compute_sync(int num_threads) {
     asm volatile("barrier.sync 3, %0;" :: "r"(num_threads));
 }
 
-#if MK_PERF_TRACE_ARGS
-__device__ __forceinline__ bool mk_perf_record_first_i64(int64_t* slot, int64_t value) {
-    return atomicCAS(reinterpret_cast<unsigned long long*>(slot), 0ULL,
-                     static_cast<unsigned long long>(value)) == 0ULL;
-}
-#endif
 
 __device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_result, int num_threads) {
     if (threadIdx.x == 0)
@@ -2529,9 +1647,6 @@ __device__ __forceinline__ int scheduler_compute_all_until_publish_done(
     if (threadIdx.x == 0) {
         if (*dispatch_done == 0 && ld_acquire_global(state->publish_all_done) != 0) {
             *dispatch_done = 1;
-#if MK_PERF_TRACE_ARGS
-            mk_perf_record_first_i64(state->perf_sched_first_done_seen_ts, globaltimer_ns());
-#endif
         }
         *shared_result = 1;
     }
@@ -2550,9 +1665,6 @@ __device__ __forceinline__ int scheduler_compute_all_until_publish_done(
 }
 
 __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens, int is_flush, int source) {
-#if MK_PERF_TRACE_ARGS
-    int64_t publish_start_ns = globaltimer_ns();
-#endif
     int tail = atomicAdd(state->compute_task_reserve_tail, 1);
     if (tail >= state->max_compute_tasks) {
         printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
@@ -2560,43 +1672,9 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
     }
     state->compute_tasks[tail] = ComputeTask{expert_id, start_slot, num_tokens, is_flush};
     __threadfence();
-#if MK_PERF_TRACE_ARGS
-    int64_t wait_start_ns = globaltimer_ns();
-    int visible_tail = ld_acquire_global(state->compute_task_tail);
-    int wait_start_visible_tail = visible_tail;
-    while (visible_tail != tail) {
-        __nanosleep(32);
-        visible_tail = ld_acquire_global(state->compute_task_tail);
-    }
-    int64_t publish_ready_ns = globaltimer_ns();
-    int64_t wait_ns = publish_ready_ns - wait_start_ns;
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_publish_wait_ns),
-              static_cast<unsigned long long>(wait_ns));
-    unsigned long long old_max = atomicMax(reinterpret_cast<unsigned long long*>(state->perf_sched_publish_wait_max_ns),
-                                           static_cast<unsigned long long>(wait_ns));
-    if (static_cast<unsigned long long>(wait_ns) > old_max) {
-        *state->perf_sched_publish_wait_max_tail = static_cast<int64_t>(tail);
-        *state->perf_sched_publish_wait_max_visible_tail = static_cast<int64_t>(wait_start_visible_tail);
-    }
-    state->perf_task_publish_ts[tail] = publish_ready_ns;
-    state->perf_task_source[tail] = source;
-#else
     while (ld_acquire_global(state->compute_task_tail) != tail)
         __nanosleep(32);
-#endif
     st_na_release(state->compute_task_tail, tail + 1);
-#if MK_PERF_TRACE_ARGS
-    int64_t publish_visible_ns = globaltimer_ns();
-    if (mk_perf_record_first_i64(state->perf_sched_first_task_publish_ts, publish_visible_ns)) {
-        st_na_global(state->perf_sched_first_task_source, static_cast<int64_t>(source));
-        st_na_global(state->perf_sched_first_task_expert, static_cast<int64_t>(expert_id));
-        st_na_global(state->perf_sched_first_task_batch, static_cast<int64_t>(start_slot / COMPUTE_BATCH_SIZE));
-        st_na_global(state->perf_sched_first_task_start_slot, static_cast<int64_t>(start_slot));
-        st_na_global(state->perf_sched_first_task_num_tokens, static_cast<int64_t>(num_tokens));
-    }
-    atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_publish_total_ns),
-              static_cast<unsigned long long>(publish_visible_ns - publish_start_ns));
-#endif
 }
 
 // source: 1=normal scheduler, 2=priority scheduler, 3=tail flush.
@@ -2608,29 +1686,9 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
         __threadfence_system(); trap();
     }
     int idx = expert_id * state->max_batches_per_expert + batch_id;
-#if MK_PERF_TRACE_ARGS
-    if (source == 1)
-        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_attempt_ts, globaltimer_ns());
-#endif
     int old_source = atomicCAS(&state->expert_batch_enqueued[idx], 0, source);
-#if MK_PERF_TRACE_ARGS
-    if (old_source == 2 && source == 1) {
-        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_normal_after_priority_count), 1ULL);
-        int64_t ts = *reinterpret_cast<volatile int64_t*>(&state->expert_batch_enqueue_ts[idx]);
-        if (ts > 0) {
-            atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_normal_after_priority_ns),
-                      static_cast<unsigned long long>(globaltimer_ns() - ts));
-        }
-    }
-#endif
     if (old_source != 0)
         return false;
-#if MK_PERF_TRACE_ARGS
-    int64_t enqueue_success_ns = globaltimer_ns();
-    if (source == 1)
-        mk_perf_record_first_i64(state->perf_sched_first_normal_enqueue_success_ts, enqueue_success_ns);
-    state->expert_batch_enqueue_ts[idx] = enqueue_success_ns;
-#endif
     scheduler_publish_task(state, expert_id, start_slot, num_tokens, is_flush, source);
     return true;
 }
@@ -2781,15 +1839,6 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
     }
     scheduler_compute_sync(num_threads);
 
-#if MK_PERF_TRACE_ENABLED
-    if (tid == 0 && scheduler_id == 0)
-        state->perf_sched_ts[0] = globaltimer_ns();
-#endif
-#if MK_PERF_TRACE_ARGS
-    int64_t sched_scan_acc = 0;
-    int64_t sched_idle_acc = 0;
-    int64_t sched_tail_flush_acc = 0;
-#endif
 
     while (true) {
         // --- Broadcast dispatch_done ---
@@ -2818,9 +1867,6 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
         // Since publisher only appends to ready_batch_queue after all slots in a batch
         // have expert_slot_ready set (via expert_batch_ready_count), any entry present
         // in the queue is guaranteed data-ready. No slot scanning needed.
-#if MK_PERF_TRACE_ARGS
-        int64_t scan_start = globaltimer_ns();
-#endif
         if (tid == 0) {
             constexpr int kEnqPublished = -2;
             const int mbe = state->max_batches_per_expert;
@@ -2845,15 +1891,9 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             s_head = head;
         }
         scheduler_compute_sync(num_threads);
-#if MK_PERF_TRACE_ARGS
-        sched_scan_acc += globaltimer_ns() - scan_start;
-#endif
 
         // --- Final drain after dispatch_done (parallel) ---
         if (dispatch_done) {
-#if MK_PERF_TRACE_ARGS
-            int64_t flush_start = globaltimer_ns();
-#endif
             // Wait for all publisher warps to finish
             if (tid == 0) {
                 for (int pw = 0; pw < state->num_pub_warps_total; ++pw)
@@ -2907,39 +1947,17 @@ __device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_i
             // --- Phase 3: tid 0 signals completion ---
             if (tid == 0) {
                 __threadfence();
-#if MK_PERF_TRACE_ENABLED
-                state->perf_sched_ts[1] = globaltimer_ns();
-#endif
                 st_na_release(state->compute_enqueue_done, 1);
                 s_done = 1;
             }
             scheduler_compute_sync(num_threads);
-#if MK_PERF_TRACE_ARGS
-            sched_tail_flush_acc += globaltimer_ns() - flush_start;
-#endif
             break;
         }
 
         // --- Idle sleep (only if nothing consumed this iteration) ---
-#if MK_PERF_TRACE_ARGS
-        int64_t idle_start = globaltimer_ns();
-#endif
         __nanosleep(32);
-#if MK_PERF_TRACE_ARGS
-        sched_idle_acc += globaltimer_ns() - idle_start;
-#endif
     }
 
-#if MK_PERF_TRACE_ARGS
-    if (tid == 0) {
-        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_scan_ns),
-                  static_cast<unsigned long long>(sched_scan_acc));
-        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_idle_ns),
-                  static_cast<unsigned long long>(sched_idle_acc));
-        atomicAdd(reinterpret_cast<unsigned long long*>(state->perf_sched_tail_flush_ns),
-                  static_cast<unsigned long long>(sched_tail_flush_acc));
-    }
-#endif
 }
 
 template <ComputeDType kComputeDType, bool kStopAtDispatchDone>
@@ -2980,13 +1998,9 @@ __device__ __forceinline__ void compute_worker_core(
     // Full batches use M=128. Tail batches use the same path with rows [batch_size,128)
     // zero-filled so WMMA M tiles never read past valid token rows.
     const int padded_m = COMPUTE_BATCH_SIZE;
-#if MK_RECV_DIRECT_STAGING
     // input_buf is unused (gate/up TMA-fed from recv_tokens, bwd save reads recv_tokens),
     // so the input region is dropped from the per-group workspace to save memory.
     const int input_stride = 0;
-#else
-    const int input_stride = padded_m * hidden;
-#endif
     const int gu_stride   = padded_m * (2 * intermediate);   // reserved GU scratch [M,2I]
     const int act_stride  = padded_m * intermediate;         // interleaved SwiGLU epilogue result (down A)
     const int down_stride = padded_m * hidden;
@@ -3028,22 +2042,10 @@ __device__ __forceinline__ void compute_worker_core(
     // until the compute worker exits the persistent loop. This eliminates
     // per-task init/dealloc overhead (2x cluster_sync + barrier init each).
     bool umma_tmem_allocated = false;
-#if MK_PERF_TRACE_ARGS
-    int64_t last_task_end_ns = 0;
-#endif
 
     while (true) {
-#if MK_PERF_TRACE_ARGS
-        int64_t pop_start_ns = 0;
-        int64_t pop_done_ns = 0;
-        int pop_attempts = 0;
-        int cas_failures = 0;
-#endif
         if (group_sm_idx == 0 && thread_id == 0) {
             int task_idx = -1;
-#if MK_PERF_TRACE_ARGS
-            pop_start_ns = globaltimer_ns();
-#endif
             while (true) {
                 if constexpr (kStopAtDispatchDone) {
                     int enqueue_done = ld_acquire_global(state->compute_enqueue_done);
@@ -3067,31 +2069,14 @@ __device__ __forceinline__ void compute_worker_core(
                 }
                 if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
                     task_idx = head;
-#if MK_PERF_TRACE_ARGS
-                    pop_done_ns = globaltimer_ns();
-                    if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
-                        state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
-                        state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
-                        state->perf_task_pop_attempts[task_idx] = pop_attempts;
-                        state->perf_task_cas_failures[task_idx] = cas_failures;
-                        state->perf_task_group_id[task_idx] = group_id;
-                    }
-#endif
                     break;
                 }
-#if MK_PERF_TRACE_ARGS
-                cas_failures += 1;
-#endif
             }
             st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
         }
         compute_group_sync(state, group_id, group_size);
 
         int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
-#if MK_PERF_TRACE_ARGS
-        if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
-            state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
-#endif
         if (task_idx == -2 || task_idx == -3) {
             // Dealloc TMEM before exiting the persistent loop (if we ever allocated).
             if (umma_tmem_allocated) {
@@ -3157,32 +2142,6 @@ __device__ __forceinline__ void compute_worker_core(
                 }
             }
         }
-#if MK_PERF_TRACE_ENABLED
-        const bool perf_leader = (group_sm_idx == 0 && thread_id == 0);
-        int64_t compute_task_start_ns = perf_leader ? globaltimer_ns() : 0;
-        int64_t compute_task_end_ns = 0;
-#endif
-#if MK_PERF_TRACE_ARGS
-        int64_t perf_ph_meta_ns = 0, perf_ph_input_ns = 0, perf_ph_upgemm_ns = 0;
-        int64_t perf_ph_downgemm_ns = 0, perf_ph_output_ns = 0;
-        // Finer breakpoints: GEMM body end (before barrier) and signaling sub-phases.
-        int64_t perf_up_body_ns = 0, perf_down_body_ns = 0, perf_out_body_ns = 0;
-        int64_t perf_sig_donecount_ns = 0, perf_sig_finalize_ns = 0;
-        int64_t perf_sig_fence_ns = 0, perf_sig_publish_ns = 0;
-        if (perf_leader && task_idx >= 0 && task_idx < state->max_compute_tasks) {
-            state->perf_task_start_ts[task_idx] = compute_task_start_ns;
-            state->perf_task_prev_end_ts[task_idx] = last_task_end_ns;
-            state->perf_task_prev_gap_ns[task_idx] = last_task_end_ns == 0 ? 0 : compute_task_start_ns - last_task_end_ns;
-        }
-        // Root-cause diagnostics rendered as args on compute X-events.
-        __shared__ int s_perf_multi_expert_rows;
-        __shared__ int s_perf_task_has_multi;
-        if (perf_leader) {
-            s_perf_multi_expert_rows = 0;
-            s_perf_task_has_multi = 0;
-        }
-        __syncthreads();
-#endif
 
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
             int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
@@ -3215,33 +2174,13 @@ __device__ __forceinline__ void compute_worker_core(
             s_topk_slot[i] = -1;
         }
         __syncthreads();
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
-#endif
 
         const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
-#if MK_RECV_DIRECT_STAGING
         // TMA-feed: the gate/up GEMM reads this task's tokens directly from
         // recv_tokens via TMA (recv_tokens descriptor + m_base = expert_slot_base+
         // start_slot, set at the umma_gateup call below). No input_buf gather and no
         // post-gather compute_group_sync are needed — recv_tokens was written and
         // fenced by dispatch before the task was enqueued.
-#else
-        const int input_vec_stride = gemm_m * hidden_int4;
-        int4* input_buf_i4 = reinterpret_cast<int4*>(input_buf);
-        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);
-        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
-            int row = idx / hidden_int4;
-            int v = idx - row * hidden_int4;
-            input_buf_i4[idx] = (row < batch_size)
-                ? combine_input_i4[(int64_t)s_recv_token_idx[row] * hidden_int4 + v]
-                : make_int4(0, 0, 0, 0);
-        }
-        compute_group_sync(state, group_id, group_size);
-#endif
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_input_ns = globaltimer_ns();
-#endif
 
         // Expert weight slices
         const __nv_bfloat16* w_gateup = &state->W_gateup[expert_id * 2 * intermediate * hidden];
@@ -3276,15 +2215,11 @@ __device__ __forceinline__ void compute_worker_core(
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
             umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
-            // A operand: default per-group input_buf descriptor (m_base=0). Under
-            // direct-staging, TMA-feed straight from recv_tokens with the task's row
-            // base (expert_slot_base+start_slot) so no input_buf gather is needed.
-            const CUtensorMap* gateup_a_desc = &in_atom.a;
-            uint32_t gateup_a_m_base = 0;
-#if MK_RECV_DIRECT_STAGING
-            gateup_a_desc = &state->recv_tokens_a_tma;
-            gateup_a_m_base = (uint32_t)(state->expert_slot_base[expert_id] + start_slot);
-#endif
+            // A operand: default per-group input_buf descriptor (m_base=0). Direct-staging
+            // feeds straight from recv_tokens with the task's row base (expert_slot_base+start_slot)
+            // so no input_buf gather is needed.
+            const CUtensorMap* gateup_a_desc = &state->recv_tokens_a_tma;
+            uint32_t gateup_a_m_base = (uint32_t)(state->expert_slot_base[expert_id] + start_slot);
             umma::umma_gateup_interleaved_persistent(
                 gateup_a_desc,
                 &state->compute_tma->wgateup[expert_id],
@@ -3298,14 +2233,8 @@ __device__ __forceinline__ void compute_worker_core(
                 s_recv_token_idx, s_topk_slot,
                 /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
                 0, 2 * intermediate, batch_size, gateup_a_m_base);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_up_body_ns = globaltimer_ns();
-#endif
             compute_group_sync(state, group_id, group_size);
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
-#endif
 
         // GEMM 3: down-proj D = act @ W_down^T.
         // TMEM is shared with gate/up — no separate init/dealloc. accum_iter
@@ -3346,59 +2275,30 @@ __device__ __forceinline__ void compute_worker_core(
                 cluster_in_group, num_clusters,
                 cluster_smem, umma_accum_iter,
                 down_scatter);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_down_body_ns = globaltimer_ns();
-#endif
             compute_group_sync(state, group_id, group_size);
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
-#endif
 
         // Backward activation save: the down output is now written directly in the
         // UMMA epilogue, so this tail only preserves fc1 input X by recv_token.
-#if MK_PERF_TRACE_ARGS
-        if (thread_id == 0) {
-            int multi_rows = 0;
-            for (int row = 0; row < batch_size; ++row)
-                if (!s_is_single[row]) ++multi_rows;
-            if (perf_leader) s_perf_task_has_multi = (multi_rows != 0);
-        }
-        __syncthreads();
-#endif
 
         const bool save_bwd = (state->bwd_fc1_input != nullptr);
         int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
-#if MK_RECV_DIRECT_STAGING
         // input_buf is no longer filled (gate/up TMA-fed from recv_tokens); the fc1
         // input X for backward comes straight from recv_tokens[slot_base+row].
         const int4* bwd_x_src_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
-#else
-        const int4* bwd_in_src_i4 = reinterpret_cast<const int4*>(input_buf);
-#endif
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
             int v = idx - row * hidden_int4;
             int rt = s_recv_token_idx[row];
             if (save_bwd) {
-#if MK_RECV_DIRECT_STAGING
                 bwd_in_i4[(int64_t)rt * hidden_int4 + v] =
                     bwd_x_src_i4[(int64_t)(slot_base + row) * hidden_int4 + v];
-#else
-                bwd_in_i4[(int64_t)rt * hidden_int4 + v] = bwd_in_src_i4[idx];
-#endif
             }
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_out_body_ns = globaltimer_ns();
-#endif
         // Device-scope fence: the UMMA epilogue has already made the down output visible.
         // Fence the backward-save writes before any SM publishes ready flags.
         __threadfence();
         compute_group_sync(state, group_id, group_size);
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_output_ns = globaltimer_ns();
-#endif
 
         // ==== Signal: per-token ready publish ====
         // Down epilogue already wrote per-slot rows into compute_output_slot / combine_input.
@@ -3407,19 +2307,6 @@ __device__ __forceinline__ void compute_worker_core(
         // advances token_done_count and publishes nhits==1 tokens directly; nhits>1 tokens are
         // claimed/enqueued by gather scheduler lanes once all local expert slots are done.
         {
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) {
-                perf_sig_donecount_ns = globaltimer_ns();
-                perf_sig_finalize_ns = perf_sig_donecount_ns;
-                perf_sig_fence_ns = perf_sig_donecount_ns;
-            }
-            if (perf_leader) {
-                int mr = 0;
-                for (int row = 0; row < batch_size; ++row)
-                    if (!s_is_single[row]) ++mr;
-                s_perf_multi_expert_rows = mr;
-            }
-#endif
             for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
                 const int recv_token = s_recv_token_idx[row];
                 if (s_is_single[row]) {
@@ -3434,56 +2321,8 @@ __device__ __forceinline__ void compute_worker_core(
                 }
             }
             compute_group_sync(state, group_id, group_size);
-#if MK_PERF_TRACE_ENABLED
-            if (perf_leader) compute_task_end_ns = globaltimer_ns();
-#endif
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_sig_publish_ns = compute_task_end_ns;
-#endif
         }
 
-#if MK_PERF_TRACE_ENABLED
-        if (perf_leader) {
-#if MK_PERF_TRACE_ARGS
-            last_task_end_ns = compute_task_end_ns;
-#endif
-            int slot = task_idx;
-            if (slot >= 0 && slot < state->max_compute_tasks) {
-                int64_t* rec = state->perf_compute_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
-                rec[0] = compute_task_start_ns;
-                rec[1] = compute_task_end_ns;
-                rec[2] = sm_id;
-                rec[3] = group_id;
-                rec[5] = batch_size;
-                rec[25] = task.is_flush;
-                rec[26] = 1;
-#if MK_PERF_TRACE_ARGS
-                rec[4] = expert_id;
-                rec[6] = hidden;
-                rec[7] = intermediate;
-                rec[8]  = perf_ph_meta_ns;
-                rec[9]  = perf_ph_input_ns;
-                rec[10] = perf_ph_upgemm_ns;
-                rec[11] = perf_ph_downgemm_ns;
-                rec[12] = perf_ph_output_ns;
-                rec[13] = compute_task_end_ns;
-                rec[14] = perf_up_body_ns;
-                rec[15] = perf_down_body_ns;
-                rec[16] = perf_out_body_ns;
-                rec[17] = perf_sig_donecount_ns;
-                rec[18] = perf_sig_finalize_ns;
-                rec[19] = perf_sig_fence_ns;
-                rec[20] = perf_sig_publish_ns;
-                rec[21] = task_idx;
-                rec[22] = start_slot;
-                rec[23] = start_slot + batch_size;
-                rec[24] = static_cast<int64_t>(state->expert_slot_base[expert_id]) + start_slot;
-                state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
-                state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
-#endif
-            }
-        }
-#endif
 
     }
 }
@@ -3726,13 +2565,6 @@ __device__ void combine_worker_v2(
     int combine_coordinator_last_rdma_head = 0;
     int combine_coordinator_last_nvl_head[kNumRDMARanks_C] = {0};
     uint32_t combine_forwarder_tma_phase[kCombineNumTMAStages] = {0};
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int combine_lch_role = is_forwarder_sm ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + combine_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        state->perf_combine_lch_ts[trace_idx + 0] = globaltimer_ns();
-    }
-#endif
     // if (thread_id == 0)
     //     printf("[MK-DBG][COMBINE][logical-loop-enter] rank=%d block=%d sm=%d combine_sm=%d physical_ch=%d logical_ch=%d is_forwarder_sm=%d dispatch_done=%d normalized=%d barrier=%d\n",
     //            state->rank, static_cast<int>(blockIdx.x), sm_id, combine_sm_idx, channel_id, logical_channel_id,
@@ -3759,10 +2591,6 @@ __device__ void combine_worker_v2(
                 }
                 __nanosleep(32);
             }
-#if MK_PERF_TRACE_ENABLED
-            int trace_idx = (logical_channel_id * 2) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-            state->perf_combine_lch_ts[trace_idx + 1] = globaltimer_ns();
-#endif
         }
         __syncwarp();
 
@@ -3869,10 +2697,6 @@ __device__ void combine_worker_v2(
         __threadfence_system();
         if (lane_id == 0) {
             st_release_sys_global(&state->channel_normalized[logical_channel_id], 1);
-#if MK_PERF_TRACE_ENABLED
-            int trace_idx = (logical_channel_id * 2) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-            state->perf_combine_lch_ts[trace_idx + 2] = globaltimer_ns();
-#endif
             // printf("[MK-DBG][COMBINE][normalizer-done] rank=%d block=%d physical_ch=%d logical_ch=%d rdma_prefix0=%d gbl_prefix0=%d\n",
             //        state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
             //        rdma_channel_prefix_matrix[logical_channel_id],
@@ -3892,25 +2716,10 @@ __device__ void combine_worker_v2(
                 }
                 __nanosleep(32);
             }
-#if MK_PERF_TRACE_ENABLED
-            if (is_forwarder_sm && thread_id == 0) {
-                int trace_idx = (logical_channel_id * 2 + 1) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-                state->perf_combine_lch_ts[trace_idx + 2] = globaltimer_ns();
-            }
-#endif
         }
         __syncwarp();
     }
 
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int combine_lch_role = is_forwarder_sm ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + combine_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        if (state->perf_combine_lch_ts[trace_idx + 1] == 0)
-            state->perf_combine_lch_ts[trace_idx + 1] = state->perf_combine_lch_ts[trace_idx + 2];
-        state->perf_combine_lch_ts[trace_idx + 3] = globaltimer_ns();
-    }
-#endif
 
     if (warp_role == WarpRole::kNVLSender) {
         // ========== NVL Sender (direct port from internode.cu L1784-1922) ==========
@@ -4038,41 +2847,9 @@ __device__ void combine_worker_v2(
                     //            (long long)token_idx, dst_slot_idx, shifted_x_buffers, src_meta + token_idx,
                     //            topk_weights + token_idx * num_topk, tma_buffer, hidden_int4, num_topk);
                     // }
-#if MK_PERF_TRACE_ARGS
-                    int64_t comb_tma_wait_ns = 0;
-                    int64_t comb_wait_ready_ns = 0;
-                    int64_t comb_wait_ready_single_ns = 0;
-                    int64_t comb_wait_ready_multi_ns = 0;
-                    int64_t comb_wait_ready_flush_ns = 0;
-                    int64_t comb_wait_ready_full_ns = 0;
-                    int64_t comb_wait_ready_flush_count = 0;
-                    int64_t comb_wait_ready_full_count = 0;
-                    int64_t comb_wait_top_ns = 0;
-                    int64_t comb_wait_top_slot = -1;
-                    int64_t comb_wait_top_from_flush = -1;
-                    int64_t comb_gather_reduce_ns = 0;
-                    int64_t comb_gather_single_ns = 0;
-                    int64_t comb_gather_multi_ns = 0;
-                    int64_t comb_pack_meta_ns = 0;
-                    int64_t comb_pack_meta_work_ns = 0;
-                    int64_t comb_pack_meta_sync_ns = 0;
-                    int64_t comb_tma_store_ns = 0;
-                    int64_t phase_start_ns = lane_id == 0 ? globaltimer_ns() : 0;
-#endif
                     tma_store_wait<0>();
-#if MK_PERF_TRACE_ARGS
-                    if (lane_id == 0) {
-                        int64_t now = globaltimer_ns();
-                        comb_tma_wait_ns = now - phase_start_ns;
-                        phase_start_ns = now;
-                    }
-#endif
                     // Gather-ready means combine_input already contains the same-rank output:
                     // compute writes nhits==1 tokens directly, gather_worker reduces nhits>1 tokens.
-#if MK_PERF_TRACE_ARGS
-                    const int nh = ld_acquire_global(&state->token_nhits[token_idx]);
-                    const bool is_single_hit = (nh == 1);
-#endif
                     auto gather_wait_start = clock64();
                     int ready = 0;
                     while (true) {
@@ -4099,20 +2876,6 @@ __device__ void combine_worker_v2(
                         const int4* token_out_i4 = reinterpret_cast<const int4*>(state->combine_input);
                         // No per-slot wait here. combine_token_ready is the only readiness signal.
                         __syncwarp();
-#if MK_PERF_TRACE_ARGS
-                        if (lane_id == 0) {
-                            int64_t now = globaltimer_ns();
-                            comb_wait_ready_ns = now - phase_start_ns;
-                            if (is_single_hit)
-                                comb_wait_ready_single_ns = comb_wait_ready_ns;
-                            else
-                                comb_wait_ready_multi_ns = comb_wait_ready_ns;
-                            comb_wait_top_ns = comb_wait_ready_ns;
-                            comb_wait_top_slot = ld_nc_global(&state->token_slot_list[token_idx * state->num_topk]);
-                            comb_wait_top_from_flush = -1;
-                            phase_start_ns = now;
-                        }
-#endif
                         if (lane_id == 0) {
                             tma_load_1d(tma_buffer,
                                         token_out_i4 + token_idx * hidden_int4,
@@ -4123,17 +2886,6 @@ __device__ void combine_worker_v2(
                         mbarrier_wait(tma_mbarrier, tma_phase);
                     }
                     __syncwarp();
-#if MK_PERF_TRACE_ARGS
-                    if (lane_id == 0) {
-                        int64_t now = globaltimer_ns();
-                        comb_gather_reduce_ns = now - phase_start_ns;
-                        if (is_single_hit)
-                            comb_gather_single_ns = comb_gather_reduce_ns;
-                        else
-                            comb_gather_multi_ns = comb_gather_reduce_ns;
-                        phase_start_ns = now;
-                    }
-#endif
 
                     if (lane_id == 0)
                         *reinterpret_cast<SourceMeta*>(tma_buffer + hidden_bytes) = ld_nc_global(src_meta + token_idx);
@@ -4146,87 +2898,6 @@ __device__ void combine_worker_v2(
                     __syncwarp();
                     if (elect_one_sync())
                         tma_store_1d(tma_buffer, shifted_x_buffers, num_bytes_per_token, false);
-#if MK_PERF_TRACE_ARGS
-                    if (lane_id == 0) {
-                        int64_t now = globaltimer_ns();
-                        comb_tma_store_ns = now - phase_start_ns;
-                        int acc_idx = logical_channel_id * 2;
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_wait_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_tma_wait_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_single_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_single_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_multi_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_multi_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_flush_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_full_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_count[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_flush_count));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_count[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_full_count));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_reduce_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_single_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_single_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_multi_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_multi_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_work_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_work_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_sync_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_sync_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_store_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_tma_store_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_wait_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_tma_wait_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_single_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_single_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_multi_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_multi_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_flush_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_flush_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_ready_full_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_wait_ready_full_ns));
-                        unsigned long long prev_top = atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_wait_top_ns[acc_idx]),
-                                                                static_cast<unsigned long long>(comb_wait_top_ns));
-                        if (static_cast<unsigned long long>(comb_wait_top_ns) > prev_top) {
-                            state->perf_comb_wait_top_token[acc_idx] = token_idx;
-                            state->perf_comb_wait_top_slot[acc_idx] = comb_wait_top_slot;
-                            state->perf_comb_wait_top_expert[acc_idx] = comb_wait_top_slot >= 0 ? comb_wait_top_slot / state->max_tokens_per_expert : -1;
-                            state->perf_comb_wait_top_from_flush[acc_idx] = comb_wait_top_from_flush;
-                            state->perf_comb_wait_top_nhits[acc_idx] = ld_acquire_global(&state->token_nhits[token_idx]);
-                            state->perf_comb_wait_top_priority_deps[acc_idx] = ld_acquire_global(&state->token_priority_dep_count[token_idx]);
-                        }
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_reduce_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_reduce_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_single_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_single_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_gather_multi_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_gather_multi_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_work_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_work_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_pack_meta_sync_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_pack_meta_sync_ns));
-                        atomicMax(reinterpret_cast<unsigned long long*>(&state->perf_comb_tma_store_max_ns[acc_idx]),
-                                  static_cast<unsigned long long>(comb_tma_store_ns));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_nhit_sum[acc_idx]),
-                                  static_cast<unsigned long long>(nh));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_token_count[acc_idx]),
-                                  static_cast<unsigned long long>(1));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_single_token_count[acc_idx]),
-                                  static_cast<unsigned long long>(is_single_hit ? 1 : 0));
-                        atomicAdd(reinterpret_cast<unsigned long long*>(&state->perf_comb_multi_token_count[acc_idx]),
-                                  static_cast<unsigned long long>(is_single_hit ? 0 : 1));
-                    }
-#endif
                 }
                 lane_id == current_rdma_idx ? (token_start_idx = static_cast<int>(token_idx)) : 0;
             }
@@ -4637,13 +3308,6 @@ __device__ void combine_worker_v2(
         }
     }
     __syncthreads();
-#if MK_PERF_TRACE_ENABLED
-    if (thread_id == 0) {
-        int combine_lch_role = is_forwarder_sm ? 1 : 0;
-        int trace_idx = (logical_channel_id * 2 + combine_lch_role) * MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-        state->perf_combine_lch_ts[trace_idx + 4] = globaltimer_ns();
-    }
-#endif
     // if (thread_id == 0)
     //     printf("[MK-DBG][COMBINE][after-logical-barrier] rank=%d block=%d physical_ch=%d logical_ch=%d barrier=%d\n",
     //            state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
@@ -4713,14 +3377,6 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
     __shared__ int s_has_task;
 
     while (true) {
-#if MK_PERF_TRACE_ENABLED
-        int64_t perf_start_ns = globaltimer_ns();
-        int64_t perf_end_ns = 0;
-#endif
-#if MK_PERF_TRACE_ARGS
-        int64_t perf_scan_done_ns = 0;
-        int64_t perf_reduce_done_ns = 0;
-#endif
         if (tid == 0) {
             s_has_task = 0;
             s_token_base = 0;
@@ -4743,10 +3399,6 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         __syncthreads();
         if (!s_has_task)
             break;
-#if MK_PERF_TRACE_ARGS
-        if (tid == 0)
-            perf_scan_done_ns = globaltimer_ns();
-#endif
 
         const int token_base = s_token_base;
         const int batch_count = s_batch_count;
@@ -4757,21 +3409,6 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
         const int num_topk = state->num_topk;
         int4* slot_base_i4 = reinterpret_cast<int4*>(state->compute_output_slot);
         int4* token_out_i4 = reinterpret_cast<int4*>(state->combine_input);
-#if MK_PERF_TRACE_ARGS
-        int first_token = -1;
-        int last_token = -1;
-        int nhit_sum = 0;
-        if (tid == 0) {
-            for (int batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
-                const int token_idx = state->gather_ready_queue[token_base + batch_idx];
-                const int nhits = ld_acquire_global(&state->token_nhits[token_idx]);
-                if (batch_idx == 0)
-                    first_token = token_idx;
-                last_token = token_idx;
-                nhit_sum += nhits;
-            }
-        }
-#endif
 
         constexpr int kGatherChunkInt4 = 128;
         constexpr int kGatherVecsPerLane = kGatherChunkInt4 / 32;
@@ -4837,28 +3474,6 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
             atomicExch(&state->combine_token_ready[token_idx], 1);
         }
         __syncthreads();
-#if MK_PERF_TRACE_ENABLED
-        if (tid == 0) {
-            perf_end_ns = globaltimer_ns();
-            int slot = atomicAdd(state->perf_gather_task_count, 1);
-            if (slot < state->max_compute_tasks) {
-                int64_t* rec = state->perf_gather_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS;
-                rec[0] = perf_start_ns;
-                rec[1] = perf_end_ns;
-                rec[2] = gather_sm_idx;
-                rec[3] = batch_count;
-#if MK_PERF_TRACE_ARGS
-                perf_reduce_done_ns = perf_end_ns;
-                rec[4] = first_token;
-                rec[5] = last_token;
-                rec[6] = nhit_sum;
-                rec[7] = perf_scan_done_ns;
-                rec[8] = perf_reduce_done_ns;
-                rec[9] = perf_reduce_done_ns;
-#endif
-            }
-        }
-#endif
     }
 }
 
@@ -4947,9 +3562,6 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // Host-Side Launch
 // ============================================================================
 
-#if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(const MegaKernelState& host_state, int total_sms, const char* trace_phase);
-#endif
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 static void launch_megakernel_v7_case(
@@ -5048,1804 +3660,8 @@ void launch_megakernel_v7(
 #undef MEGAKERNEL_LAUNCH_CASE_WITH_DTYPE
 #undef MEGAKERNEL_LAUNCH_STAGE_CASE
 
-#if MK_PERF_TRACE_ENABLED
-    dump_perf_trace_perfetto(*launcher_host_state, total_sms, "forward");
-#endif
 }
 
-#if MK_PERF_TRACE_ENABLED
-static void dump_perf_trace_perfetto(const MegaKernelState& host_state, int total_sms, const char* trace_phase) {
-
-    static int forward_trace_iter = 0;
-    static int backward_trace_iter = 0;
-    const bool is_backward_trace = trace_phase != nullptr && trace_phase[0] == 'b';
-    const int trace_iter = is_backward_trace ? backward_trace_iter++ : forward_trace_iter++;
-    const char* trace_retention = std::getenv("MK_PERF_TRACE_RETENTION");
-    const bool keep_all_trace_iters = trace_retention != nullptr && trace_retention[0] == 'a';
-
-    int num_logical_channels = host_state.num_logical_channels;
-    constexpr int NLP = MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-
-    std::vector<int64_t> dispatch_lch_ts(num_logical_channels * 2 * NLP);
-    std::vector<int64_t> combine_lch_ts(num_logical_channels * 2 * NLP);
-    CUDA_CHECK(cudaMemcpy(dispatch_lch_ts.data(), host_state.perf_dispatch_lch_ts, num_logical_channels * 2 * NLP * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(combine_lch_ts.data(), host_state.perf_combine_lch_ts, num_logical_channels * 2 * NLP * sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    constexpr int NCF = MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
-    int compute_task_count = host_state.max_compute_tasks;
-    std::vector<int64_t> compute_task(compute_task_count > 0 ? (size_t)compute_task_count * NCF : 1);
-    if (compute_task_count > 0)
-        CUDA_CHECK(cudaMemcpy(compute_task.data(), host_state.perf_compute_task, (size_t)compute_task_count * NCF * sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    int gather_task_count = 0;
-    constexpr int NGF = MegaKernelState::MK_PERF_NUM_GATHER_FIELDS;
-    CUDA_CHECK(cudaMemcpy(&gather_task_count, host_state.perf_gather_task_count, sizeof(int), cudaMemcpyDeviceToHost));
-    if (gather_task_count > host_state.max_compute_tasks)
-        gather_task_count = host_state.max_compute_tasks;
-    std::vector<int64_t> gather_task(gather_task_count > 0 ? (size_t)gather_task_count * NGF : 1);
-    if (gather_task_count > 0)
-        CUDA_CHECK(cudaMemcpy(gather_task.data(), host_state.perf_gather_task, (size_t)gather_task_count * NGF * sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    const int async_pub_n = host_state.num_pub_warps_total;
-    std::vector<int64_t> async_pub_start(async_pub_n);
-    std::vector<int64_t> async_pub_end(async_pub_n);
-    int64_t async_publish_all_done_ts = 0;
-    if (async_pub_n > 0) {
-        const size_t async_pub_bytes = (size_t)async_pub_n * sizeof(int64_t);
-        CUDA_CHECK(cudaMemcpy(async_pub_start.data(), host_state.perf_async_pub_start_ts, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_end.data(), host_state.perf_async_pub_end_ts, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&async_publish_all_done_ts, host_state.perf_async_publish_all_done_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    }
-    const int logical_channels_per_physical = host_state.num_dispatch_channels > 0 ?
-        num_logical_channels / host_state.num_dispatch_channels : 1;
-
-#if !MK_PERF_TRACE_ARGS
-    std::vector<int64_t> sched_ts(2);
-    CUDA_CHECK(cudaMemcpy(sched_ts.data(), host_state.perf_sched_ts, 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    int64_t base_ts = std::numeric_limits<int64_t>::max();
-    for (int i = 0; i < num_logical_channels * 2 * NLP; ++i) {
-        int64_t trace_ts = dispatch_lch_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int i = 0; i < num_logical_channels * 2 * NLP; ++i) {
-        int64_t trace_ts = combine_lch_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int t = 0; t < compute_task_count; ++t) {
-        int64_t* rec = &compute_task[(size_t)t * NCF];
-        if (rec[26] == 0) continue;
-        int64_t trace_ts = rec[0];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int t = 0; t < gather_task_count; ++t) {
-        int64_t trace_ts = gather_task[(size_t)t * NGF];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int i = 0; i < async_pub_n; ++i) {
-        int64_t trace_ts = async_pub_start[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int i = 0; i < 2; ++i) {
-        int64_t trace_ts = sched_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    if (base_ts == std::numeric_limits<int64_t>::max()) base_ts = 0;
-
-    char filename[256];
-    if (keep_all_trace_iters) {
-        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s_iter%d.json", host_state.rank, trace_phase, trace_iter);
-    } else {
-        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s.json", host_state.rank, trace_phase);
-    }
-    FILE* f = fopen(filename, "w");
-
-    if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
-    // printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
-
-    fprintf(f, "[\n");
-    bool first = true;
-    auto emit_comma = [&]() {
-        if (!first) fprintf(f, ",\n");
-        first = false;
-    };
-    auto emit_event = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid);
-    };
-    auto emit_colored_event = [&](const char* name, const char* cat, const char* color,
-                                  int64_t start, int64_t end, int pid, int tid) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"cname\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d}",
-                name, cat, color, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid);
-    };
-
-    emit_comma();
-    fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}}",
-            host_state.rank, host_state.rank);
-    emit_comma();
-    fprintf(f, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":%lld}}",
-            host_state.rank, (long long)base_ts);
-
-    int lch_tid_base = 0;
-    int compute_tid_base = num_logical_channels * 5;
-    const int num_compute_groups = host_state.num_compute_groups;
-    for (int group_id = 0; group_id < num_compute_groups; ++group_id) {
-        int tid = compute_tid_base + group_id;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"compute_group_%d\"}}",
-                host_state.rank, tid, group_id);
-    }
-    {
-        int tid = compute_tid_base + num_compute_groups;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"gather_task\"}}",
-                host_state.rank, tid);
-    }
-    int scheduler_tid = num_logical_channels * 5 + 50;
-    emit_comma();
-    fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-               "\"args\":{\"name\":\"scheduler_bridge\"}}",
-            host_state.rank, scheduler_tid);
-
-    for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
-        int dispatch_sender_tid = lch_tid_base + logical_channel_id * 5;
-        int dispatch_forwarder_tid = dispatch_sender_tid + 1;
-        int async_publish_tid = dispatch_sender_tid + 2;
-        int combine_sender_tid = dispatch_sender_tid + 3;
-        int combine_forwarder_tid = dispatch_sender_tid + 4;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"dispatch_sender_lch_%d\"}}",
-                host_state.rank, dispatch_sender_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"dispatch_forwarder_lch_%d\"}}",
-                host_state.rank, dispatch_forwarder_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"dispatch_async_publish_lch_%d\"}}",
-                host_state.rank, async_publish_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"combine_sender_lch_%d\"}}",
-                host_state.rank, combine_sender_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"combine_forwarder_lch_%d\"}}",
-                host_state.rank, combine_forwarder_tid, logical_channel_id);
-
-        int64_t* dsp = &dispatch_lch_ts[(logical_channel_id * 2) * NLP];
-        emit_event("dispatch_sender_work", "dispatch_sender_lch", dsp[0], dsp[1], host_state.rank, dispatch_sender_tid);
-        emit_event("dispatch_sender_channel_barrier", "dispatch_sender_lch", dsp[1], dsp[2], host_state.rank, dispatch_sender_tid);
-        emit_event("dispatch_sender_round_barrier", "dispatch_sender_lch", dsp[2], dsp[3], host_state.rank, dispatch_sender_tid);
-
-        int64_t* dfp = &dispatch_lch_ts[(logical_channel_id * 2 + 1) * NLP];
-        emit_event("dispatch_forwarder_work", "dispatch_forwarder_lch", dfp[0], dfp[1], host_state.rank, dispatch_forwarder_tid);
-        emit_event("dispatch_forwarder_channel_barrier", "dispatch_forwarder_lch", dfp[1], dfp[2], host_state.rank, dispatch_forwarder_tid);
-        emit_event("dispatch_forwarder_round_barrier", "dispatch_forwarder_lch", dfp[2], dfp[3], host_state.rank, dispatch_forwarder_tid);
-
-        int physical_channel_id = logical_channels_per_physical > 0 ?
-            logical_channel_id / logical_channels_per_physical : logical_channel_id;
-        int max_pw = -1;
-        int64_t max_pub_duration_ns = -1;
-        for (int src_nvl_rank = 0; src_nvl_rank < NUM_MAX_NVL_PEERS; ++src_nvl_rank) {
-            int pw = physical_channel_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
-            if (pw >= async_pub_n || async_pub_start[pw] == 0 || async_pub_end[pw] == 0)
-                continue;
-            int64_t start = async_pub_start[pw];
-            int64_t end = async_pub_end[pw];
-            if (end <= start)
-                end = start + 1;
-            int64_t gate_end = end;
-            if (async_publish_all_done_ts > start && async_publish_all_done_ts < end)
-                gate_end = async_publish_all_done_ts;
-            int64_t duration_ns = gate_end - start;
-            if (duration_ns > max_pub_duration_ns) {
-                max_pub_duration_ns = duration_ns;
-                max_pw = pw;
-            }
-        }
-        if (max_pw >= 0) {
-            int64_t start = async_pub_start[max_pw];
-            int64_t end = async_pub_end[max_pw];
-            if (end <= start)
-                end = start + 1;
-            int64_t gate_end = end;
-            if (async_publish_all_done_ts > start && async_publish_all_done_ts < end)
-                gate_end = async_publish_all_done_ts;
-            emit_event("dispatch_async_publish", "dispatch_async_publish", start, gate_end, host_state.rank, async_publish_tid);
-        }
-
-        int64_t* csp = &combine_lch_ts[(logical_channel_id * 2) * NLP];
-        emit_event("sender_wait_dispatch_done", "combine_sender_lch", csp[0], csp[1], host_state.rank, combine_sender_tid);
-        emit_event("sender_head_normalize", "combine_sender_lch", csp[1], csp[2], host_state.rank, combine_sender_tid);
-        emit_event("sender_nvl_send_rdma_recv", "combine_sender_lch", csp[3], csp[4], host_state.rank, combine_sender_tid);
-
-        int64_t* cfp = &combine_lch_ts[(logical_channel_id * 2 + 1) * NLP];
-        emit_event("forwarder_wait_normalized", "combine_forwarder_lch", cfp[0], cfp[2], host_state.rank, combine_forwarder_tid);
-        emit_event("forwarder_nvl_to_rdma", "combine_forwarder_lch", cfp[3], cfp[4], host_state.rank, combine_forwarder_tid);
-    }
-
-    emit_event("scheduler_bridge", "scheduler", sched_ts[0], sched_ts[1], host_state.rank, scheduler_tid);
-
-    for (int t = 0; t < gather_task_count; ++t) {
-        int64_t* rec = &gather_task[(size_t)t * NGF];
-        int tid = compute_tid_base + num_compute_groups;
-        emit_event("gather_task", "gather_sm", rec[0], rec[1], host_state.rank, tid);
-    }
-    for (int t = 0; t < compute_task_count; ++t) {
-        int64_t* rec = &compute_task[(size_t)t * NCF];
-        if (rec[26] == 0) continue;
-        int group_id = static_cast<int>(rec[3]);
-        int batch_size = static_cast<int>(rec[5]);
-        int tid = compute_tid_base + group_id;
-        const bool is_partial_batch = batch_size < host_state.compute_batch_size;
-        const char* task_color = is_partial_batch ? "terrible" : "good";
-        const char* task_name = is_partial_batch ? "compute_task_partial" : "compute_task_full";
-        emit_colored_event(task_name, "compute_group", task_color,
-                           rec[0], rec[1], host_state.rank, tid);
-    }
-
-    fprintf(f, "\n]\n");
-    fclose(f);
-    // printf("[MK-PERF] Perfetto trace written to %s (%d logical channels, block events only)\n", filename, num_logical_channels);
-    return;
-#else
-    constexpr bool emit_perf_args = MK_PERF_TRACE_ARGS;
-
-    // Accumulated semaphore-interaction timers (rendered as args on existing rows).
-    std::vector<int64_t> disp_wait_nvl(num_logical_channels * 2);
-    std::vector<int64_t> disp_publish(num_logical_channels * 2);
-    std::vector<int64_t> disp_wait_recvcount(num_logical_channels * 2);
-    std::vector<int64_t> comb_tma_wait(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_single(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_multi(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_flush(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_full(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_flush_count(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_full_count(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_reduce(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_single(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_multi(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta_work(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta_sync(num_logical_channels * 2);
-    std::vector<int64_t> comb_tma_store(num_logical_channels * 2);
-    std::vector<int64_t> comb_tma_wait_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_single_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_multi_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_flush_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_ready_full_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_token(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_slot(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_expert(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_from_flush(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_nhits(num_logical_channels * 2);
-    std::vector<int64_t> comb_wait_top_priority_deps(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_reduce_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_single_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_gather_multi_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta_work_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_pack_meta_sync_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_tma_store_max(num_logical_channels * 2);
-    std::vector<int64_t> comb_nhit_sum(num_logical_channels * 2);
-    std::vector<int64_t> comb_token_count(num_logical_channels * 2);
-    std::vector<int64_t> comb_single_token_count(num_logical_channels * 2);
-    std::vector<int64_t> comb_multi_token_count(num_logical_channels * 2);
-    CUDA_CHECK(cudaMemcpy(disp_wait_nvl.data(), host_state.perf_disp_wait_nvl_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_publish.data(), host_state.perf_disp_publish_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_wait_recvcount.data(), host_state.perf_disp_wait_recvcount_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_tma_wait.data(), host_state.perf_comb_tma_wait_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready.data(), host_state.perf_comb_wait_ready_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_single.data(), host_state.perf_comb_wait_ready_single_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_multi.data(), host_state.perf_comb_wait_ready_multi_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush.data(), host_state.perf_comb_wait_ready_flush_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full.data(), host_state.perf_comb_wait_ready_full_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush_count.data(), host_state.perf_comb_wait_ready_flush_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full_count.data(), host_state.perf_comb_wait_ready_full_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_reduce.data(), host_state.perf_comb_gather_reduce_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_single.data(), host_state.perf_comb_gather_single_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_multi.data(), host_state.perf_comb_gather_multi_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta.data(), host_state.perf_comb_pack_meta_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta_work.data(), host_state.perf_comb_pack_meta_work_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta_sync.data(), host_state.perf_comb_pack_meta_sync_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_tma_store.data(), host_state.perf_comb_tma_store_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_tma_wait_max.data(), host_state.perf_comb_tma_wait_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_max.data(), host_state.perf_comb_wait_ready_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_single_max.data(), host_state.perf_comb_wait_ready_single_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_multi_max.data(), host_state.perf_comb_wait_ready_multi_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_flush_max.data(), host_state.perf_comb_wait_ready_flush_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_ready_full_max.data(), host_state.perf_comb_wait_ready_full_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top.data(), host_state.perf_comb_wait_top_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_token.data(), host_state.perf_comb_wait_top_token, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_slot.data(), host_state.perf_comb_wait_top_slot, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_expert.data(), host_state.perf_comb_wait_top_expert, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_from_flush.data(), host_state.perf_comb_wait_top_from_flush, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_nhits.data(), host_state.perf_comb_wait_top_nhits, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_wait_top_priority_deps.data(), host_state.perf_comb_wait_top_priority_deps, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_reduce_max.data(), host_state.perf_comb_gather_reduce_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_single_max.data(), host_state.perf_comb_gather_single_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_gather_multi_max.data(), host_state.perf_comb_gather_multi_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta_max.data(), host_state.perf_comb_pack_meta_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta_work_max.data(), host_state.perf_comb_pack_meta_work_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_pack_meta_sync_max.data(), host_state.perf_comb_pack_meta_sync_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_tma_store_max.data(), host_state.perf_comb_tma_store_max_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_nhit_sum.data(), host_state.perf_comb_nhit_sum, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_token_count.data(), host_state.perf_comb_token_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_single_token_count.data(), host_state.perf_comb_single_token_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(comb_multi_token_count.data(), host_state.perf_comb_multi_token_count, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    // publish breakdown timers.
-    std::vector<int64_t> disp_pub_scan(num_logical_channels * 2);
-    std::vector<int64_t> disp_pub_atomic(num_logical_channels * 2);
-    std::vector<int64_t> disp_pub_fence(num_logical_channels * 2);
-    std::vector<int64_t> disp_pub_store(num_logical_channels * 2);
-    std::vector<int64_t> disp_cta_barrier(num_logical_channels * 2);
-    std::vector<int64_t> disp_channel_barrier(num_logical_channels * 2);
-    std::vector<int64_t> disp_round_barrier(num_logical_channels * 2);
-    std::vector<int64_t> disp_tokens(num_logical_channels * 2);
-    std::vector<int64_t> disp_local_hit_tokens(num_logical_channels * 2);
-    std::vector<int64_t> disp_local_hits(num_logical_channels * 2);
-    const int disp_role_n = num_logical_channels * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS;
-    const int disp_recv_n = num_logical_channels * 2 * NUM_MAX_NVL_PEERS;
-    const int num_rdma_ranks = host_state.num_ranks / NUM_MAX_NVL_PEERS;
-    std::vector<int64_t> disp_cta_release(num_logical_channels * 2);
-    std::vector<int64_t> disp_role_arrive(disp_role_n);
-    std::vector<int64_t> disp_role_work(disp_role_n);
-    std::vector<int64_t> disp_allrecv_wait_nvl(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_wait(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_wait_start(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_observe(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_done(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_slowest_rdma(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_src_nvl(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_raw_start(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_prefix_raw_end(disp_recv_n);
-    const int disp_prefix_prod_n = disp_recv_n * num_rdma_ranks;
-    std::vector<int64_t> disp_prefix_store_begin(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_publish(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_fence_done(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_store_to_fence(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_meta_wait(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_tokens(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_producer_rank(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_producer_nvl(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_producer_dst_nvl(disp_prefix_prod_n);
-    std::vector<int64_t> disp_prefix_producer_src_rdma(disp_prefix_prod_n);
-    std::vector<int64_t> disp_allrecv_token_loop(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_retire(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_publish(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_tokens(disp_recv_n);
-    std::vector<int64_t> disp_allrecv_local_hits(disp_recv_n);
-    std::vector<int64_t> async_pub_wait_ring(async_pub_n);
-    std::vector<int64_t> async_pub_poll(async_pub_n);
-    std::vector<int64_t> async_pub_gap(async_pub_n);
-    std::vector<int64_t> async_pub_start_gap(async_pub_n);
-    std::vector<int64_t> async_pub_empty_gap(async_pub_n);
-    std::vector<int64_t> async_pub_done_recheck(async_pub_n);
-    std::vector<int64_t> async_pub_ring_load(async_pub_n);
-    std::vector<int64_t> async_pub_head_release(async_pub_n);
-    std::vector<int64_t> async_pub_syncwarp(async_pub_n);
-    std::vector<int64_t> async_pub_batch_wall(async_pub_n);
-    std::vector<int64_t> async_pub_batch_accounted(async_pub_n);
-    std::vector<int64_t> async_pub_batch_unattributed(async_pub_n);
-    std::vector<int64_t> async_pub_token_gap(async_pub_n);
-    std::vector<int64_t> async_pub_helper_unattributed(async_pub_n);
-    std::vector<int64_t> async_pub_finish(async_pub_n);
-    std::vector<int64_t> async_pub_work(async_pub_n);
-    std::vector<int64_t> async_pub_scan(async_pub_n);
-    std::vector<int64_t> async_pub_atomic(async_pub_n);
-    std::vector<int64_t> async_pub_fence(async_pub_n);
-    std::vector<int64_t> async_pub_store(async_pub_n);
-    std::vector<int64_t> async_pub_drain(async_pub_n);
-    std::vector<int64_t> async_pub_tokens(async_pub_n);
-    std::vector<int64_t> async_pub_batch_count(async_pub_n);
-    std::vector<int64_t> async_pub_head_release_count(async_pub_n);
-    std::vector<int64_t> async_pub_max_batch(async_pub_n);
-    std::vector<int64_t> async_pub_local_hit_tokens(async_pub_n);
-    std::vector<int64_t> async_pub_local_hits(async_pub_n);
-    CUDA_CHECK(cudaMemcpy(disp_pub_scan.data(), host_state.perf_disp_pub_scan_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_pub_atomic.data(), host_state.perf_disp_pub_atomic_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_pub_fence.data(), host_state.perf_disp_pub_fence_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_pub_store.data(), host_state.perf_disp_pub_store_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_cta_barrier.data(), host_state.perf_disp_cta_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_channel_barrier.data(), host_state.perf_disp_channel_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_round_barrier.data(), host_state.perf_disp_round_barrier_ns, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_tokens.data(), host_state.perf_disp_tokens, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_local_hit_tokens.data(), host_state.perf_disp_local_hit_tokens, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_local_hits.data(), host_state.perf_disp_local_hits, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_cta_release.data(), host_state.perf_disp_cta_release_ts, num_logical_channels * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_role_arrive.data(), host_state.perf_disp_role_arrive_ts, (size_t)disp_role_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_role_work.data(), host_state.perf_disp_role_work_ns, (size_t)disp_role_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_wait_nvl.data(), host_state.perf_disp_allrecv_wait_nvl_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_wait.data(), host_state.perf_disp_allrecv_prefix_wait_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_wait_start.data(), host_state.perf_disp_allrecv_prefix_wait_start_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_observe.data(), host_state.perf_disp_allrecv_prefix_observe_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_done.data(), host_state.perf_disp_allrecv_prefix_done_ts, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_slowest_rdma.data(), host_state.perf_disp_allrecv_prefix_slowest_rdma, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_src_nvl.data(), host_state.perf_disp_allrecv_prefix_src_nvl, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_raw_start.data(), host_state.perf_disp_allrecv_prefix_raw_start, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_prefix_raw_end.data(), host_state.perf_disp_allrecv_prefix_raw_end, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_store_begin.data(), host_state.perf_disp_prefix_store_begin_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_publish.data(), host_state.perf_disp_prefix_publish_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_fence_done.data(), host_state.perf_disp_prefix_fence_done_ts, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_store_to_fence.data(), host_state.perf_disp_prefix_store_to_fence_ns, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_meta_wait.data(), host_state.perf_disp_prefix_meta_wait_ns, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_tokens.data(), host_state.perf_disp_prefix_tokens, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_rank.data(), host_state.perf_disp_prefix_producer_rank, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_nvl.data(), host_state.perf_disp_prefix_producer_nvl, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_dst_nvl.data(), host_state.perf_disp_prefix_producer_dst_nvl, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_prefix_producer_src_rdma.data(), host_state.perf_disp_prefix_producer_src_rdma, (size_t)disp_prefix_prod_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_token_loop.data(), host_state.perf_disp_allrecv_token_loop_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_retire.data(), host_state.perf_disp_allrecv_retire_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_publish.data(), host_state.perf_disp_allrecv_publish_ns, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_tokens.data(), host_state.perf_disp_allrecv_tokens, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(disp_allrecv_local_hits.data(), host_state.perf_disp_allrecv_local_hits, (size_t)disp_recv_n * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    if (async_pub_n > 0) {
-        const size_t async_pub_bytes = (size_t)async_pub_n * sizeof(int64_t);
-        CUDA_CHECK(cudaMemcpy(async_pub_wait_ring.data(), host_state.perf_async_pub_wait_ring_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_poll.data(), host_state.perf_async_pub_poll_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_gap.data(), host_state.perf_async_pub_gap_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_start_gap.data(), host_state.perf_async_pub_start_gap_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_empty_gap.data(), host_state.perf_async_pub_empty_gap_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_done_recheck.data(), host_state.perf_async_pub_done_recheck_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_ring_load.data(), host_state.perf_async_pub_ring_load_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_head_release.data(), host_state.perf_async_pub_head_release_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_syncwarp.data(), host_state.perf_async_pub_syncwarp_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_batch_wall.data(), host_state.perf_async_pub_batch_wall_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_batch_accounted.data(), host_state.perf_async_pub_batch_accounted_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_batch_unattributed.data(), host_state.perf_async_pub_batch_unattributed_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_token_gap.data(), host_state.perf_async_pub_token_gap_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_helper_unattributed.data(), host_state.perf_async_pub_helper_unattributed_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_finish.data(), host_state.perf_async_pub_finish_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_work.data(), host_state.perf_async_pub_work_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_scan.data(), host_state.perf_async_pub_scan_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_atomic.data(), host_state.perf_async_pub_atomic_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_fence.data(), host_state.perf_async_pub_fence_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_store.data(), host_state.perf_async_pub_store_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_drain.data(), host_state.perf_async_pub_drain_ns, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_tokens.data(), host_state.perf_async_pub_tokens, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_batch_count.data(), host_state.perf_async_pub_batch_count, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_head_release_count.data(), host_state.perf_async_pub_head_release_count, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_max_batch.data(), host_state.perf_async_pub_max_batch, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_local_hit_tokens.data(), host_state.perf_async_pub_local_hit_tokens, async_pub_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(async_pub_local_hits.data(), host_state.perf_async_pub_local_hits, async_pub_bytes, cudaMemcpyDeviceToHost));
-    }
-
-    std::vector<int64_t> sched_ts(2);
-    int64_t sched_scan_ns = 0, sched_enqueue_ns = 0, sched_idle_ns = 0;
-    int64_t sched_priority_ns = 0, sched_normal_ns = 0, sched_tail_flush_ns = 0;
-    int64_t sched_publish_total_ns = 0, sched_publish_wait_ns = 0, sched_publish_wait_max_ns = 0;
-    int64_t sched_publish_wait_max_tail = -1, sched_publish_wait_max_visible_tail = -1;
-    int64_t sched_priority_scan_tokens = 0, sched_priority_ready_tokens = 0;
-    int64_t sched_priority_full_batch_hits = 0, sched_priority_batch_already_enqueued = 0;
-    int64_t sched_priority_already_normal = 0, sched_priority_already_priority = 0, sched_priority_already_tail = 0;
-    int64_t sched_normal_after_priority_ns = 0, sched_normal_after_priority_count = 0;
-    int64_t sched_priority_not_full = 0, sched_normal_full_batch_enqueues = 0, sched_flush_tail_enqueues = 0;
-    int64_t sched_queue_empty_count = 0, sched_queue_empty_after_dispatch_count = 0;
-    int64_t sched_max_ready_tail_gap = 0, sched_stall_expert = -1, sched_stall_recv_count = 0;
-    int64_t sched_stall_alloc_count = 0, sched_stall_enqueue_cursor = 0;
-    int64_t sched_stall_first_unready_slot = -1, sched_stall_first_unready_ready = 0, sched_stall_dispatch_done = 0;
-    int64_t sched_first_done_seen_ts = 0, sched_first_recv_count_advance_ts = 0;
-    int64_t sched_first_recv_count_advance_expert = -1, sched_first_recv_count_advance_old = -1;
-    int64_t sched_first_recv_count_advance_new = -1;
-    int64_t sched_first_normal_enqueue_attempt_ts = 0, sched_first_normal_enqueue_success_ts = 0;
-    int64_t sched_first_task_publish_ts = 0, sched_first_task_source = 0;
-    int64_t sched_first_task_expert = -1, sched_first_task_batch = -1;
-    int64_t sched_first_task_start_slot = -1, sched_first_task_num_tokens = 0;
-    CUDA_CHECK(cudaMemcpy(sched_ts.data(), host_state.perf_sched_ts, 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_scan_ns, host_state.perf_sched_scan_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_enqueue_ns, host_state.perf_sched_enqueue_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_idle_ns, host_state.perf_sched_idle_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_ns, host_state.perf_sched_priority_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_normal_ns, host_state.perf_sched_normal_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_tail_flush_ns, host_state.perf_sched_tail_flush_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_publish_total_ns, host_state.perf_sched_publish_total_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_publish_wait_ns, host_state.perf_sched_publish_wait_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_publish_wait_max_ns, host_state.perf_sched_publish_wait_max_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_publish_wait_max_tail, host_state.perf_sched_publish_wait_max_tail, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_publish_wait_max_visible_tail, host_state.perf_sched_publish_wait_max_visible_tail, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_scan_tokens, host_state.perf_sched_priority_scan_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_ready_tokens, host_state.perf_sched_priority_ready_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_full_batch_hits, host_state.perf_sched_priority_full_batch_hits, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_batch_already_enqueued, host_state.perf_sched_priority_batch_already_enqueued, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_already_normal, host_state.perf_sched_priority_already_normal, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_already_priority, host_state.perf_sched_priority_already_priority, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_already_tail, host_state.perf_sched_priority_already_tail, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_normal_after_priority_ns, host_state.perf_sched_normal_after_priority_ns, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_normal_after_priority_count, host_state.perf_sched_normal_after_priority_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_priority_not_full, host_state.perf_sched_priority_not_full, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_normal_full_batch_enqueues, host_state.perf_sched_normal_full_batch_enqueues, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_flush_tail_enqueues, host_state.perf_sched_flush_tail_enqueues, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_queue_empty_count, host_state.perf_sched_queue_empty_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_queue_empty_after_dispatch_count, host_state.perf_sched_queue_empty_after_dispatch_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_max_ready_tail_gap, host_state.perf_sched_max_ready_tail_gap, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_expert, host_state.perf_sched_stall_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_recv_count, host_state.perf_sched_stall_recv_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_alloc_count, host_state.perf_sched_stall_alloc_count, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_enqueue_cursor, host_state.perf_sched_stall_enqueue_cursor, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_slot, host_state.perf_sched_stall_first_unready_slot, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_first_unready_ready, host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_stall_dispatch_done, host_state.perf_sched_stall_dispatch_done, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_done_seen_ts, host_state.perf_sched_first_done_seen_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_ts, host_state.perf_sched_first_recv_count_advance_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_expert, host_state.perf_sched_first_recv_count_advance_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_old, host_state.perf_sched_first_recv_count_advance_old, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_recv_count_advance_new, host_state.perf_sched_first_recv_count_advance_new, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_normal_enqueue_attempt_ts, host_state.perf_sched_first_normal_enqueue_attempt_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_normal_enqueue_success_ts, host_state.perf_sched_first_normal_enqueue_success_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_publish_ts, host_state.perf_sched_first_task_publish_ts, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_source, host_state.perf_sched_first_task_source, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_expert, host_state.perf_sched_first_task_expert, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_batch, host_state.perf_sched_first_task_batch, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_start_slot, host_state.perf_sched_first_task_start_slot, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&sched_first_task_num_tokens, host_state.perf_sched_first_task_num_tokens, sizeof(int64_t), cudaMemcpyDeviceToHost));
-
-    // Root-cause diagnostic parallel arrays: multi-expert rows.
-    const int diag_n = compute_task_count > 0 ? compute_task_count : 1;
-    std::vector<int> diag_multi_rows(diag_n);
-    std::vector<int> diag_task_has_multi(diag_n);
-    const int queue_diag_n = host_state.max_compute_tasks > 0 ? host_state.max_compute_tasks : 1;
-    std::vector<int64_t> q_publish(queue_diag_n), q_pop_start(queue_diag_n), q_pop_done(queue_diag_n),
-        q_bcast_done(queue_diag_n), q_task_start(queue_diag_n), q_prev_end(queue_diag_n), q_prev_gap(queue_diag_n);
-    std::vector<int> q_source(queue_diag_n), q_pop_attempts(queue_diag_n), q_cas_failures(queue_diag_n), q_group_id(queue_diag_n);
-    if (compute_task_count > 0) {
-        CUDA_CHECK(cudaMemcpy(diag_multi_rows.data(), host_state.perf_compute_multi_expert_rows, (size_t)compute_task_count * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(diag_task_has_multi.data(), host_state.perf_compute_task_has_multi, (size_t)compute_task_count * sizeof(int), cudaMemcpyDeviceToHost));
-    }
-    if (host_state.max_compute_tasks > 0) {
-        const size_t qb64 = (size_t)host_state.max_compute_tasks * sizeof(int64_t);
-        const size_t qb32 = (size_t)host_state.max_compute_tasks * sizeof(int);
-        CUDA_CHECK(cudaMemcpy(q_publish.data(), host_state.perf_task_publish_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_source.data(), host_state.perf_task_source, qb32, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_pop_start.data(), host_state.perf_task_pop_start_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_pop_done.data(), host_state.perf_task_pop_done_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_bcast_done.data(), host_state.perf_task_bcast_done_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_task_start.data(), host_state.perf_task_start_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_prev_end.data(), host_state.perf_task_prev_end_ts, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_prev_gap.data(), host_state.perf_task_prev_gap_ns, qb64, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_pop_attempts.data(), host_state.perf_task_pop_attempts, qb32, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_cas_failures.data(), host_state.perf_task_cas_failures, qb32, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(q_group_id.data(), host_state.perf_task_group_id, qb32, cudaMemcpyDeviceToHost));
-    }
-
-    int64_t base_ts = std::numeric_limits<int64_t>::max();
-    for (int i = 0; i < num_logical_channels * 2 * NLP; ++i) {
-        int64_t trace_ts = dispatch_lch_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int i = 0; i < num_logical_channels * 2 * NLP; ++i) {
-        int64_t trace_ts = combine_lch_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int i = 0; i < 2; ++i) {
-        int64_t trace_ts = sched_ts[i];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int t = 0; t < compute_task_count; ++t) {
-        int64_t* rec = &compute_task[(size_t)t * NCF];
-        if (rec[26] == 0) continue;
-        int64_t trace_ts = rec[0];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    for (int t = 0; t < gather_task_count; ++t) {
-        int64_t trace_ts = gather_task[(size_t)t * NGF];
-        if (trace_ts != 0 && trace_ts < base_ts) base_ts = trace_ts;
-    }
-    if (base_ts == std::numeric_limits<int64_t>::max()) base_ts = 0;
-
-    // globaltimer_ns() already returns nanoseconds; convert to us for Perfetto.
-    // Use per-rank min as base so trace starts near 0; for cross-rank comparison,
-    // use aggregate_mk_perf_traces.py which aligns rank baselines.
-
-    char filename[256];
-    if (keep_all_trace_iters) {
-        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s_iter%d.json", host_state.rank, trace_phase, trace_iter);
-    } else {
-        snprintf(filename, sizeof(filename), "mk_perf_trace_rank%d_%s.json", host_state.rank, trace_phase);
-    }
-    FILE* f = fopen(filename, "w");
-
-    if (!f) { printf("[MK-PERF] Failed to open %s\n", filename); return; }
-
-    // Also write raw base_ts so post-processing can re-align ranks
-    // printf("[MK-PERF] rank=%d base_ts_ns=%lld\n", host_state.rank, (long long)base_ts);
-
-    fprintf(f, "[\n");
-    bool first = true;
-    auto emit_comma = [&]() {
-        if (!first) fprintf(f, ",\n");
-        first = false;
-    };
-    auto emit_event = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid) {
-        if (start == 0 || end == 0 || end <= start) return;
-        // Output in nanoseconds (Perfetto supports "displayTimeUnit":"ns" but default is us)
-        // We use microseconds with fractional part via integer division
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid);
-    };
-    auto emit_colored_event = [&](const char* name, const char* cat, const char* color,
-                                  int64_t start, int64_t end, int pid, int tid) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"cname\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d}",
-                name, cat, color, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid);
-    };
-    // Same as emit_event, but attaches semaphore-interaction breakdown (us) as args.
-    auto emit_event_sema = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
-                               int64_t wait_a_ns, const char* key_a,
-                               int64_t wait_b_ns, const char* key_b,
-                               int64_t wait_c_ns, const char* key_c) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        if (!emit_perf_args) {
-            emit_event(name, cat, start, end, pid, tid);
-            return;
-        }
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"%s_us\":%.3f,\"%s_us\":%.3f,\"%s_us\":%.3f}}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
-                key_a, wait_a_ns / 1000.0, key_b, wait_b_ns / 1000.0, key_c, wait_c_ns / 1000.0);
-    };
-    auto emit_event_combine_sender = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
-                                         int64_t tma_wait_sum_ns, int64_t wait_ready_sum_ns,
-                                         int64_t wait_ready_single_sum_ns, int64_t wait_ready_multi_sum_ns,
-                                         int64_t wait_ready_flush_sum_ns, int64_t wait_ready_full_sum_ns,
-                                         int64_t wait_ready_flush_count, int64_t wait_ready_full_count,
-                                         int64_t gather_reduce_sum_ns,
-                                         int64_t gather_single_sum_ns, int64_t gather_multi_sum_ns,
-                                         int64_t pack_meta_sum_ns, int64_t pack_meta_work_sum_ns,
-                                         int64_t pack_meta_sync_sum_ns, int64_t tma_store_sum_ns,
-                                         int64_t tma_wait_max_ns, int64_t wait_ready_max_ns,
-                                         int64_t wait_ready_single_max_ns, int64_t wait_ready_multi_max_ns,
-                                         int64_t wait_ready_flush_max_ns, int64_t wait_ready_full_max_ns,
-                                         int64_t wait_top_ns, int64_t wait_top_token, int64_t wait_top_slot,
-                                         int64_t wait_top_expert, int64_t wait_top_from_flush,
-                                         int64_t wait_top_nhits, int64_t wait_top_priority_deps,
-                                         int64_t gather_reduce_max_ns,
-                                         int64_t gather_single_max_ns, int64_t gather_multi_max_ns,
-                                         int64_t pack_meta_max_ns, int64_t pack_meta_work_max_ns,
-                                         int64_t pack_meta_sync_max_ns, int64_t tma_store_max_ns,
-                                         int64_t nhit_sum, int64_t token_count,
-                                         int64_t single_token_count, int64_t multi_token_count) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        if (!emit_perf_args) {
-            emit_event(name, cat, start, end, pid, tid);
-            return;
-        }
-        double avg_nhits = token_count > 0 ? static_cast<double>(nhit_sum) / static_cast<double>(token_count) : 0.0;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"tma_wait_sum_us\":%.3f,\"wait_slot_ready_sum_us\":%.3f,"
-                   "\"wait_slot_ready_single_sum_us\":%.3f,\"wait_slot_ready_multi_sum_us\":%.3f,"
-                   "\"wait_slot_ready_flush_sum_us\":%.3f,\"wait_slot_ready_full_sum_us\":%.3f,"
-                   "\"wait_slot_ready_flush_count\":%lld,\"wait_slot_ready_full_count\":%lld,"
-                   "\"gather_reduce_sum_us\":%.3f,\"gather_single_sum_us\":%.3f,\"gather_multi_sum_us\":%.3f,"
-                   "\"pack_meta_sum_us\":%.3f,\"pack_meta_work_sum_us\":%.3f,\"pack_meta_sync_sum_us\":%.3f,"
-                   "\"tma_store_issue_sum_us\":%.3f,"
-                   "\"tma_wait_max_us\":%.3f,\"wait_slot_ready_max_us\":%.3f,"
-                   "\"wait_slot_ready_single_max_us\":%.3f,\"wait_slot_ready_multi_max_us\":%.3f,"
-                   "\"wait_slot_ready_flush_max_us\":%.3f,\"wait_slot_ready_full_max_us\":%.3f,"
-                   "\"top_wait_us\":%.3f,\"top_wait_token\":%lld,\"top_wait_slot\":%lld,"
-                   "\"top_wait_expert\":%lld,\"top_wait_from_flush\":%lld,"
-                   "\"top_wait_nhits\":%lld,\"top_wait_priority_deps\":%lld,"
-                   "\"gather_reduce_max_us\":%.3f,\"gather_single_max_us\":%.3f,\"gather_multi_max_us\":%.3f,"
-                   "\"pack_meta_max_us\":%.3f,\"pack_meta_work_max_us\":%.3f,\"pack_meta_sync_max_us\":%.3f,"
-                   "\"tma_store_issue_max_us\":%.3f,"
-                   "\"tokens\":%lld,\"single_tokens\":%lld,\"multi_tokens\":%lld,"
-                   "\"nhit_sum\":%lld,\"avg_nhits\":%.3f}}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
-                tma_wait_sum_ns / 1000.0, wait_ready_sum_ns / 1000.0,
-                wait_ready_single_sum_ns / 1000.0, wait_ready_multi_sum_ns / 1000.0,
-                wait_ready_flush_sum_ns / 1000.0, wait_ready_full_sum_ns / 1000.0,
-                static_cast<long long>(wait_ready_flush_count), static_cast<long long>(wait_ready_full_count),
-                gather_reduce_sum_ns / 1000.0, gather_single_sum_ns / 1000.0, gather_multi_sum_ns / 1000.0,
-                pack_meta_sum_ns / 1000.0, pack_meta_work_sum_ns / 1000.0, pack_meta_sync_sum_ns / 1000.0,
-                tma_store_sum_ns / 1000.0,
-                tma_wait_max_ns / 1000.0, wait_ready_max_ns / 1000.0,
-                wait_ready_single_max_ns / 1000.0, wait_ready_multi_max_ns / 1000.0,
-                wait_ready_flush_max_ns / 1000.0, wait_ready_full_max_ns / 1000.0,
-                wait_top_ns / 1000.0, static_cast<long long>(wait_top_token), static_cast<long long>(wait_top_slot),
-                static_cast<long long>(wait_top_expert), static_cast<long long>(wait_top_from_flush),
-                static_cast<long long>(wait_top_nhits), static_cast<long long>(wait_top_priority_deps),
-                gather_reduce_max_ns / 1000.0, gather_single_max_ns / 1000.0, gather_multi_max_ns / 1000.0,
-                pack_meta_max_ns / 1000.0, pack_meta_work_max_ns / 1000.0, pack_meta_sync_max_ns / 1000.0,
-                tma_store_max_ns / 1000.0,
-                static_cast<long long>(token_count), static_cast<long long>(single_token_count),
-                static_cast<long long>(multi_token_count), static_cast<long long>(nhit_sum), avg_nhits);
-    };
-    auto emit_event_scheduler = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
-                                    int64_t scan_ns, int64_t enqueue_ns, int64_t idle_ns,
-                                    int64_t priority_ns, int64_t normal_ns, int64_t tail_flush_ns,
-                                    int64_t publish_total_ns, int64_t publish_wait_ns,
-                                    int64_t publish_wait_max_ns, int64_t publish_wait_max_tail,
-                                    int64_t publish_wait_max_visible_tail,
-                                    int64_t priority_scan_tokens, int64_t priority_ready_tokens,
-                                    int64_t priority_full_batch_hits, int64_t priority_batch_already_enqueued,
-                                    int64_t priority_already_normal, int64_t priority_already_priority, int64_t priority_already_tail,
-                                    int64_t normal_after_priority_ns, int64_t normal_after_priority_count,
-                                    int64_t priority_not_full, int64_t normal_full_batch_enqueues,
-                                    int64_t flush_tail_enqueues, int64_t queue_empty_count,
-                                    int64_t queue_empty_after_dispatch_count, int64_t max_ready_tail_gap,
-                                    int64_t stall_expert, int64_t stall_recv_count, int64_t stall_alloc_count,
-                                    int64_t stall_enqueue_cursor, int64_t stall_first_unready_slot,
-                                    int64_t stall_first_unready_ready, int64_t stall_dispatch_done) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        auto trace_ts_us = [&](int64_t value) -> double {
-            return value > 0 ? (value - base_ts) / 1000.0 : -1.0;
-        };
-        auto sched_delta_us = [&](int64_t value) -> double {
-            return value > 0 && sched_ts[0] > 0 ? (value - sched_ts[0]) / 1000.0 : -1.0;
-        };
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        if (!emit_perf_args) {
-            emit_event(name, cat, start, end, pid, tid);
-            return;
-        }
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"scheduler_lanes\":%d,\"scan_ready_us\":%.3f,\"enqueue_task_us\":%.3f,\"idle_sleep_us\":%.3f,"
-                   "\"priority_path_us\":%.3f,\"normal_path_us\":%.3f,\"tail_flush_path_us\":%.3f,"
-                   "\"publish_total_us\":%.3f,\"publish_wait_tail_us\":%.3f,\"publish_wait_tail_max_us\":%.3f,"
-                   "\"publish_wait_tail_max_tail\":%lld,\"publish_wait_tail_max_visible_tail\":%lld,"
-                   "\"priority_scan_tokens\":%lld,\"priority_ready_tokens\":%lld,"
-                   "\"priority_full_batch_hits\":%lld,\"priority_batch_already_enqueued\":%lld,"
-                   "\"priority_already_normal\":%lld,\"priority_already_priority\":%lld,\"priority_already_tail\":%lld,"
-                   "\"normal_after_priority_us\":%.3f,\"normal_after_priority_count\":%lld,"
-                   "\"priority_not_full\":%lld,\"normal_full_batch_enqueues\":%lld,\"flush_tail_enqueues\":%lld,"
-                   "\"queue_empty_count\":%lld,\"queue_empty_after_dispatch_count\":%lld,"
-                   "\"max_ready_tail_gap\":%lld,\"stall_expert\":%lld,\"stall_recv_count\":%lld,"
-                   "\"stall_alloc_count\":%lld,\"stall_enqueue_cursor\":%lld,"
-                   "\"stall_first_unready_slot\":%lld,\"stall_first_unready_ready\":%lld,"
-                   "\"stall_dispatch_done\":%lld,"
-                   "\"async_publish_all_done_ts_us\":%.3f,\"sched_start_to_publish_all_done_us\":%.3f,"
-                   "\"first_done_seen_ts_us\":%.3f,\"sched_start_to_first_done_seen_us\":%.3f,"
-                   "\"first_recv_count_advance_ts_us\":%.3f,\"sched_start_to_first_recv_count_advance_us\":%.3f,"
-                   "\"first_recv_count_advance_expert\":%lld,\"first_recv_count_advance_old\":%lld,\"first_recv_count_advance_new\":%lld,"
-                   "\"first_normal_enqueue_attempt_ts_us\":%.3f,\"sched_start_to_first_normal_enqueue_attempt_us\":%.3f,"
-                   "\"first_normal_enqueue_success_ts_us\":%.3f,\"sched_start_to_first_normal_enqueue_success_us\":%.3f,"
-                   "\"first_task_publish_ts_us\":%.3f,\"sched_start_to_first_task_publish_us\":%.3f,"
-                   "\"first_task_source\":%lld,\"first_task_expert\":%lld,\"first_task_batch\":%lld,"
-                   "\"first_task_start_slot\":%lld,\"first_task_num_tokens\":%lld}}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
-                COMPUTE_SCHEDULER_SMS, scan_ns / 1000.0, enqueue_ns / 1000.0, idle_ns / 1000.0,
-                priority_ns / 1000.0, normal_ns / 1000.0, tail_flush_ns / 1000.0,
-                publish_total_ns / 1000.0, publish_wait_ns / 1000.0, publish_wait_max_ns / 1000.0,
-                static_cast<long long>(publish_wait_max_tail), static_cast<long long>(publish_wait_max_visible_tail),
-                static_cast<long long>(priority_scan_tokens), static_cast<long long>(priority_ready_tokens),
-                static_cast<long long>(priority_full_batch_hits), static_cast<long long>(priority_batch_already_enqueued),
-                static_cast<long long>(priority_already_normal), static_cast<long long>(priority_already_priority),
-                static_cast<long long>(priority_already_tail), normal_after_priority_ns / 1000.0,
-                static_cast<long long>(normal_after_priority_count), static_cast<long long>(priority_not_full),
-                static_cast<long long>(normal_full_batch_enqueues),
-                static_cast<long long>(flush_tail_enqueues), static_cast<long long>(queue_empty_count),
-                static_cast<long long>(queue_empty_after_dispatch_count), static_cast<long long>(max_ready_tail_gap),
-                static_cast<long long>(stall_expert), static_cast<long long>(stall_recv_count),
-                static_cast<long long>(stall_alloc_count), static_cast<long long>(stall_enqueue_cursor),
-                static_cast<long long>(stall_first_unready_slot), static_cast<long long>(stall_first_unready_ready),
-                static_cast<long long>(stall_dispatch_done),
-                trace_ts_us(async_publish_all_done_ts), sched_delta_us(async_publish_all_done_ts),
-                trace_ts_us(sched_first_done_seen_ts), sched_delta_us(sched_first_done_seen_ts),
-                trace_ts_us(sched_first_recv_count_advance_ts), sched_delta_us(sched_first_recv_count_advance_ts),
-                static_cast<long long>(sched_first_recv_count_advance_expert),
-                static_cast<long long>(sched_first_recv_count_advance_old),
-                static_cast<long long>(sched_first_recv_count_advance_new),
-                trace_ts_us(sched_first_normal_enqueue_attempt_ts), sched_delta_us(sched_first_normal_enqueue_attempt_ts),
-                trace_ts_us(sched_first_normal_enqueue_success_ts), sched_delta_us(sched_first_normal_enqueue_success_ts),
-                trace_ts_us(sched_first_task_publish_ts), sched_delta_us(sched_first_task_publish_ts),
-                static_cast<long long>(sched_first_task_source), static_cast<long long>(sched_first_task_expert),
-                static_cast<long long>(sched_first_task_batch), static_cast<long long>(sched_first_task_start_slot),
-                static_cast<long long>(sched_first_task_num_tokens));
-    };
-    // Dispatch sender/forwarder work event with full publish breakdown as args (us).
-    auto emit_event_publish = [&](const char* name, const char* cat, int64_t start, int64_t end, int pid, int tid,
-                                  int64_t wait_nvl_ns, int64_t publish_ns, int64_t wait_recvcount_ns,
-                                  int64_t scan_ns, int64_t atomic_ns, int64_t fence_ns, int64_t store_ns,
-                                  int64_t cta_barrier_ns, int64_t channel_barrier_ns, int64_t round_barrier_ns,
-                                  int64_t tokens, int64_t local_hit_tokens, int64_t local_hits,
-                                  int64_t cta_last_role, int64_t cta_last_slot, int64_t cta_last_work_ns,
-                                  int64_t cta_last_arrive_to_release_ns,
-                                  int64_t last_recv_prefix_wait_ns, int64_t last_recv_prefix_src_nvl,
-                                  int64_t last_recv_prefix_src_rdma,
-                                  int64_t last_recv_prefix_publish_to_done_ns,
-                                  int64_t last_recv_prefix_store_to_fence_ns,
-                                  int64_t last_recv_prefix_fence_done_to_done_ns,
-                                  int64_t last_recv_prefix_producer_meta_wait_ns,
-                                  int64_t last_recv_prefix_producer_tokens,
-                                  int64_t last_recv_prefix_producer_rank,
-                                  int64_t last_recv_prefix_producer_nvl,
-                                  int64_t last_recv_prefix_producer_dst_nvl,
-                                  int64_t last_recv_prefix_producer_src_rdma,
-                                  int64_t last_recv_prefix_wait_start_to_store_begin_ns,
-                                  int64_t last_recv_prefix_store_begin_to_observe_ns,
-                                  int64_t last_recv_prefix_publish_to_observe_ns,
-                                  int64_t last_recv_prefix_observe_to_done_ns,
-                                  int64_t last_recv_prefix_raw_start,
-                                  int64_t last_recv_prefix_raw_end,
-                                  int64_t last_recv_wait_nvl_ns,
-                                  int64_t last_recv_token_loop_ns, int64_t last_recv_publish_ns,
-                                  int64_t last_recv_retire_ns, int64_t last_recv_tokens,
-                                  int64_t last_recv_local_hits,
-                                  int64_t slowest_recv_rank, int64_t slowest_recv_prefix_wait_ns,
-                                  int64_t slowest_recv_prefix_src_nvl,
-                                  int64_t slowest_recv_prefix_src_rdma,
-                                  int64_t slowest_recv_prefix_publish_to_done_ns,
-                                  int64_t slowest_recv_prefix_store_to_fence_ns,
-                                  int64_t slowest_recv_prefix_fence_done_to_done_ns,
-                                  int64_t slowest_recv_prefix_producer_meta_wait_ns,
-                                  int64_t slowest_recv_prefix_producer_tokens,
-                                  int64_t slowest_recv_prefix_producer_rank,
-                                  int64_t slowest_recv_prefix_producer_nvl,
-                                  int64_t slowest_recv_prefix_producer_dst_nvl,
-                                  int64_t slowest_recv_prefix_producer_src_rdma,
-                                  int64_t slowest_recv_prefix_wait_start_to_store_begin_ns,
-                                  int64_t slowest_recv_prefix_store_begin_to_observe_ns,
-                                  int64_t slowest_recv_prefix_publish_to_observe_ns,
-                                  int64_t slowest_recv_prefix_observe_to_done_ns,
-                                  int64_t slowest_recv_prefix_raw_start,
-                                  int64_t slowest_recv_prefix_raw_end,
-                                  int64_t slowest_recv_wait_nvl_ns, int64_t slowest_recv_token_loop_ns,
-                                  int64_t slowest_recv_publish_ns, int64_t slowest_recv_retire_ns,
-                                  int64_t slowest_recv_tokens, int64_t slowest_recv_local_hits) {
-        if (start == 0 || end == 0 || end <= start) return;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        if (!emit_perf_args) {
-            emit_event(name, cat, start, end, pid, tid);
-            return;
-        }
-        int64_t attributed_ns = wait_nvl_ns + publish_ns + cta_barrier_ns + channel_barrier_ns + round_barrier_ns;
-        int64_t unattributed_ns = dur_ns > attributed_ns ? dur_ns - attributed_ns : 0;
-        emit_comma();
-        fprintf(f, "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"wait_nvl_us\":%.3f,\"publish_us\":%.3f,\"wait_recvcount_us\":%.3f,"
-                   "\"pub_scan_us\":%.3f,\"pub_atomic_us\":%.3f,\"pub_fence_us\":%.3f,\"pub_store_us\":%.3f,"
-                   "\"cta_barrier_us\":%.3f,\"channel_barrier_us\":%.3f,\"round_barrier_us\":%.3f,\"unattributed_us\":%.3f,"
-                   "\"tokens\":%lld,\"local_hit_tokens\":%lld,\"local_hits\":%lld,"
-                   "\"cta_last_role\":%lld,\"cta_last_slot\":%lld,\"cta_last_work_us\":%.3f,"
-                   "\"cta_last_arrive_to_release_us\":%.3f,"
-                   "\"last_recv_prefix_wait_us\":%.3f,\"last_recv_prefix_src_nvl\":%lld,"
-                   "\"last_recv_prefix_src_rdma\":%lld,"
-                   "\"last_recv_prefix_publish_to_done_us\":%.3f,\"last_recv_prefix_store_to_fence_us\":%.3f,"
-                   "\"last_recv_prefix_fence_done_to_done_us\":%.3f,\"last_recv_prefix_producer_meta_wait_us\":%.3f,"
-                   "\"last_recv_prefix_producer_tokens\":%lld,\"last_recv_prefix_producer_rank\":%lld,"
-                   "\"last_recv_prefix_producer_nvl\":%lld,\"last_recv_prefix_producer_dst_nvl\":%lld,"
-                   "\"last_recv_prefix_producer_src_rdma\":%lld,"
-                   "\"last_recv_prefix_wait_start_to_store_begin_us\":%.3f,"
-                   "\"last_recv_prefix_store_begin_to_observe_us\":%.3f,"
-                   "\"last_recv_prefix_publish_to_observe_us\":%.3f,"
-                   "\"last_recv_prefix_observe_to_done_us\":%.3f,"
-                   "\"last_recv_prefix_raw_start\":%lld,\"last_recv_prefix_raw_end\":%lld,"
-                   "\"last_recv_wait_nvl_us\":%.3f,"
-                   "\"last_recv_token_loop_us\":%.3f,\"last_recv_publish_us\":%.3f,"
-                   "\"last_recv_retire_us\":%.3f,\"last_recv_tokens\":%lld,"
-                   "\"last_recv_local_hits\":%lld,"
-                   "\"slowest_recv_rank\":%lld,\"slowest_recv_prefix_wait_us\":%.3f,"
-                   "\"slowest_recv_prefix_src_nvl\":%lld,\"slowest_recv_prefix_src_rdma\":%lld,"
-                   "\"slowest_recv_prefix_publish_to_done_us\":%.3f,"
-                   "\"slowest_recv_prefix_store_to_fence_us\":%.3f,\"slowest_recv_prefix_fence_done_to_done_us\":%.3f,"
-                   "\"slowest_recv_prefix_producer_meta_wait_us\":%.3f,\"slowest_recv_prefix_producer_tokens\":%lld,"
-                   "\"slowest_recv_prefix_producer_rank\":%lld,\"slowest_recv_prefix_producer_nvl\":%lld,"
-                   "\"slowest_recv_prefix_producer_dst_nvl\":%lld,\"slowest_recv_prefix_producer_src_rdma\":%lld,"
-                   "\"slowest_recv_prefix_wait_start_to_store_begin_us\":%.3f,"
-                   "\"slowest_recv_prefix_store_begin_to_observe_us\":%.3f,"
-                   "\"slowest_recv_prefix_publish_to_observe_us\":%.3f,"
-                   "\"slowest_recv_prefix_observe_to_done_us\":%.3f,"
-                   "\"slowest_recv_prefix_raw_start\":%lld,\"slowest_recv_prefix_raw_end\":%lld,"
-                   "\"slowest_recv_wait_nvl_us\":%.3f,\"slowest_recv_token_loop_us\":%.3f,"
-                   "\"slowest_recv_publish_us\":%.3f,\"slowest_recv_retire_us\":%.3f,"
-                   "\"slowest_recv_tokens\":%lld,\"slowest_recv_local_hits\":%lld}}",
-                name, cat, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid,
-                wait_nvl_ns / 1000.0, publish_ns / 1000.0, wait_recvcount_ns / 1000.0,
-                scan_ns / 1000.0, atomic_ns / 1000.0, fence_ns / 1000.0, store_ns / 1000.0,
-                cta_barrier_ns / 1000.0, channel_barrier_ns / 1000.0, round_barrier_ns / 1000.0, unattributed_ns / 1000.0,
-                static_cast<long long>(tokens), static_cast<long long>(local_hit_tokens),
-                static_cast<long long>(local_hits), static_cast<long long>(cta_last_role),
-                static_cast<long long>(cta_last_slot), cta_last_work_ns / 1000.0,
-                cta_last_arrive_to_release_ns / 1000.0,
-                last_recv_prefix_wait_ns / 1000.0, static_cast<long long>(last_recv_prefix_src_nvl),
-                static_cast<long long>(last_recv_prefix_src_rdma),
-                last_recv_prefix_publish_to_done_ns / 1000.0,
-                last_recv_prefix_store_to_fence_ns / 1000.0,
-                last_recv_prefix_fence_done_to_done_ns / 1000.0,
-                last_recv_prefix_producer_meta_wait_ns / 1000.0,
-                static_cast<long long>(last_recv_prefix_producer_tokens),
-                static_cast<long long>(last_recv_prefix_producer_rank),
-                static_cast<long long>(last_recv_prefix_producer_nvl),
-                static_cast<long long>(last_recv_prefix_producer_dst_nvl),
-                static_cast<long long>(last_recv_prefix_producer_src_rdma),
-                last_recv_prefix_wait_start_to_store_begin_ns / 1000.0,
-                last_recv_prefix_store_begin_to_observe_ns / 1000.0,
-                last_recv_prefix_publish_to_observe_ns / 1000.0,
-                last_recv_prefix_observe_to_done_ns / 1000.0,
-                static_cast<long long>(last_recv_prefix_raw_start),
-                static_cast<long long>(last_recv_prefix_raw_end),
-                last_recv_wait_nvl_ns / 1000.0,
-                last_recv_token_loop_ns / 1000.0, last_recv_publish_ns / 1000.0,
-                last_recv_retire_ns / 1000.0, static_cast<long long>(last_recv_tokens),
-                static_cast<long long>(last_recv_local_hits),
-                static_cast<long long>(slowest_recv_rank), slowest_recv_prefix_wait_ns / 1000.0,
-                static_cast<long long>(slowest_recv_prefix_src_nvl),
-                static_cast<long long>(slowest_recv_prefix_src_rdma),
-                slowest_recv_prefix_publish_to_done_ns / 1000.0,
-                slowest_recv_prefix_store_to_fence_ns / 1000.0,
-                slowest_recv_prefix_fence_done_to_done_ns / 1000.0,
-                slowest_recv_prefix_producer_meta_wait_ns / 1000.0,
-                static_cast<long long>(slowest_recv_prefix_producer_tokens),
-                static_cast<long long>(slowest_recv_prefix_producer_rank),
-                static_cast<long long>(slowest_recv_prefix_producer_nvl),
-                static_cast<long long>(slowest_recv_prefix_producer_dst_nvl),
-                static_cast<long long>(slowest_recv_prefix_producer_src_rdma),
-                slowest_recv_prefix_wait_start_to_store_begin_ns / 1000.0,
-                slowest_recv_prefix_store_begin_to_observe_ns / 1000.0,
-                slowest_recv_prefix_publish_to_observe_ns / 1000.0,
-                slowest_recv_prefix_observe_to_done_ns / 1000.0,
-                static_cast<long long>(slowest_recv_prefix_raw_start),
-                static_cast<long long>(slowest_recv_prefix_raw_end),
-                slowest_recv_wait_nvl_ns / 1000.0, slowest_recv_token_loop_ns / 1000.0,
-                slowest_recv_publish_ns / 1000.0, slowest_recv_retire_ns / 1000.0,
-                static_cast<long long>(slowest_recv_tokens), static_cast<long long>(slowest_recv_local_hits));
-    };
-
-    // Process/thread metadata
-    emit_comma();
-    fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}}",
-            host_state.rank, host_state.rank);
-    // Embed base_ts_ns for cross-rank alignment by aggregate script
-    emit_comma();
-    fprintf(f, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":%lld}}",
-            host_state.rank, (long long)base_ts);
-
-    const int args_lch_tid_base = 0;
-    const int args_block_compute_tid_base = num_logical_channels * 4;
-    const int args_block_num_compute_groups = host_state.num_compute_groups;
-    for (int group_id = 0; group_id < args_block_num_compute_groups; ++group_id) {
-        int tid = args_block_compute_tid_base + group_id;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"compute_group_%d\"}}",
-                host_state.rank, tid, group_id);
-    }
-    {
-        int tid = args_block_compute_tid_base + args_block_num_compute_groups;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,\"args\":{\"name\":\"gather_task\"}}",
-                host_state.rank, tid);
-    }
-
-    for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
-        int dispatch_sender_tid = args_lch_tid_base + logical_channel_id * 5;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"dispatch_sender_lch_%d\"}}",
-                host_state.rank, dispatch_sender_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, dispatch_sender_tid, dispatch_sender_tid);
-
-        int dispatch_forwarder_tid = dispatch_sender_tid + 1;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"dispatch_forwarder_lch_%d\"}}",
-                host_state.rank, dispatch_forwarder_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, dispatch_forwarder_tid, dispatch_forwarder_tid);
-
-        int async_publish_tid = dispatch_sender_tid + 2;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"dispatch_async_publish_lch_%d\"}}",
-                host_state.rank, async_publish_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, async_publish_tid, async_publish_tid);
-
-        int combine_sender_tid = dispatch_sender_tid + 3;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"combine_sender_lch_%d\"}}",
-                host_state.rank, combine_sender_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, combine_sender_tid, combine_sender_tid);
-
-        int combine_forwarder_tid = dispatch_sender_tid + 4;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"combine_forwarder_lch_%d\"}}",
-                host_state.rank, combine_forwarder_tid, logical_channel_id);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, combine_forwarder_tid, combine_forwarder_tid);
-    }
-
-    int scheduler_tid = num_logical_channels * 5 + 50;
-    emit_comma();
-    fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-               "\"args\":{\"name\":\"scheduler_bridge\"}}",
-            host_state.rank, scheduler_tid);
-    emit_comma();
-    fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-               "\"args\":{\"sort_index\":%d}}",
-            host_state.rank, scheduler_tid, scheduler_tid);
-
-    int pid = host_state.rank;
-    auto get_dispatch_role_diag = [&](int acc_idx, int64_t& last_role, int64_t& last_slot,
-                                      int64_t& last_work_ns, int64_t& last_arrive_to_release_ns,
-                                      int64_t& last_recv_prefix_wait_ns, int64_t& last_recv_prefix_src_nvl,
-                                      int64_t& last_recv_prefix_src_rdma,
-                                      int64_t& last_recv_prefix_publish_to_done_ns,
-                                      int64_t& last_recv_prefix_store_to_fence_ns,
-                                      int64_t& last_recv_prefix_fence_done_to_done_ns,
-                                      int64_t& last_recv_prefix_producer_meta_wait_ns,
-                                      int64_t& last_recv_prefix_producer_tokens,
-                                      int64_t& last_recv_prefix_producer_rank,
-                                      int64_t& last_recv_prefix_producer_nvl,
-                                      int64_t& last_recv_prefix_producer_dst_nvl,
-                                      int64_t& last_recv_prefix_producer_src_rdma,
-                                      int64_t& last_recv_prefix_wait_start_to_store_begin_ns,
-                                      int64_t& last_recv_prefix_store_begin_to_observe_ns,
-                                      int64_t& last_recv_prefix_publish_to_observe_ns,
-                                      int64_t& last_recv_prefix_observe_to_done_ns,
-                                      int64_t& last_recv_prefix_raw_start,
-                                      int64_t& last_recv_prefix_raw_end,
-                                      int64_t& last_recv_wait_ns,
-                                      int64_t& last_recv_token_loop_ns, int64_t& last_recv_publish_ns,
-                                      int64_t& last_recv_retire_ns, int64_t& last_recv_tokens,
-                                      int64_t& last_recv_local_hits,
-                                      int64_t& slow_recv_rank, int64_t& slow_recv_prefix_wait_ns,
-                                      int64_t& slow_recv_prefix_src_nvl,
-                                      int64_t& slow_recv_prefix_src_rdma,
-                                      int64_t& slow_recv_prefix_publish_to_done_ns,
-                                      int64_t& slow_recv_prefix_store_to_fence_ns,
-                                      int64_t& slow_recv_prefix_fence_done_to_done_ns,
-                                      int64_t& slow_recv_prefix_producer_meta_wait_ns,
-                                      int64_t& slow_recv_prefix_producer_tokens,
-                                      int64_t& slow_recv_prefix_producer_rank,
-                                      int64_t& slow_recv_prefix_producer_nvl,
-                                      int64_t& slow_recv_prefix_producer_dst_nvl,
-                                      int64_t& slow_recv_prefix_producer_src_rdma,
-                                      int64_t& slow_recv_prefix_wait_start_to_store_begin_ns,
-                                      int64_t& slow_recv_prefix_store_begin_to_observe_ns,
-                                      int64_t& slow_recv_prefix_publish_to_observe_ns,
-                                      int64_t& slow_recv_prefix_observe_to_done_ns,
-                                      int64_t& slow_recv_prefix_raw_start,
-                                      int64_t& slow_recv_prefix_raw_end,
-                                      int64_t& slow_recv_wait_ns, int64_t& slow_recv_token_loop_ns,
-                                      int64_t& slow_recv_publish_ns, int64_t& slow_recv_retire_ns,
-                                      int64_t& slow_recv_tokens, int64_t& slow_recv_local_hits) {
-        last_role = -1;
-        last_slot = -1;
-        last_work_ns = 0;
-        last_arrive_to_release_ns = 0;
-        last_recv_prefix_wait_ns = 0;
-        last_recv_prefix_src_nvl = -1;
-        last_recv_prefix_src_rdma = -1;
-        last_recv_prefix_publish_to_done_ns = 0;
-        last_recv_prefix_store_to_fence_ns = 0;
-        last_recv_prefix_fence_done_to_done_ns = 0;
-        last_recv_prefix_producer_meta_wait_ns = 0;
-        last_recv_prefix_producer_tokens = 0;
-        last_recv_prefix_producer_rank = -1;
-        last_recv_prefix_producer_nvl = -1;
-        last_recv_prefix_producer_dst_nvl = -1;
-        last_recv_prefix_producer_src_rdma = -1;
-        last_recv_prefix_wait_start_to_store_begin_ns = 0;
-        last_recv_prefix_store_begin_to_observe_ns = 0;
-        last_recv_prefix_publish_to_observe_ns = 0;
-        last_recv_prefix_observe_to_done_ns = 0;
-        last_recv_prefix_raw_start = 0;
-        last_recv_prefix_raw_end = 0;
-        last_recv_wait_ns = 0;
-        last_recv_token_loop_ns = 0;
-        last_recv_publish_ns = 0;
-        last_recv_retire_ns = 0;
-        last_recv_tokens = 0;
-        last_recv_local_hits = 0;
-        slow_recv_rank = -1;
-        slow_recv_prefix_wait_ns = 0;
-        slow_recv_prefix_src_nvl = -1;
-        slow_recv_prefix_src_rdma = -1;
-        slow_recv_prefix_publish_to_done_ns = 0;
-        slow_recv_prefix_store_to_fence_ns = 0;
-        slow_recv_prefix_fence_done_to_done_ns = 0;
-        slow_recv_prefix_producer_meta_wait_ns = 0;
-        slow_recv_prefix_producer_tokens = 0;
-        slow_recv_prefix_producer_rank = -1;
-        slow_recv_prefix_producer_nvl = -1;
-        slow_recv_prefix_producer_dst_nvl = -1;
-        slow_recv_prefix_producer_src_rdma = -1;
-        slow_recv_prefix_wait_start_to_store_begin_ns = 0;
-        slow_recv_prefix_store_begin_to_observe_ns = 0;
-        slow_recv_prefix_publish_to_observe_ns = 0;
-        slow_recv_prefix_observe_to_done_ns = 0;
-        slow_recv_prefix_raw_start = 0;
-        slow_recv_prefix_raw_end = 0;
-        slow_recv_wait_ns = 0;
-        slow_recv_token_loop_ns = 0;
-        slow_recv_publish_ns = 0;
-        slow_recv_retire_ns = 0;
-        slow_recv_tokens = 0;
-        slow_recv_local_hits = 0;
-        int64_t last_arrive = 0;
-        for (int r = 0; r < MK_DISPATCH_ROLE_COUNT; ++r) {
-            for (int s = 0; s < NUM_MAX_NVL_PEERS; ++s) {
-                int idx = ((acc_idx * MK_DISPATCH_ROLE_COUNT + r) * NUM_MAX_NVL_PEERS) + s;
-                int64_t arrive = disp_role_arrive[idx];
-                if (arrive > last_arrive) {
-                    last_arrive = arrive;
-                    last_role = r;
-                    last_slot = s;
-                    last_work_ns = disp_role_work[idx];
-                }
-            }
-        }
-        if (disp_cta_release[acc_idx] > last_arrive && last_arrive > 0)
-            last_arrive_to_release_ns = disp_cta_release[acc_idx] - last_arrive;
-        if (last_role == 4 && last_slot >= 0) {
-            int idx = acc_idx * NUM_MAX_NVL_PEERS + last_slot;
-            last_recv_prefix_wait_ns = disp_allrecv_prefix_wait[idx];
-            last_recv_prefix_src_nvl = disp_allrecv_prefix_src_nvl[idx];
-            last_recv_prefix_src_rdma = disp_allrecv_prefix_slowest_rdma[idx];
-            if (last_recv_prefix_src_rdma >= 0) {
-                int producer_acc_idx = (acc_idx / 2) * 2 + 1;
-                int prod_idx = (producer_acc_idx * NUM_MAX_NVL_PEERS + last_slot) * num_rdma_ranks + static_cast<int>(last_recv_prefix_src_rdma);
-                int64_t store_begin_ts = disp_prefix_store_begin[prod_idx];
-                int64_t publish_ts = disp_prefix_publish[prod_idx];
-                int64_t observe_ts = disp_allrecv_prefix_observe[idx];
-                if (disp_allrecv_prefix_done[idx] > publish_ts && publish_ts > 0)
-                    last_recv_prefix_publish_to_done_ns = disp_allrecv_prefix_done[idx] - publish_ts;
-                last_recv_prefix_store_to_fence_ns = disp_prefix_store_to_fence[prod_idx];
-                if (disp_allrecv_prefix_done[idx] > disp_prefix_fence_done[prod_idx] && disp_prefix_fence_done[prod_idx] > 0)
-                    last_recv_prefix_fence_done_to_done_ns = disp_allrecv_prefix_done[idx] - disp_prefix_fence_done[prod_idx];
-                if (store_begin_ts > disp_allrecv_prefix_wait_start[idx] && disp_allrecv_prefix_wait_start[idx] > 0)
-                    last_recv_prefix_wait_start_to_store_begin_ns = store_begin_ts - disp_allrecv_prefix_wait_start[idx];
-                if (observe_ts > store_begin_ts && store_begin_ts > 0)
-                    last_recv_prefix_store_begin_to_observe_ns = observe_ts - store_begin_ts;
-                if (observe_ts > publish_ts && publish_ts > 0)
-                    last_recv_prefix_publish_to_observe_ns = observe_ts - publish_ts;
-                if (disp_allrecv_prefix_done[idx] > observe_ts && observe_ts > 0)
-                    last_recv_prefix_observe_to_done_ns = disp_allrecv_prefix_done[idx] - observe_ts;
-                last_recv_prefix_raw_start = disp_allrecv_prefix_raw_start[idx];
-                last_recv_prefix_raw_end = disp_allrecv_prefix_raw_end[idx];
-                last_recv_prefix_producer_meta_wait_ns = disp_prefix_meta_wait[prod_idx];
-                last_recv_prefix_producer_tokens = disp_prefix_tokens[prod_idx];
-                last_recv_prefix_producer_rank = disp_prefix_producer_rank[prod_idx];
-                last_recv_prefix_producer_nvl = disp_prefix_producer_nvl[prod_idx];
-                last_recv_prefix_producer_dst_nvl = disp_prefix_producer_dst_nvl[prod_idx];
-                last_recv_prefix_producer_src_rdma = disp_prefix_producer_src_rdma[prod_idx];
-            }
-            last_recv_wait_ns = disp_allrecv_wait_nvl[idx];
-            last_recv_token_loop_ns = disp_allrecv_token_loop[idx];
-            last_recv_publish_ns = disp_allrecv_publish[idx];
-            last_recv_retire_ns = disp_allrecv_retire[idx];
-            last_recv_tokens = disp_allrecv_tokens[idx];
-            last_recv_local_hits = disp_allrecv_local_hits[idx];
-        }
-        int64_t slow_recv_total = 0;
-        for (int s = 0; s < NUM_MAX_NVL_PEERS; ++s) {
-            int idx = acc_idx * NUM_MAX_NVL_PEERS + s;
-            int64_t total = disp_allrecv_prefix_wait[idx] + disp_allrecv_wait_nvl[idx] +
-                disp_allrecv_token_loop[idx] + disp_allrecv_publish[idx] + disp_allrecv_retire[idx];
-            if (total > slow_recv_total) {
-                slow_recv_total = total;
-                slow_recv_rank = s;
-                slow_recv_prefix_wait_ns = disp_allrecv_prefix_wait[idx];
-                slow_recv_prefix_src_nvl = disp_allrecv_prefix_src_nvl[idx];
-                slow_recv_prefix_src_rdma = disp_allrecv_prefix_slowest_rdma[idx];
-                slow_recv_prefix_publish_to_done_ns = 0;
-                slow_recv_prefix_store_to_fence_ns = 0;
-                slow_recv_prefix_fence_done_to_done_ns = 0;
-                slow_recv_prefix_producer_meta_wait_ns = 0;
-                slow_recv_prefix_producer_tokens = 0;
-                slow_recv_prefix_producer_rank = -1;
-                slow_recv_prefix_producer_nvl = -1;
-                slow_recv_prefix_producer_dst_nvl = -1;
-                slow_recv_prefix_producer_src_rdma = -1;
-                slow_recv_prefix_wait_start_to_store_begin_ns = 0;
-                slow_recv_prefix_store_begin_to_observe_ns = 0;
-                slow_recv_prefix_publish_to_observe_ns = 0;
-                slow_recv_prefix_observe_to_done_ns = 0;
-                slow_recv_prefix_raw_start = 0;
-                slow_recv_prefix_raw_end = 0;
-                if (slow_recv_prefix_src_rdma >= 0) {
-                    int producer_acc_idx = (acc_idx / 2) * 2 + 1;
-                    int prod_idx = (producer_acc_idx * NUM_MAX_NVL_PEERS + s) * num_rdma_ranks + static_cast<int>(slow_recv_prefix_src_rdma);
-                    int64_t store_begin_ts = disp_prefix_store_begin[prod_idx];
-                    int64_t publish_ts = disp_prefix_publish[prod_idx];
-                    int64_t observe_ts = disp_allrecv_prefix_observe[idx];
-                    if (disp_allrecv_prefix_done[idx] > publish_ts && publish_ts > 0)
-                        slow_recv_prefix_publish_to_done_ns = disp_allrecv_prefix_done[idx] - publish_ts;
-                    slow_recv_prefix_store_to_fence_ns = disp_prefix_store_to_fence[prod_idx];
-                    if (disp_allrecv_prefix_done[idx] > disp_prefix_fence_done[prod_idx] && disp_prefix_fence_done[prod_idx] > 0)
-                        slow_recv_prefix_fence_done_to_done_ns = disp_allrecv_prefix_done[idx] - disp_prefix_fence_done[prod_idx];
-                    if (store_begin_ts > disp_allrecv_prefix_wait_start[idx] && disp_allrecv_prefix_wait_start[idx] > 0)
-                        slow_recv_prefix_wait_start_to_store_begin_ns = store_begin_ts - disp_allrecv_prefix_wait_start[idx];
-                    if (observe_ts > store_begin_ts && store_begin_ts > 0)
-                        slow_recv_prefix_store_begin_to_observe_ns = observe_ts - store_begin_ts;
-                    if (observe_ts > publish_ts && publish_ts > 0)
-                        slow_recv_prefix_publish_to_observe_ns = observe_ts - publish_ts;
-                    if (disp_allrecv_prefix_done[idx] > observe_ts && observe_ts > 0)
-                        slow_recv_prefix_observe_to_done_ns = disp_allrecv_prefix_done[idx] - observe_ts;
-                    slow_recv_prefix_raw_start = disp_allrecv_prefix_raw_start[idx];
-                    slow_recv_prefix_raw_end = disp_allrecv_prefix_raw_end[idx];
-                    slow_recv_prefix_producer_meta_wait_ns = disp_prefix_meta_wait[prod_idx];
-                    slow_recv_prefix_producer_tokens = disp_prefix_tokens[prod_idx];
-                    slow_recv_prefix_producer_rank = disp_prefix_producer_rank[prod_idx];
-                    slow_recv_prefix_producer_nvl = disp_prefix_producer_nvl[prod_idx];
-                    slow_recv_prefix_producer_dst_nvl = disp_prefix_producer_dst_nvl[prod_idx];
-                    slow_recv_prefix_producer_src_rdma = disp_prefix_producer_src_rdma[prod_idx];
-                }
-                slow_recv_wait_ns = disp_allrecv_wait_nvl[idx];
-                slow_recv_token_loop_ns = disp_allrecv_token_loop[idx];
-                slow_recv_publish_ns = disp_allrecv_publish[idx];
-                slow_recv_retire_ns = disp_allrecv_retire[idx];
-                slow_recv_tokens = disp_allrecv_tokens[idx];
-                slow_recv_local_hits = disp_allrecv_local_hits[idx];
-            }
-        }
-    };
-
-    for (int logical_channel_id = 0; logical_channel_id < num_logical_channels; ++logical_channel_id) {
-        int dispatch_sender_tid = args_lch_tid_base + logical_channel_id * 5;
-        int64_t* dsp = &dispatch_lch_ts[(logical_channel_id * 2) * NLP];
-        int64_t last_role = -1, last_slot = -1, last_work_ns = 0, last_arrive_to_release_ns = 0;
-        int64_t last_recv_prefix_wait_ns = 0, last_recv_prefix_src_nvl = -1, last_recv_prefix_src_rdma = -1;
-        int64_t last_recv_prefix_publish_to_done_ns = 0, last_recv_prefix_store_to_fence_ns = 0;
-        int64_t last_recv_prefix_fence_done_to_done_ns = 0, last_recv_prefix_producer_meta_wait_ns = 0;
-        int64_t last_recv_prefix_producer_tokens = 0, last_recv_prefix_producer_rank = -1;
-        int64_t last_recv_prefix_producer_nvl = -1, last_recv_prefix_producer_dst_nvl = -1;
-        int64_t last_recv_prefix_producer_src_rdma = -1;
-        int64_t last_recv_prefix_wait_start_to_store_begin_ns = 0, last_recv_prefix_store_begin_to_observe_ns = 0;
-        int64_t last_recv_prefix_publish_to_observe_ns = 0, last_recv_prefix_observe_to_done_ns = 0;
-        int64_t last_recv_prefix_raw_start = 0, last_recv_prefix_raw_end = 0;
-        int64_t last_recv_wait_ns = 0, last_recv_token_loop_ns = 0;
-        int64_t last_recv_publish_ns = 0, last_recv_retire_ns = 0, last_recv_tokens = 0, last_recv_local_hits = 0;
-        int64_t slow_recv_rank = -1, slow_recv_prefix_wait_ns = 0, slow_recv_prefix_src_nvl = -1, slow_recv_prefix_src_rdma = -1;
-        int64_t slow_recv_prefix_publish_to_done_ns = 0, slow_recv_prefix_store_to_fence_ns = 0;
-        int64_t slow_recv_prefix_fence_done_to_done_ns = 0, slow_recv_prefix_producer_meta_wait_ns = 0;
-        int64_t slow_recv_prefix_producer_tokens = 0, slow_recv_prefix_producer_rank = -1;
-        int64_t slow_recv_prefix_producer_nvl = -1, slow_recv_prefix_producer_dst_nvl = -1;
-        int64_t slow_recv_prefix_producer_src_rdma = -1;
-        int64_t slow_recv_prefix_wait_start_to_store_begin_ns = 0, slow_recv_prefix_store_begin_to_observe_ns = 0;
-        int64_t slow_recv_prefix_publish_to_observe_ns = 0, slow_recv_prefix_observe_to_done_ns = 0;
-        int64_t slow_recv_prefix_raw_start = 0, slow_recv_prefix_raw_end = 0;
-        int64_t slow_recv_wait_ns = 0;
-        int64_t slow_recv_token_loop_ns = 0, slow_recv_publish_ns = 0, slow_recv_retire_ns = 0;
-        int64_t slow_recv_tokens = 0, slow_recv_local_hits = 0;
-        get_dispatch_role_diag(logical_channel_id * 2 + 0, last_role, last_slot, last_work_ns,
-                               last_arrive_to_release_ns,
-                               last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
-                               last_recv_prefix_publish_to_done_ns,
-                               last_recv_prefix_store_to_fence_ns,
-                               last_recv_prefix_fence_done_to_done_ns,
-                               last_recv_prefix_producer_meta_wait_ns,
-                               last_recv_prefix_producer_tokens,
-                               last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
-                               last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
-                               last_recv_prefix_wait_start_to_store_begin_ns,
-                               last_recv_prefix_store_begin_to_observe_ns,
-                               last_recv_prefix_publish_to_observe_ns,
-                               last_recv_prefix_observe_to_done_ns,
-                               last_recv_prefix_raw_start, last_recv_prefix_raw_end,
-                               last_recv_wait_ns, last_recv_token_loop_ns,
-                               last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
-                               last_recv_local_hits,
-                               slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
-                               slow_recv_prefix_publish_to_done_ns,
-                               slow_recv_prefix_store_to_fence_ns,
-                               slow_recv_prefix_fence_done_to_done_ns,
-                               slow_recv_prefix_producer_meta_wait_ns,
-                               slow_recv_prefix_producer_tokens,
-                               slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
-                               slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
-                               slow_recv_prefix_wait_start_to_store_begin_ns,
-                               slow_recv_prefix_store_begin_to_observe_ns,
-                               slow_recv_prefix_publish_to_observe_ns,
-                               slow_recv_prefix_observe_to_done_ns,
-                               slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
-                               slow_recv_wait_ns, slow_recv_token_loop_ns,
-                               slow_recv_publish_ns, slow_recv_retire_ns,
-                               slow_recv_tokens, slow_recv_local_hits);
-        emit_event_publish("dispatch_sender_work", "dispatch_sender_lch", dsp[0], dsp[1], pid, dispatch_sender_tid,
-                           disp_wait_nvl[logical_channel_id * 2 + 0], disp_publish[logical_channel_id * 2 + 0],
-                           disp_wait_recvcount[logical_channel_id * 2 + 0],
-                           disp_pub_scan[logical_channel_id * 2 + 0], disp_pub_atomic[logical_channel_id * 2 + 0],
-                           disp_pub_fence[logical_channel_id * 2 + 0], disp_pub_store[logical_channel_id * 2 + 0],
-                           disp_cta_barrier[logical_channel_id * 2 + 0],
-                           disp_channel_barrier[logical_channel_id * 2 + 0],
-                           disp_round_barrier[logical_channel_id * 2 + 0],
-                           disp_tokens[logical_channel_id * 2 + 0],
-                           disp_local_hit_tokens[logical_channel_id * 2 + 0],
-                           disp_local_hits[logical_channel_id * 2 + 0],
-                           last_role, last_slot, last_work_ns, last_arrive_to_release_ns,
-                           last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
-                           last_recv_prefix_publish_to_done_ns,
-                           last_recv_prefix_store_to_fence_ns,
-                           last_recv_prefix_fence_done_to_done_ns,
-                           last_recv_prefix_producer_meta_wait_ns,
-                           last_recv_prefix_producer_tokens,
-                           last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
-                           last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
-                           last_recv_prefix_wait_start_to_store_begin_ns,
-                           last_recv_prefix_store_begin_to_observe_ns,
-                           last_recv_prefix_publish_to_observe_ns,
-                           last_recv_prefix_observe_to_done_ns,
-                           last_recv_prefix_raw_start, last_recv_prefix_raw_end,
-                           last_recv_wait_ns, last_recv_token_loop_ns,
-                           last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
-                           last_recv_local_hits,
-                           slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
-                           slow_recv_prefix_publish_to_done_ns,
-                           slow_recv_prefix_store_to_fence_ns,
-                           slow_recv_prefix_fence_done_to_done_ns,
-                           slow_recv_prefix_producer_meta_wait_ns,
-                           slow_recv_prefix_producer_tokens,
-                           slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
-                           slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
-                           slow_recv_prefix_wait_start_to_store_begin_ns,
-                           slow_recv_prefix_store_begin_to_observe_ns,
-                           slow_recv_prefix_publish_to_observe_ns,
-                           slow_recv_prefix_observe_to_done_ns,
-                           slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
-                           slow_recv_wait_ns, slow_recv_token_loop_ns,
-                           slow_recv_publish_ns, slow_recv_retire_ns,
-                           slow_recv_tokens, slow_recv_local_hits);
-        emit_event("dispatch_sender_channel_barrier", "dispatch_sender_lch", dsp[1], dsp[2], pid, dispatch_sender_tid);
-        emit_event("dispatch_sender_round_barrier", "dispatch_sender_lch", dsp[2], dsp[3], pid, dispatch_sender_tid);
-
-        int dispatch_forwarder_tid = dispatch_sender_tid + 1;
-        int64_t* dfp = &dispatch_lch_ts[(logical_channel_id * 2 + 1) * NLP];
-        get_dispatch_role_diag(logical_channel_id * 2 + 1, last_role, last_slot, last_work_ns,
-                               last_arrive_to_release_ns,
-                               last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
-                               last_recv_prefix_publish_to_done_ns,
-                               last_recv_prefix_store_to_fence_ns,
-                               last_recv_prefix_fence_done_to_done_ns,
-                               last_recv_prefix_producer_meta_wait_ns,
-                               last_recv_prefix_producer_tokens,
-                               last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
-                               last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
-                               last_recv_prefix_wait_start_to_store_begin_ns,
-                               last_recv_prefix_store_begin_to_observe_ns,
-                               last_recv_prefix_publish_to_observe_ns,
-                               last_recv_prefix_observe_to_done_ns,
-                               last_recv_prefix_raw_start, last_recv_prefix_raw_end,
-                               last_recv_wait_ns, last_recv_token_loop_ns,
-                               last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
-                               last_recv_local_hits,
-                               slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
-                               slow_recv_prefix_publish_to_done_ns,
-                               slow_recv_prefix_store_to_fence_ns,
-                               slow_recv_prefix_fence_done_to_done_ns,
-                               slow_recv_prefix_producer_meta_wait_ns,
-                               slow_recv_prefix_producer_tokens,
-                               slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
-                               slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
-                               slow_recv_prefix_wait_start_to_store_begin_ns,
-                               slow_recv_prefix_store_begin_to_observe_ns,
-                               slow_recv_prefix_publish_to_observe_ns,
-                               slow_recv_prefix_observe_to_done_ns,
-                               slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
-                               slow_recv_wait_ns, slow_recv_token_loop_ns,
-                               slow_recv_publish_ns, slow_recv_retire_ns,
-                               slow_recv_tokens, slow_recv_local_hits);
-        emit_event_publish("dispatch_forwarder_work", "dispatch_forwarder_lch", dfp[0], dfp[1], pid, dispatch_forwarder_tid,
-                           disp_wait_nvl[logical_channel_id * 2 + 1], disp_publish[logical_channel_id * 2 + 1],
-                           disp_wait_recvcount[logical_channel_id * 2 + 1],
-                           disp_pub_scan[logical_channel_id * 2 + 1], disp_pub_atomic[logical_channel_id * 2 + 1],
-                           disp_pub_fence[logical_channel_id * 2 + 1], disp_pub_store[logical_channel_id * 2 + 1],
-                           disp_cta_barrier[logical_channel_id * 2 + 1],
-                           disp_channel_barrier[logical_channel_id * 2 + 1],
-                           disp_round_barrier[logical_channel_id * 2 + 1],
-                           disp_tokens[logical_channel_id * 2 + 1],
-                           disp_local_hit_tokens[logical_channel_id * 2 + 1],
-                           disp_local_hits[logical_channel_id * 2 + 1],
-                           last_role, last_slot, last_work_ns, last_arrive_to_release_ns,
-                           last_recv_prefix_wait_ns, last_recv_prefix_src_nvl, last_recv_prefix_src_rdma,
-                           last_recv_prefix_publish_to_done_ns,
-                           last_recv_prefix_store_to_fence_ns,
-                           last_recv_prefix_fence_done_to_done_ns,
-                           last_recv_prefix_producer_meta_wait_ns,
-                           last_recv_prefix_producer_tokens,
-                           last_recv_prefix_producer_rank, last_recv_prefix_producer_nvl,
-                           last_recv_prefix_producer_dst_nvl, last_recv_prefix_producer_src_rdma,
-                           last_recv_prefix_wait_start_to_store_begin_ns,
-                           last_recv_prefix_store_begin_to_observe_ns,
-                           last_recv_prefix_publish_to_observe_ns,
-                           last_recv_prefix_observe_to_done_ns,
-                           last_recv_prefix_raw_start, last_recv_prefix_raw_end,
-                           last_recv_wait_ns, last_recv_token_loop_ns,
-                           last_recv_publish_ns, last_recv_retire_ns, last_recv_tokens,
-                           last_recv_local_hits,
-                           slow_recv_rank, slow_recv_prefix_wait_ns, slow_recv_prefix_src_nvl, slow_recv_prefix_src_rdma,
-                           slow_recv_prefix_publish_to_done_ns,
-                           slow_recv_prefix_store_to_fence_ns,
-                           slow_recv_prefix_fence_done_to_done_ns,
-                           slow_recv_prefix_producer_meta_wait_ns,
-                           slow_recv_prefix_producer_tokens,
-                           slow_recv_prefix_producer_rank, slow_recv_prefix_producer_nvl,
-                           slow_recv_prefix_producer_dst_nvl, slow_recv_prefix_producer_src_rdma,
-                           slow_recv_prefix_wait_start_to_store_begin_ns,
-                           slow_recv_prefix_store_begin_to_observe_ns,
-                           slow_recv_prefix_publish_to_observe_ns,
-                           slow_recv_prefix_observe_to_done_ns,
-                           slow_recv_prefix_raw_start, slow_recv_prefix_raw_end,
-                           slow_recv_wait_ns, slow_recv_token_loop_ns,
-                           slow_recv_publish_ns, slow_recv_retire_ns,
-                           slow_recv_tokens, slow_recv_local_hits);
-        emit_event("dispatch_forwarder_channel_barrier", "dispatch_forwarder_lch", dfp[1], dfp[2], pid, dispatch_forwarder_tid);
-        emit_event("dispatch_forwarder_round_barrier", "dispatch_forwarder_lch", dfp[2], dfp[3], pid, dispatch_forwarder_tid);
-
-        int async_publish_tid = dispatch_sender_tid + 2;
-        int physical_channel_id = logical_channels_per_physical > 0 ? logical_channel_id / logical_channels_per_physical : logical_channel_id;
-        int max_pw = -1;
-        int max_src_nvl_rank = -1;
-        int64_t max_pub_duration_ns = -1;
-        for (int src_nvl_rank = 0; src_nvl_rank < NUM_MAX_NVL_PEERS; ++src_nvl_rank) {
-            int pw = physical_channel_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
-            if (pw >= async_pub_n || async_pub_start[pw] == 0 || async_pub_end[pw] == 0)
-                continue;
-            int64_t start = async_pub_start[pw];
-            int64_t end = async_pub_end[pw];
-            if (end <= start)
-                end = start + 1;
-            int64_t gate_end = end;
-            if (async_publish_all_done_ts > start && async_publish_all_done_ts < end)
-                gate_end = async_publish_all_done_ts;
-            int64_t duration_ns = gate_end - start;
-            if (duration_ns > max_pub_duration_ns) {
-                max_pub_duration_ns = duration_ns;
-                max_pw = pw;
-                max_src_nvl_rank = src_nvl_rank;
-            }
-        }
-        if (max_pw >= 0) {
-            int64_t start = async_pub_start[max_pw];
-            int64_t worker_end = async_pub_end[max_pw];
-            if (worker_end <= start)
-                worker_end = start + 1;
-            int64_t gate_end = worker_end;
-            if (async_publish_all_done_ts > start && async_publish_all_done_ts < worker_end)
-                gate_end = async_publish_all_done_ts;
-            if (!emit_perf_args) {
-                emit_event("dispatch_async_publish", "dispatch_async_publish", start, gate_end, pid, async_publish_tid);
-            } else {
-                int64_t worker_dur_ns = worker_end - start;
-                int64_t gate_dur_ns = gate_end - start;
-                int64_t post_gate_ns = worker_end > gate_end ? worker_end - gate_end : 0;
-                int64_t attributed_ns = async_pub_wait_ring[max_pw] + async_pub_poll[max_pw] +
-                    async_pub_gap[max_pw] + async_pub_start_gap[max_pw] + async_pub_empty_gap[max_pw] +
-                    async_pub_done_recheck[max_pw] + async_pub_ring_load[max_pw] +
-                    async_pub_head_release[max_pw] + async_pub_syncwarp[max_pw] +
-                    async_pub_finish[max_pw] + async_pub_work[max_pw];
-                int64_t worker_unattributed_ns = worker_dur_ns > attributed_ns ? worker_dur_ns - attributed_ns : 0;
-                int64_t gate_unattributed_ns = gate_dur_ns > attributed_ns ? gate_dur_ns - attributed_ns : 0;
-                double avg_batch_tokens = async_pub_batch_count[max_pw] > 0 ?
-                    static_cast<double>(async_pub_tokens[max_pw]) / static_cast<double>(async_pub_batch_count[max_pw]) : 0.0;
-                double tokens_per_release = async_pub_head_release_count[max_pw] > 0 ?
-                    static_cast<double>(async_pub_tokens[max_pw]) / static_cast<double>(async_pub_head_release_count[max_pw]) : 0.0;
-                emit_comma();
-                fprintf(f, "{\"name\":\"dispatch_async_publish\",\"cat\":\"dispatch_async_publish\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,\"pid\":%d,\"tid\":%d,"
-                           "\"args\":{\"logical_channel\":%d,\"physical_channel\":%d,\"src_nvl_rank\":%d,\"publisher_warp\":%d,"
-                           "\"worker_dur_us\":%.3f,\"gate_dur_us\":%.3f,\"post_gate_us\":%.3f,"
-                           "\"wait_ring_us\":%.3f,\"poll_us\":%.3f,\"gap_us\":%.3f,"
-                           "\"start_gap_us\":%.3f,\"empty_gap_us\":%.3f,\"done_recheck_us\":%.3f,"
-                           "\"ring_load_us\":%.3f,\"head_release_us\":%.3f,\"syncwarp_us\":%.3f,"
-                           "\"batch_wall_us\":%.3f,\"batch_accounted_us\":%.3f,\"batch_unattributed_us\":%.3f,"
-                           "\"token_gap_us\":%.3f,\"helper_unattributed_us\":%.3f,"
-                           "\"finish_us\":%.3f,\"work_us\":%.3f,\"scan_us\":%.3f,\"atomic_us\":%.3f,"
-                           "\"fence_us\":%.3f,\"store_us\":%.3f,\"drain_us\":%.3f,"
-                           "\"worker_unattributed_us\":%.3f,\"gate_unattributed_us\":%.3f,\"unattributed_us\":%.3f,"
-                           "\"batch_count\":%lld,\"max_batch\":%lld,\"avg_batch_tokens\":%.3f,"
-                           "\"head_release_count\":%lld,\"tokens_per_release\":%.3f,"
-                           "\"tokens\":%lld,\"local_hit_tokens\":%lld,\"local_hits\":%lld}}",
-                        (start - base_ts) / 1000.0, gate_dur_ns / 1000.0, pid, async_publish_tid,
-                        logical_channel_id, physical_channel_id, max_src_nvl_rank, max_pw,
-                        worker_dur_ns / 1000.0, gate_dur_ns / 1000.0, post_gate_ns / 1000.0,
-                        async_pub_wait_ring[max_pw] / 1000.0, async_pub_poll[max_pw] / 1000.0,
-                        async_pub_gap[max_pw] / 1000.0, async_pub_start_gap[max_pw] / 1000.0,
-                        async_pub_empty_gap[max_pw] / 1000.0, async_pub_done_recheck[max_pw] / 1000.0,
-                        async_pub_ring_load[max_pw] / 1000.0, async_pub_head_release[max_pw] / 1000.0,
-                        async_pub_syncwarp[max_pw] / 1000.0,
-                        async_pub_batch_wall[max_pw] / 1000.0,
-                        async_pub_batch_accounted[max_pw] / 1000.0,
-                        async_pub_batch_unattributed[max_pw] / 1000.0,
-                        async_pub_token_gap[max_pw] / 1000.0,
-                        async_pub_helper_unattributed[max_pw] / 1000.0,
-                        async_pub_finish[max_pw] / 1000.0, async_pub_work[max_pw] / 1000.0,
-                        async_pub_scan[max_pw] / 1000.0, async_pub_atomic[max_pw] / 1000.0,
-                        async_pub_fence[max_pw] / 1000.0, async_pub_store[max_pw] / 1000.0,
-                        async_pub_drain[max_pw] / 1000.0,
-                        worker_unattributed_ns / 1000.0, gate_unattributed_ns / 1000.0,
-                        gate_unattributed_ns / 1000.0,
-                        static_cast<long long>(async_pub_batch_count[max_pw]),
-                        static_cast<long long>(async_pub_max_batch[max_pw]), avg_batch_tokens,
-                        static_cast<long long>(async_pub_head_release_count[max_pw]), tokens_per_release,
-                        static_cast<long long>(async_pub_tokens[max_pw]),
-                        static_cast<long long>(async_pub_local_hit_tokens[max_pw]),
-                        static_cast<long long>(async_pub_local_hits[max_pw]));
-            }
-        }
-
-        int combine_sender_tid = dispatch_sender_tid + 3;
-        int64_t* csp = &combine_lch_ts[(logical_channel_id * 2) * NLP];
-        emit_event("sender_wait_dispatch_done", "combine_sender_lch", csp[0], csp[1], pid, combine_sender_tid);
-        emit_event("sender_head_normalize", "combine_sender_lch", csp[1], csp[2], pid, combine_sender_tid);
-        emit_event_combine_sender("sender_nvl_send_rdma_recv", "combine_sender_lch", csp[3], csp[4], pid, combine_sender_tid,
-                                  comb_tma_wait[logical_channel_id * 2 + 0],
-                                  comb_wait_ready[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_single[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_multi[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_flush[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_full[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_flush_count[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_full_count[logical_channel_id * 2 + 0],
-                                  comb_gather_reduce[logical_channel_id * 2 + 0],
-                                  comb_gather_single[logical_channel_id * 2 + 0],
-                                  comb_gather_multi[logical_channel_id * 2 + 0],
-                                  comb_pack_meta[logical_channel_id * 2 + 0],
-                                  comb_pack_meta_work[logical_channel_id * 2 + 0],
-                                  comb_pack_meta_sync[logical_channel_id * 2 + 0],
-                                  comb_tma_store[logical_channel_id * 2 + 0],
-                                  comb_tma_wait_max[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_max[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_single_max[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_multi_max[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_flush_max[logical_channel_id * 2 + 0],
-                                  comb_wait_ready_full_max[logical_channel_id * 2 + 0],
-                                  comb_wait_top[logical_channel_id * 2 + 0],
-                                  comb_wait_top_token[logical_channel_id * 2 + 0],
-                                  comb_wait_top_slot[logical_channel_id * 2 + 0],
-                                  comb_wait_top_expert[logical_channel_id * 2 + 0],
-                                  comb_wait_top_from_flush[logical_channel_id * 2 + 0],
-                                  comb_wait_top_nhits[logical_channel_id * 2 + 0],
-                                  comb_wait_top_priority_deps[logical_channel_id * 2 + 0],
-                                  comb_gather_reduce_max[logical_channel_id * 2 + 0],
-                                  comb_gather_single_max[logical_channel_id * 2 + 0],
-                                  comb_gather_multi_max[logical_channel_id * 2 + 0],
-                                  comb_pack_meta_max[logical_channel_id * 2 + 0],
-                                  comb_pack_meta_work_max[logical_channel_id * 2 + 0],
-                                  comb_pack_meta_sync_max[logical_channel_id * 2 + 0],
-                                  comb_tma_store_max[logical_channel_id * 2 + 0],
-                                  comb_nhit_sum[logical_channel_id * 2 + 0],
-                                  comb_token_count[logical_channel_id * 2 + 0],
-                                  comb_single_token_count[logical_channel_id * 2 + 0],
-                                  comb_multi_token_count[logical_channel_id * 2 + 0]);
-
-        int combine_forwarder_tid = dispatch_sender_tid + 4;
-        int64_t* cfp = &combine_lch_ts[(logical_channel_id * 2 + 1) * NLP];
-        emit_event("forwarder_wait_normalized", "combine_forwarder_lch", cfp[0], cfp[2], pid, combine_forwarder_tid);
-        emit_event("forwarder_nvl_to_rdma", "combine_forwarder_lch", cfp[3], cfp[4], pid, combine_forwarder_tid);
-    }
-
-    emit_event_scheduler("scheduler_bridge", "scheduler", sched_ts[0], sched_ts[1], pid, scheduler_tid,
-                         sched_scan_ns, sched_enqueue_ns, sched_idle_ns,
-                         sched_priority_ns, sched_normal_ns, sched_tail_flush_ns,
-                         sched_publish_total_ns, sched_publish_wait_ns, sched_publish_wait_max_ns,
-                         sched_publish_wait_max_tail, sched_publish_wait_max_visible_tail,
-                         sched_priority_scan_tokens, sched_priority_ready_tokens,
-                         sched_priority_full_batch_hits, sched_priority_batch_already_enqueued,
-                         sched_priority_already_normal, sched_priority_already_priority, sched_priority_already_tail,
-                         sched_normal_after_priority_ns, sched_normal_after_priority_count,
-                         sched_priority_not_full, sched_normal_full_batch_enqueues,
-                         sched_flush_tail_enqueues, sched_queue_empty_count,
-                         sched_queue_empty_after_dispatch_count, sched_max_ready_tail_gap,
-                         sched_stall_expert, sched_stall_recv_count, sched_stall_alloc_count,
-                         sched_stall_enqueue_cursor, sched_stall_first_unready_slot,
-                         sched_stall_first_unready_ready, sched_stall_dispatch_done);
-
-    // Compute task rows: one Perfetto row per compute group, one X-event per task batch.
-    int compute_tid_base = num_logical_channels * 5 + 100;
-    int num_compute_groups = host_state.num_compute_groups;
-    for (int g = 0; g < num_compute_groups; ++g) {
-        int tid = compute_tid_base + g;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"compute_group_%d\"}}",
-                host_state.rank, tid, g);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, tid, tid);
-    }
-    {
-        int tid = compute_tid_base + num_compute_groups;
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"name\":\"gather_task\"}}",
-                host_state.rank, tid);
-        emit_comma();
-        fprintf(f, "{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":%d,\"tid\":%d,"
-                   "\"args\":{\"sort_index\":%d}}",
-                host_state.rank, tid, tid);
-    }
-    auto gather_phase_us = [](int64_t a, int64_t b) -> double {
-        if (a == 0 || b == 0 || b <= a) return 0.0;
-        return (b - a) / 1000.0;
-    };
-    for (int t = 0; t < gather_task_count; ++t) {
-        int64_t* rec = &gather_task[(size_t)t * NGF];
-        int64_t start = rec[0], end = rec[1];
-        if (start == 0 || end == 0 || end <= start) continue;
-        int gather_sm = static_cast<int>(rec[2]);
-        int batch_size = static_cast<int>(rec[3]);
-        int first_token = static_cast<int>(rec[4]);
-        int last_token = static_cast<int>(rec[5]);
-        int nhit_sum = static_cast<int>(rec[6]);
-        double scan_us = gather_phase_us(start, rec[7]);
-        double reduce_us = gather_phase_us(rec[7], rec[8]);
-        double signal_us = gather_phase_us(rec[8], rec[9]);
-        int tid = compute_tid_base + num_compute_groups;
-        if (!emit_perf_args) {
-            emit_event("gather_task", "gather_sm", start, end, pid, tid);
-            continue;
-        }
-        emit_comma();
-        fprintf(f, "{\"name\":\"gather_task\",\"cat\":\"gather_sm\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
-                   "\"pid\":%d,\"tid\":%d,\"args\":{\"gather_sm_idx\":%d,\"batch_size\":%d,"
-                   "\"first_token\":%d,\"last_token\":%d,\"nhit_sum\":%d,"
-                   "\"scan_us\":%.3f,\"reduce_us\":%.3f,\"signal_us\":%.3f}}",
-                (start - base_ts) / 1000.0, (end - start) / 1000.0,
-                pid, tid, gather_sm, batch_size, first_token, last_token, nhit_sum,
-                scan_us, reduce_us, signal_us);
-    }
-    for (int t = 0; t < compute_task_count; ++t) {
-        int64_t* rec = &compute_task[(size_t)t * NCF];
-        if (rec[26] == 0) continue;
-        int64_t start = rec[0];
-        int64_t end = rec[1];
-        if (start == 0 || end == 0 || end <= start) continue;
-        int sm_id = static_cast<int>(rec[2]);
-        int group_id = static_cast<int>(rec[3]);
-        int expert_id = static_cast<int>(rec[4]);
-        int batch_size = static_cast<int>(rec[5]);
-        int hidden = static_cast<int>(rec[6]);
-        int intermediate = static_cast<int>(rec[7]);
-        int tid = compute_tid_base + group_id;
-        int64_t ts_ns = start - base_ts;
-        int64_t dur_ns = end - start;
-        if (dur_ns <= 0) dur_ns = 1;
-        // Phase boundary timestamps (0 if not captured); derive per-phase durations (us).
-        int64_t ph_meta = rec[8], ph_input = rec[9], ph_upgemm = rec[10];
-        int64_t ph_downgemm = rec[11], ph_output = rec[12], ph_signal = rec[13];
-        // Finer breakpoints to separate GEMM compute vs group-barrier wait, and split signaling.
-        int64_t up_body = rec[14], down_body = rec[15], out_body = rec[16];
-        int64_t sig_donecount = rec[17], sig_finalize = rec[18];
-        int64_t sig_fence = rec[19], sig_publish = rec[20];
-        int queue_task_idx = static_cast<int>(rec[21]);
-        int start_slot = static_cast<int>(rec[22]);
-        int end_slot = static_cast<int>(rec[23]);
-        int64_t abs_slot_base = rec[24];
-        int is_flush_task = static_cast<int>(rec[25]);
-        const bool is_partial_batch = batch_size < COMPUTE_BATCH_SIZE;
-        const char* task_color = is_partial_batch ? "terrible" : "good";
-        const char* task_kind = is_partial_batch ? "partial" : "full";
-        auto phase_us = [](int64_t a, int64_t b) -> double {
-            if (a == 0 || b == 0 || b <= a) return 0.0;
-            return (b - a) / 1000.0;
-        };
-        double meta_us     = phase_us(start, ph_meta);
-        double input_us    = phase_us(ph_meta, ph_input);
-        double upgemm_us   = phase_us(ph_input, ph_upgemm);
-        double downgemm_us = phase_us(ph_upgemm, ph_downgemm);
-        double output_us   = phase_us(ph_downgemm, ph_output);
-        double signal_us   = phase_us(ph_output, ph_signal);
-        // p3 split: actual up GEMM body vs barrier wait after it.
-        double up_compute_us  = phase_us(ph_input, up_body);
-        double up_barrier_us   = phase_us(up_body, ph_upgemm);
-        // p4 split: actual down GEMM body vs barrier wait after it.
-        double down_compute_us = phase_us(ph_upgemm, down_body);
-        double down_barrier_us = phase_us(down_body, ph_downgemm);
-        // p5 (output) split: write loop vs barrier+fence after it.
-        double out_compute_us  = phase_us(ph_downgemm, out_body);
-        double out_barrier_us  = phase_us(out_body, ph_output);
-        // p6 split: done-count, fp32 finalize, fence, ready-publish sub-phases.
-        double sig_donecount_us = phase_us(ph_output, sig_donecount);
-        double sig_finalize_us  = phase_us(sig_donecount, sig_finalize);
-        double sig_fence_us     = phase_us(sig_finalize, sig_fence);
-        double sig_publish_us   = phase_us(sig_fence, sig_publish);
-        auto ns_us = [](int64_t v) -> double { return v > 0 ? v / 1000.0 : 0.0; };
-        int multi_expert_rows = diag_multi_rows[t];
-        int task_has_multi = diag_task_has_multi[t];
-        bool have_queue_diag = queue_task_idx >= 0 && queue_task_idx < queue_diag_n;
-        int64_t task_publish = have_queue_diag ? q_publish[queue_task_idx] : 0;
-        int64_t task_pop_start = have_queue_diag ? q_pop_start[queue_task_idx] : 0;
-        int64_t task_pop_done = have_queue_diag ? q_pop_done[queue_task_idx] : 0;
-        int64_t task_bcast_done = have_queue_diag ? q_bcast_done[queue_task_idx] : 0;
-        int64_t task_start_diag = have_queue_diag ? q_task_start[queue_task_idx] : 0;
-        int64_t task_prev_gap = have_queue_diag ? q_prev_gap[queue_task_idx] : 0;
-        int64_t task_prev_end = (task_start_diag != 0 && task_prev_gap != 0) ? task_start_diag - task_prev_gap : 0;
-        int task_pop_attempts = have_queue_diag ? q_pop_attempts[queue_task_idx] : 0;
-        int task_cas_failures = have_queue_diag ? q_cas_failures[queue_task_idx] : 0;
-        int task_group_diag = have_queue_diag ? q_group_id[queue_task_idx] : -1;
-        int task_source = have_queue_diag ? q_source[queue_task_idx] : 0;
-        double publish_to_pop_us = phase_us(task_publish, task_pop_done);
-        double pop_wait_us = phase_us(task_pop_start, task_pop_done);
-        double pop_to_bcast_us = phase_us(task_pop_done, task_bcast_done);
-        double bcast_to_start_us = phase_us(task_bcast_done, task_start_diag);
-        double prev_end_to_pop_start_us = phase_us(task_prev_end, task_pop_start);
-        double pop_done_to_bcast_us = pop_to_bcast_us;
-        double bcast_done_to_start_us = bcast_to_start_us;
-        double prev_task_gap_us = ns_us(task_prev_gap);
-        double boundary_unattributed_us = prev_task_gap_us - prev_end_to_pop_start_us - pop_wait_us - pop_done_to_bcast_us - bcast_done_to_start_us;
-        if (boundary_unattributed_us < 0.0 && boundary_unattributed_us > -0.001)
-            boundary_unattributed_us = 0.0;
-        if (!emit_perf_args) {
-            const char* task_name = is_partial_batch ? "compute_task_partial" : "compute_task_full";
-            emit_colored_event(task_name, "compute_group", task_color,
-                               start, end, pid, tid);
-            continue;
-        }
-        emit_comma();
-        fprintf(f, "{\"name\":\"compute_e%d_%s\",\"cat\":\"compute_group\",\"cname\":\"%s\",\"ph\":\"X\",\"ts\":%.3f,\"dur\":%.3f,"
-                   "\"pid\":%d,\"tid\":%d,\"args\":{\"expert_id\":%d,\"sm_id\":%d,\"group_id\":%d,\"batch_size\":%d,\"batch_kind\":\"%s\","
-                   "\"start_slot\":%d,\"end_slot\":%d,\"abs_slot_base\":%lld,\"is_flush_task\":%d,"
-                   "\"hidden_size\":%d,\"intermediate_size\":%d,"
-                   "\"p1_meta_us\":%.3f,\"p2_input_load_us\":%.3f,\"p3_gateup_gemm_us\":%.3f,"
-                   "\"p4_down_gemm_us\":%.3f,\"p5_output_us\":%.3f,\"p6_signal_us\":%.3f,"
-                   "\"p3a_up_compute_us\":%.3f,\"p3b_up_barrier_us\":%.3f,"
-                   "\"p4a_down_compute_us\":%.3f,\"p4b_down_barrier_us\":%.3f,"
-                   "\"p5a_out_compute_us\":%.3f,\"p5b_out_barrier_us\":%.3f,"
-                   "\"p6a_donecount_us\":%.3f,\"p6b_fp32finalize_us\":%.3f,"
-                   "\"p6c_fence_us\":%.3f,\"p6d_publish_us\":%.3f,"
-                   "\"queue_task_idx\":%d,\"queue_group_id\":%d,\"queue_source\":%d,\"prev_task_gap_us\":%.3f,"
-                   "\"publish_to_pop_us\":%.3f,\"pop_wait_us\":%.3f,\"pop_to_bcast_us\":%.3f,"
-                   "\"bcast_to_start_us\":%.3f,\"prev_end_to_pop_start_us\":%.3f,"
-                   "\"pop_done_to_bcast_us\":%.3f,\"bcast_done_to_start_us\":%.3f,"
-                   "\"boundary_unattributed_us\":%.3f,\"pop_attempts\":%d,\"cas_failures\":%d,"
-                   "\"p6b_multi_expert_rows\":%d,\"p6_task_has_multi\":%d}}",
-                expert_id, task_kind, task_color, ts_ns / 1000.0, dur_ns / 1000.0, pid, tid, expert_id, sm_id, group_id, batch_size, task_kind,
-                start_slot, end_slot, static_cast<long long>(abs_slot_base), is_flush_task,
-                hidden, intermediate,
-                meta_us, input_us, upgemm_us, downgemm_us, output_us, signal_us,
-                up_compute_us, up_barrier_us, down_compute_us, down_barrier_us,
-                out_compute_us, out_barrier_us,
-                sig_donecount_us, sig_finalize_us, sig_fence_us, sig_publish_us,
-                queue_task_idx, task_group_diag, task_source, prev_task_gap_us,
-                publish_to_pop_us, pop_wait_us, pop_to_bcast_us,
-                bcast_to_start_us, prev_end_to_pop_start_us,
-                pop_done_to_bcast_us, bcast_done_to_start_us, boundary_unattributed_us,
-                task_pop_attempts, task_cas_failures,
-                multi_expert_rows, task_has_multi);
-    }
-
-    fprintf(f, "\n]\n");
-    fclose(f);
-    // printf("[MK-PERF] Perfetto trace written to %s (%d logical channels)\n", filename, num_logical_channels);
-#endif
-}
-#endif
 
 // Step 1 optimization from .v0: use PyTorch's CUDA caching allocator for long-lived
 // megakernel state buffers, and batch host-side memset initialization into one
@@ -7370,10 +4186,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     int* token_nhits;
     int* token_slot_list;
     int* expert_batch_enqueued;
-#if MK_PERF_TRACE_ARGS
-    int64_t* expert_batch_enqueue_ts;
-    int* token_priority_dep_count;
-#endif
     int* ready_batch_queue;
     int* ready_batch_reserve_tail;
     arena = &transient_arena;
@@ -7418,12 +4230,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     const int max_batches_per_expert = (max_tokens_per_expert + compute_batch_size - 1) / compute_batch_size;
     CUDA_CHECK(cudaMalloc(&expert_batch_enqueued, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
     CUDA_CHECK(cudaMemset(expert_batch_enqueued, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int)));
-#if MK_PERF_TRACE_ARGS
-    CUDA_CHECK(cudaMalloc(&expert_batch_enqueue_ts, (size_t)num_local_experts * max_batches_per_expert * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(expert_batch_enqueue_ts, 0, (size_t)num_local_experts * max_batches_per_expert * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&token_priority_dep_count, (size_t)max_total_recv_tokens * sizeof(int)));
-    CUDA_CHECK(cudaMemset(token_priority_dep_count, 0, (size_t)max_total_recv_tokens * sizeof(int)));
-#endif
     // Arrival-order FIFO batch queue (dispatch receiver -> scheduler). Sized at the flat
     // (expert, batch) id space; total appended entries <= Σ ceil(count_e/BATCH) <= that.
     // Initialized to -1 (0xff) = "not yet published".
@@ -7441,13 +4247,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     // now writes directly to its final destinations and no longer consumes the down slice.
     // The interleaved gate/up path writes act directly from the GEMM epilogue; the GU scratch
     // region remains reserved so existing descriptors/helpers stay valid.
-    // Under MK_RECV_DIRECT_STAGING the input region is dropped (input_buf unused: gate/up
-    // and grad_act are TMA-fed from recv_tokens), matching the device gemm_stride.
-#if MK_RECV_DIRECT_STAGING
+    // The input region is dropped here (input_buf unused: gate/up and grad_act are
+    // TMA-fed from recv_tokens), matching the device gemm_stride.
     const size_t per_group_input_elems = 0;
-#else
-    const size_t per_group_input_elems = (size_t)compute_batch_size * hidden_dim;
-#endif
     size_t per_group_elems = per_group_input_elems +
         (size_t)compute_batch_size * (hidden_dim + 3 * intermediate_dim);
     size_t workspace_bytes = num_compute_groups * per_group_elems * sizeof(__nv_bfloat16);
@@ -7771,10 +4573,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.token_nhits = token_nhits;
     host_state.token_slot_list = token_slot_list;
     host_state.expert_batch_enqueued = expert_batch_enqueued;
-#if MK_PERF_TRACE_ARGS
-    host_state.expert_batch_enqueue_ts = expert_batch_enqueue_ts;
-    host_state.token_priority_dep_count = token_priority_dep_count;
-#endif
     host_state.ready_batch_queue = ready_batch_queue;
     host_state.ready_batch_reserve_tail = ready_batch_reserve_tail;
     host_state.expert_batch_ready_count = expert_batch_ready_count;
@@ -7789,533 +4587,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     EP_HOST_ASSERT(rdma_reuse_prelude_enable && "combine RDMA reuse requires the prelude enabled");
     void* combine_rdma_ptr = rdma_buffer_ptr;
 
-#if MK_PERF_TRACE_ENABLED
-    int64_t* perf_dispatch_lch_ts;
-    int64_t* perf_combine_lch_ts;
-    constexpr int NLP = MegaKernelState::MK_PERF_NUM_LCH_PHASES;
-    CUDA_CHECK(cudaMalloc(&perf_dispatch_lch_ts, num_logical_channels * 2 * NLP * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(perf_dispatch_lch_ts, 0, num_logical_channels * 2 * NLP * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&perf_combine_lch_ts, num_logical_channels * 2 * NLP * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(perf_combine_lch_ts, 0, num_logical_channels * 2 * NLP * sizeof(int64_t)));
-    host_state.perf_dispatch_lch_ts = perf_dispatch_lch_ts;
-    host_state.perf_combine_lch_ts = perf_combine_lch_ts;
 
-    int64_t* perf_compute_task;
-    int* perf_compute_task_count;
-    const size_t compute_task_bytes = (size_t)max_compute_tasks * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&perf_compute_task, compute_task_bytes));
-    CUDA_CHECK(cudaMemset(perf_compute_task, 0, compute_task_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_compute_task_count, sizeof(int)));
-    CUDA_CHECK(cudaMemset(perf_compute_task_count, 0, sizeof(int)));
-    host_state.perf_compute_task = perf_compute_task;
-    host_state.perf_compute_task_count = perf_compute_task_count;
-
-    const size_t gather_task_bytes = (size_t)max_compute_tasks * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_gather_task, gather_task_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_gather_task, 0, gather_task_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_gather_task_count, sizeof(int)));
-    CUDA_CHECK(cudaMemset(host_state.perf_gather_task_count, 0, sizeof(int)));
-
-    const size_t async_pub_bytes = (size_t)num_pub_warps_total * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_start_ts, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_start_ts, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_end_ts, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_end_ts, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_publish_all_done_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_publish_all_done_ts, 0, sizeof(int64_t)));
-
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_ts, 2 * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_ts, 0, 2 * sizeof(int64_t)));
-#endif
-
-#if MK_PERF_TRACE_ARGS
-    const size_t dispatch_round_trace_count = static_cast<size_t>(num_logical_channels) *
-                                              (num_ranks / NUM_MAX_NVL_PEERS);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_dispatch_round_trace,
-                          dispatch_round_trace_count * sizeof(MegaKernelState::DispatchRoundTrace)));
-    CUDA_CHECK(cudaMemset(host_state.perf_dispatch_round_trace, 0,
-                          dispatch_round_trace_count * sizeof(MegaKernelState::DispatchRoundTrace)));
-
-    // Accumulated dispatch/combine semaphore-interaction timers (rendered as args on existing rows).
-    int64_t* perf_disp_wait_nvl_ns;
-    int64_t* perf_disp_publish_ns;
-    int64_t* perf_disp_wait_recvcount_ns;
-    int64_t* perf_comb_tma_wait_ns;
-    int64_t* perf_comb_wait_ready_ns;
-    int64_t* perf_comb_wait_ready_single_ns;
-    int64_t* perf_comb_wait_ready_multi_ns;
-    int64_t* perf_comb_wait_ready_flush_ns;
-    int64_t* perf_comb_wait_ready_full_ns;
-    int64_t* perf_comb_wait_ready_flush_count;
-    int64_t* perf_comb_wait_ready_full_count;
-    int64_t* perf_comb_gather_reduce_ns;
-    int64_t* perf_comb_gather_single_ns;
-    int64_t* perf_comb_gather_multi_ns;
-    int64_t* perf_comb_pack_meta_ns;
-    int64_t* perf_comb_pack_meta_work_ns;
-    int64_t* perf_comb_pack_meta_sync_ns;
-    int64_t* perf_comb_tma_store_ns;
-    int64_t* perf_comb_tma_wait_max_ns;
-    int64_t* perf_comb_wait_ready_max_ns;
-    int64_t* perf_comb_wait_ready_single_max_ns;
-    int64_t* perf_comb_wait_ready_multi_max_ns;
-    int64_t* perf_comb_wait_ready_flush_max_ns;
-    int64_t* perf_comb_wait_ready_full_max_ns;
-    int64_t* perf_comb_wait_top_ns;
-    int64_t* perf_comb_wait_top_token;
-    int64_t* perf_comb_wait_top_slot;
-    int64_t* perf_comb_wait_top_expert;
-    int64_t* perf_comb_wait_top_from_flush;
-    int64_t* perf_comb_wait_top_nhits;
-    int64_t* perf_comb_wait_top_priority_deps;
-    int64_t* perf_comb_gather_reduce_max_ns;
-    int64_t* perf_comb_gather_single_max_ns;
-    int64_t* perf_comb_gather_multi_max_ns;
-    int64_t* perf_comb_pack_meta_max_ns;
-    int64_t* perf_comb_pack_meta_work_max_ns;
-    int64_t* perf_comb_pack_meta_sync_max_ns;
-    int64_t* perf_comb_tma_store_max_ns;
-    int64_t* perf_comb_nhit_sum;
-    int64_t* perf_comb_token_count;
-    int64_t* perf_comb_single_token_count;
-    int64_t* perf_comb_multi_token_count;
-    const size_t acc_bytes = (size_t)num_logical_channels * 2 * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&perf_disp_wait_nvl_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_wait_nvl_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_disp_publish_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_publish_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_disp_wait_recvcount_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_wait_recvcount_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_tma_wait_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_tma_wait_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_single_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_single_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_multi_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_multi_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_count, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_count, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_count, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_count, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_single_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_single_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_multi_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_multi_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_work_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_work_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_sync_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_sync_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_tma_store_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_tma_store_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_tma_wait_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_tma_wait_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_single_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_single_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_multi_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_multi_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_flush_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_flush_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_ready_full_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_ready_full_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_token, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_token, 0xff, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_slot, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_slot, 0xff, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_expert, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_expert, 0xff, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_from_flush, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_from_flush, 0xff, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_nhits, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_nhits, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_wait_top_priority_deps, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_wait_top_priority_deps, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_reduce_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_reduce_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_single_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_single_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_gather_multi_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_gather_multi_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_work_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_work_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_pack_meta_sync_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_pack_meta_sync_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_tma_store_max_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_tma_store_max_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_nhit_sum, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_nhit_sum, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_token_count, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_token_count, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_single_token_count, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_single_token_count, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_comb_multi_token_count, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_comb_multi_token_count, 0, acc_bytes));
-    host_state.perf_disp_wait_nvl_ns = perf_disp_wait_nvl_ns;
-    host_state.perf_disp_publish_ns = perf_disp_publish_ns;
-    host_state.perf_disp_wait_recvcount_ns = perf_disp_wait_recvcount_ns;
-    host_state.perf_comb_tma_wait_ns = perf_comb_tma_wait_ns;
-    host_state.perf_comb_wait_ready_ns = perf_comb_wait_ready_ns;
-    host_state.perf_comb_wait_ready_single_ns = perf_comb_wait_ready_single_ns;
-    host_state.perf_comb_wait_ready_multi_ns = perf_comb_wait_ready_multi_ns;
-    host_state.perf_comb_wait_ready_flush_ns = perf_comb_wait_ready_flush_ns;
-    host_state.perf_comb_wait_ready_full_ns = perf_comb_wait_ready_full_ns;
-    host_state.perf_comb_wait_ready_flush_count = perf_comb_wait_ready_flush_count;
-    host_state.perf_comb_wait_ready_full_count = perf_comb_wait_ready_full_count;
-    host_state.perf_comb_gather_reduce_ns = perf_comb_gather_reduce_ns;
-    host_state.perf_comb_gather_single_ns = perf_comb_gather_single_ns;
-    host_state.perf_comb_gather_multi_ns = perf_comb_gather_multi_ns;
-    host_state.perf_comb_pack_meta_ns = perf_comb_pack_meta_ns;
-    host_state.perf_comb_pack_meta_work_ns = perf_comb_pack_meta_work_ns;
-    host_state.perf_comb_pack_meta_sync_ns = perf_comb_pack_meta_sync_ns;
-    host_state.perf_comb_tma_store_ns = perf_comb_tma_store_ns;
-    host_state.perf_comb_tma_wait_max_ns = perf_comb_tma_wait_max_ns;
-    host_state.perf_comb_wait_ready_max_ns = perf_comb_wait_ready_max_ns;
-    host_state.perf_comb_wait_ready_single_max_ns = perf_comb_wait_ready_single_max_ns;
-    host_state.perf_comb_wait_ready_multi_max_ns = perf_comb_wait_ready_multi_max_ns;
-    host_state.perf_comb_wait_ready_flush_max_ns = perf_comb_wait_ready_flush_max_ns;
-    host_state.perf_comb_wait_ready_full_max_ns = perf_comb_wait_ready_full_max_ns;
-    host_state.perf_comb_wait_top_ns = perf_comb_wait_top_ns;
-    host_state.perf_comb_wait_top_token = perf_comb_wait_top_token;
-    host_state.perf_comb_wait_top_slot = perf_comb_wait_top_slot;
-    host_state.perf_comb_wait_top_expert = perf_comb_wait_top_expert;
-    host_state.perf_comb_wait_top_from_flush = perf_comb_wait_top_from_flush;
-    host_state.perf_comb_wait_top_nhits = perf_comb_wait_top_nhits;
-    host_state.perf_comb_wait_top_priority_deps = perf_comb_wait_top_priority_deps;
-    host_state.perf_comb_gather_reduce_max_ns = perf_comb_gather_reduce_max_ns;
-    host_state.perf_comb_gather_single_max_ns = perf_comb_gather_single_max_ns;
-    host_state.perf_comb_gather_multi_max_ns = perf_comb_gather_multi_max_ns;
-    host_state.perf_comb_pack_meta_max_ns = perf_comb_pack_meta_max_ns;
-    host_state.perf_comb_pack_meta_work_max_ns = perf_comb_pack_meta_work_max_ns;
-    host_state.perf_comb_pack_meta_sync_max_ns = perf_comb_pack_meta_sync_max_ns;
-    host_state.perf_comb_tma_store_max_ns = perf_comb_tma_store_max_ns;
-    host_state.perf_comb_nhit_sum = perf_comb_nhit_sum;
-    host_state.perf_comb_token_count = perf_comb_token_count;
-    host_state.perf_comb_single_token_count = perf_comb_single_token_count;
-    host_state.perf_comb_multi_token_count = perf_comb_multi_token_count;
-
-    // publish breakdown timers.
-    int64_t* perf_disp_pub_scan_ns;
-    int64_t* perf_disp_pub_atomic_ns;
-    int64_t* perf_disp_pub_fence_ns;
-    int64_t* perf_disp_pub_store_ns;
-    CUDA_CHECK(cudaMalloc(&perf_disp_pub_scan_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_pub_scan_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_disp_pub_atomic_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_pub_atomic_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_disp_pub_fence_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_pub_fence_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&perf_disp_pub_store_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(perf_disp_pub_store_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_cta_barrier_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_cta_barrier_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_channel_barrier_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_channel_barrier_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_round_barrier_ns, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_round_barrier_ns, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_tokens, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_tokens, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_local_hit_tokens, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_local_hit_tokens, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_local_hits, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_local_hits, 0, acc_bytes));
-    const size_t disp_role_bytes = (size_t)num_logical_channels * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS * sizeof(int64_t);
-    const size_t disp_recv_bytes = (size_t)num_logical_channels * 2 * NUM_MAX_NVL_PEERS * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_cta_release_ts, acc_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_cta_release_ts, 0, acc_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_role_arrive_ts, disp_role_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_role_arrive_ts, 0, disp_role_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_role_work_ns, disp_role_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_role_work_ns, 0, disp_role_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_wait_nvl_ns, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_wait_nvl_ns, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_wait_ns, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_wait_ns, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_wait_start_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_wait_start_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_observe_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_observe_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_done_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_done_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_start_first_negative_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_start_first_negative_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_end_first_negative_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_end_first_negative_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_pair_ready_ts, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_pair_ready_ts, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_poll_count, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_poll_count, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_mixed_poll_count, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_mixed_poll_count, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_slowest_rdma, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_slowest_rdma, 0xff, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_src_nvl, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_src_nvl, 0xff, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_raw_start, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_start, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_prefix_raw_end, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_prefix_raw_end, 0, disp_recv_bytes));
-    const size_t disp_sender_meta_bytes = (size_t)num_logical_channels * 2 * (host_state.num_ranks / NUM_MAX_NVL_PEERS) * sizeof(int64_t);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_build_start_ts, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_build_start_ts, 0, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_ready_ts, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_ready_ts, 0, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_put_begin_ts, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_put_begin_ts, 0, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_put_end_ts, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_put_end_ts, 0, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_raw_2, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_raw_2, 0, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_sender_meta_raw_3, disp_sender_meta_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_sender_meta_raw_3, 0, disp_sender_meta_bytes));
-    const size_t disp_prefix_prod_bytes = disp_recv_bytes * (host_state.num_ranks / NUM_MAX_NVL_PEERS);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_wait_start_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_wait_start_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_ready_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_ready_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_first_negative_ts, disp_prefix_prod_bytes * 4));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_first_negative_ts, 0, disp_prefix_prod_bytes * 4));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_mixed_poll_count, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_mixed_poll_count, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_poll_count, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_poll_count, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_0, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_1, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_1, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_2, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_2, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_raw_3, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_raw_3, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_start_done_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_start_done_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_begin_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_begin_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_publish_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_publish_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_fence_done_ts, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_fence_done_ts, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_store_to_fence_ns, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_store_to_fence_ns, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_meta_wait_ns, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_meta_wait_ns, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_raw_start, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_raw_start, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_raw_end, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_raw_end, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_tokens, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_tokens, 0, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_rank, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_rank, 0xff, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_nvl, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_nvl, 0xff, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_dst_nvl, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_dst_nvl, 0xff, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_prefix_producer_src_rdma, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_prefix_producer_src_rdma, 0xff, disp_prefix_prod_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_token_loop_ns, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_token_loop_ns, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_retire_ns, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_retire_ns, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_publish_ns, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_publish_ns, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_tokens, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_tokens, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_disp_allrecv_local_hits, disp_recv_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_disp_allrecv_local_hits, 0, disp_recv_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_wait_ring_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_wait_ring_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_poll_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_poll_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_gap_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_gap_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_start_gap_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_start_gap_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_empty_gap_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_empty_gap_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_done_recheck_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_done_recheck_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_ring_load_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_ring_load_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_head_release_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_head_release_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_syncwarp_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_syncwarp_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_batch_wall_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_batch_wall_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_batch_accounted_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_batch_accounted_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_batch_unattributed_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_batch_unattributed_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_token_gap_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_token_gap_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_helper_unattributed_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_helper_unattributed_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_finish_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_finish_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_work_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_work_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_scan_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_scan_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_atomic_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_atomic_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_fence_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_fence_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_store_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_store_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_drain_ns, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_drain_ns, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_tokens, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_tokens, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_batch_count, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_batch_count, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_head_release_count, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_head_release_count, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_max_batch, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_max_batch, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_local_hit_tokens, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_local_hit_tokens, 0, async_pub_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_async_pub_local_hits, async_pub_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_async_pub_local_hits, 0, async_pub_bytes));
-    host_state.perf_disp_pub_scan_ns = perf_disp_pub_scan_ns;
-    host_state.perf_disp_pub_atomic_ns = perf_disp_pub_atomic_ns;
-    host_state.perf_disp_pub_fence_ns = perf_disp_pub_fence_ns;
-    host_state.perf_disp_pub_store_ns = perf_disp_pub_store_ns;
-
-    // Scheduler bridge detailed timers.
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_scan_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_scan_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_enqueue_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_enqueue_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_idle_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_idle_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_normal_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_normal_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_tail_flush_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_tail_flush_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_publish_total_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_publish_total_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_publish_wait_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_publish_wait_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_publish_wait_max_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_publish_wait_max_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_publish_wait_max_tail, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_publish_wait_max_tail, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_publish_wait_max_visible_tail, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_publish_wait_max_visible_tail, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_scan_tokens, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_scan_tokens, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_ready_tokens, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_ready_tokens, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_full_batch_hits, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_full_batch_hits, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_batch_already_enqueued, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_batch_already_enqueued, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_already_normal, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_already_normal, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_already_priority, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_already_priority, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_already_tail, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_already_tail, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_normal_after_priority_ns, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_normal_after_priority_ns, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_normal_after_priority_count, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_normal_after_priority_count, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_priority_not_full, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_priority_not_full, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_normal_full_batch_enqueues, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_normal_full_batch_enqueues, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_flush_tail_enqueues, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_flush_tail_enqueues, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_queue_empty_count, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_queue_empty_count, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_queue_empty_after_dispatch_count, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_queue_empty_after_dispatch_count, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_max_ready_tail_gap, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_max_ready_tail_gap, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_expert, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_expert, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_recv_count, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_recv_count, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_alloc_count, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_alloc_count, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_enqueue_cursor, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_enqueue_cursor, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_first_unready_slot, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_first_unready_slot, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_first_unready_ready, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_first_unready_ready, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_stall_dispatch_done, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_stall_dispatch_done, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_done_seen_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_done_seen_ts, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_ts, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_expert, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_expert, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_old, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_old, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_recv_count_advance_new, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_recv_count_advance_new, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_normal_enqueue_attempt_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_normal_enqueue_attempt_ts, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_normal_enqueue_success_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_normal_enqueue_success_ts, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_publish_ts, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_publish_ts, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_source, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_source, 0, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_expert, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_expert, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_batch, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_batch, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_start_slot, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_start_slot, 0xff, sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_sched_first_task_num_tokens, sizeof(int64_t)));
-    CUDA_CHECK(cudaMemset(host_state.perf_sched_first_task_num_tokens, 0, sizeof(int64_t)));
-
-    // Root-cause diagnostic parallel arrays (one entry per compute-task slot).
-    const size_t diag_i64_bytes = (size_t)max_compute_tasks * sizeof(int64_t);
-    const size_t diag_i32_bytes = (size_t)max_compute_tasks * sizeof(int);
-    auto alloc_diag_i64 = [&](int64_t** p) {
-        CUDA_CHECK(cudaMalloc(p, diag_i64_bytes));
-        CUDA_CHECK(cudaMemset(*p, 0, diag_i64_bytes));
-    };
-    CUDA_CHECK(cudaMalloc(&host_state.perf_compute_multi_expert_rows, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_compute_multi_expert_rows, 0, diag_i32_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_compute_task_has_multi, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_compute_task_has_multi, 0, diag_i32_bytes));
-    alloc_diag_i64(&host_state.perf_task_publish_ts);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_task_source, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_task_source, 0, diag_i32_bytes));
-    alloc_diag_i64(&host_state.perf_task_pop_start_ts);
-    alloc_diag_i64(&host_state.perf_task_pop_done_ts);
-    alloc_diag_i64(&host_state.perf_task_bcast_done_ts);
-    alloc_diag_i64(&host_state.perf_task_start_ts);
-    alloc_diag_i64(&host_state.perf_task_prev_end_ts);
-    alloc_diag_i64(&host_state.perf_task_prev_gap_ns);
-    CUDA_CHECK(cudaMalloc(&host_state.perf_task_pop_attempts, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_task_pop_attempts, 0, diag_i32_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_task_cas_failures, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_task_cas_failures, 0, diag_i32_bytes));
-    CUDA_CHECK(cudaMalloc(&host_state.perf_task_group_id, diag_i32_bytes));
-    CUDA_CHECK(cudaMemset(host_state.perf_task_group_id, 0xff, diag_i32_bytes));
-#endif
 
     host_state.combine_rdma_buffer_ptr = combine_rdma_ptr;
     host_state.combine_buffer_ptrs = combine_buffer_ptrs;
@@ -8467,10 +4739,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.token_nhits));
     CUDA_CHECK(cudaFree(host_state.token_slot_list));
     CUDA_CHECK(cudaFree(host_state.expert_batch_enqueued));
-#if MK_PERF_TRACE_ARGS
-    CUDA_CHECK(cudaFree(host_state.expert_batch_enqueue_ts));
-    CUDA_CHECK(cudaFree(host_state.token_priority_dep_count));
-#endif
     CUDA_CHECK(cudaFree(host_state.ready_batch_queue));
     CUDA_CHECK(cudaFree(host_state.ready_batch_reserve_tail));
     CUDA_CHECK(cudaFree(host_state.expert_batch_ready_count));
@@ -8532,209 +4800,6 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.dispatch_round_barrier));
     CUDA_CHECK(cudaFree(host_state.combine_channel_barrier));
     CUDA_CHECK(cudaFree(host_state.fused_fill_desc_buf));
-#if MK_PERF_TRACE_ENABLED
-    CUDA_CHECK(cudaFree(host_state.perf_dispatch_lch_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_combine_lch_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_compute_task));
-    CUDA_CHECK(cudaFree(host_state.perf_compute_task_count));
-    CUDA_CHECK(cudaFree(host_state.perf_gather_task));
-    CUDA_CHECK(cudaFree(host_state.perf_gather_task_count));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_end_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_async_publish_all_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_ts));
-#endif
-#if MK_PERF_TRACE_ARGS
-    CUDA_CHECK(cudaFree(host_state.perf_dispatch_round_trace));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_wait_nvl_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_publish_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_wait_recvcount_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_pub_scan_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_pub_atomic_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_pub_fence_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_pub_store_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_cta_barrier_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_channel_barrier_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_round_barrier_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_local_hit_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_local_hits));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_cta_release_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_role_arrive_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_role_work_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_wait_nvl_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_wait_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_wait_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_observe_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_start_first_negative_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_end_first_negative_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_pair_ready_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_poll_count));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_mixed_poll_count));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_slowest_rdma));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_src_nvl));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_start));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_prefix_raw_end));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_build_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_ready_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_put_begin_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_put_end_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_raw_2));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_sender_meta_raw_3));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_wait_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_ready_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_first_negative_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_mixed_poll_count));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_poll_count));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_0));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_1));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_2));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_raw_3));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_start_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_begin_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_publish_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_fence_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_store_to_fence_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_meta_wait_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_raw_start));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_raw_end));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_rank));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_nvl));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_dst_nvl));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_prefix_producer_src_rdma));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_token_loop_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_retire_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_publish_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_disp_allrecv_local_hits));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_wait_ring_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_poll_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_gap_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_start_gap_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_empty_gap_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_done_recheck_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_ring_load_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_head_release_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_syncwarp_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_batch_wall_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_batch_accounted_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_batch_unattributed_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_token_gap_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_helper_unattributed_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_finish_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_work_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_scan_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_atomic_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_fence_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_store_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_drain_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_batch_count));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_head_release_count));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_max_batch));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_local_hit_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_async_pub_local_hits));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_wait_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_single_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_multi_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_count));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_count));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_single_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_multi_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_work_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_sync_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_store_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_wait_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_single_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_multi_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_flush_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_ready_full_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_token));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_slot));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_expert));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_from_flush));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_nhits));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_wait_top_priority_deps));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_reduce_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_single_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_gather_multi_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_work_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_pack_meta_sync_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_tma_store_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_nhit_sum));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_token_count));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_single_token_count));
-    CUDA_CHECK(cudaFree(host_state.perf_comb_multi_token_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_scan_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_enqueue_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_idle_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_normal_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_tail_flush_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_publish_total_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_publish_wait_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_publish_wait_max_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_publish_wait_max_tail));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_publish_wait_max_visible_tail));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_scan_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_ready_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_full_batch_hits));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_batch_already_enqueued));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_already_normal));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_already_priority));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_already_tail));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_normal_after_priority_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_normal_after_priority_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_priority_not_full));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_normal_full_batch_enqueues));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_flush_tail_enqueues));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_queue_empty_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_queue_empty_after_dispatch_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_max_ready_tail_gap));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_expert));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_recv_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_alloc_count));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_enqueue_cursor));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_slot));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_first_unready_ready));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_stall_dispatch_done));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_done_seen_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_expert));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_old));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_recv_count_advance_new));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_normal_enqueue_attempt_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_normal_enqueue_success_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_publish_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_source));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_expert));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_batch));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_start_slot));
-    CUDA_CHECK(cudaFree(host_state.perf_sched_first_task_num_tokens));
-    CUDA_CHECK(cudaFree(host_state.perf_compute_multi_expert_rows));
-    CUDA_CHECK(cudaFree(host_state.perf_compute_task_has_multi));
-    CUDA_CHECK(cudaFree(host_state.perf_task_publish_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_source));
-    CUDA_CHECK(cudaFree(host_state.perf_task_pop_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_pop_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_bcast_done_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_start_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_prev_end_ts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_prev_gap_ns));
-    CUDA_CHECK(cudaFree(host_state.perf_task_pop_attempts));
-    CUDA_CHECK(cudaFree(host_state.perf_task_cas_failures));
-    CUDA_CHECK(cudaFree(host_state.perf_task_group_id));
-#endif
     CUDA_CHECK(cudaFree(device_state));
 #undef host_state
 #undef cudaFree
@@ -9025,12 +5090,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
     // Per-group global workspace, same layout as the forward compute worker:
     //   input_buf[M,hidden] = grad_down (gathered)   gu_buf[M,2I] = GU scratch
     //   up_buf[M,I]         = grad_act                down_buf[M,hidden] = grad_xperm
-#if MK_RECV_DIRECT_STAGING
     // input_buf unused (grad_act TMA-fed from recv_tokens); drop the input region.
     const int input_stride = 0;
-#else
-    const int input_stride = COMPUTE_BATCH_SIZE * hidden;
-#endif
     const int gu_stride    = COMPUTE_BATCH_SIZE * twoI;
     const int act_stride   = COMPUTE_BATCH_SIZE * intermediate;
     const int down_stride  = COMPUTE_BATCH_SIZE * hidden;
@@ -9066,23 +5127,11 @@ __device__ __forceinline__ void compute_backward_worker_core(
 
     // TMEM persistent across tasks (same optimization as forward compute_worker_core).
     bool umma_tmem_allocated = false;
-#if MK_PERF_TRACE_ARGS
-    int64_t last_task_end_ns = 0;
-#endif
 
     while (true) {
-#if MK_PERF_TRACE_ARGS
-        int64_t pop_start_ns = 0;
-        int64_t pop_done_ns = 0;
-        int pop_attempts = 0;
-        int cas_failures = 0;
-#endif
         // ---- pop a compute task (group leader) and broadcast to the group ----
         if (group_sm_idx == 0 && thread_id == 0) {
             int task_idx = -1;
-#if MK_PERF_TRACE_ARGS
-            pop_start_ns = globaltimer_ns();
-#endif
             while (true) {
                 if constexpr (kStopAtDispatchDone) {
                     // Check if compute progress has reached the threshold to switch to combine.
@@ -9107,31 +5156,14 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 }
                 if (atomicCAS(state->compute_task_head, head, head + 1) == head) {
                     task_idx = head;
-#if MK_PERF_TRACE_ARGS
-                    pop_done_ns = globaltimer_ns();
-                    if (task_idx >= 0 && task_idx < state->max_compute_tasks) {
-                        state->perf_task_pop_start_ts[task_idx] = pop_start_ns;
-                        state->perf_task_pop_done_ts[task_idx] = pop_done_ns;
-                        state->perf_task_pop_attempts[task_idx] = pop_attempts;
-                        state->perf_task_cas_failures[task_idx] = cas_failures;
-                        state->perf_task_group_id[task_idx] = group_id;
-                    }
-#endif
                     break;
                 }
-#if MK_PERF_TRACE_ARGS
-                cas_failures += 1;
-#endif
             }
             st_release_gpu_global(&state->compute_group_task_idx[group_id], task_idx);
         }
         compute_group_sync(state, group_id, group_size);
 
         int task_idx = ld_acquire_global(&state->compute_group_task_idx[group_id]);
-#if MK_PERF_TRACE_ARGS
-        if (group_sm_idx == 0 && thread_id == 0 && task_idx >= 0 && task_idx < state->max_compute_tasks)
-            state->perf_task_bcast_done_ts[task_idx] = globaltimer_ns();
-#endif
         if (task_idx == -2 || task_idx == -3) {
             // Dealloc TMEM before exiting the backward persistent loop.
             if (umma_tmem_allocated) {
@@ -9152,30 +5184,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
         int start_slot = task.start_slot;
         int batch_size = task.num_tokens;
 
-#if MK_PERF_TRACE_ENABLED
-        const bool perf_leader = (group_sm_idx == 0 && thread_id == 0);
-        int64_t compute_task_start_ns = perf_leader ? globaltimer_ns() : 0;
-        int64_t compute_task_end_ns = 0;
-#endif
-#if MK_PERF_TRACE_ARGS
-        int64_t perf_ph_meta_ns = 0, perf_ph_input_ns = 0, perf_ph_upgemm_ns = 0;
-        int64_t perf_ph_downgemm_ns = 0, perf_ph_output_ns = 0;
-        int64_t perf_up_body_ns = 0, perf_down_body_ns = 0, perf_out_body_ns = 0;
-        int64_t perf_sig_donecount_ns = 0, perf_sig_finalize_ns = 0;
-        int64_t perf_sig_fence_ns = 0, perf_sig_publish_ns = 0;
-        if (perf_leader && task_idx >= 0 && task_idx < state->max_compute_tasks) {
-            state->perf_task_start_ts[task_idx] = compute_task_start_ns;
-            state->perf_task_prev_end_ts[task_idx] = last_task_end_ns;
-            state->perf_task_prev_gap_ns[task_idx] = last_task_end_ns == 0 ? 0 : compute_task_start_ns - last_task_end_ns;
-        }
-        __shared__ int s_perf_multi_expert_rows;
-        __shared__ int s_perf_task_has_multi;
-        if (perf_leader) {
-            s_perf_multi_expert_rows = 0;
-            s_perf_task_has_multi = 0;
-        }
-        __syncthreads();
-#endif
 
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
         static_assert(kUseUmmaCompute, "WMMA compute path removed; MK_COMPUTE_KERNEL must be 1 (1-CTA) or 2 (2-CTA UMMA)");
@@ -9231,14 +5239,10 @@ __device__ __forceinline__ void compute_backward_worker_core(
             s_route_w[i] = 0.0f;
         }
         __syncthreads();
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_meta_ns = globaltimer_ns();
-#endif
 
         // ---- stage weight-grad inputs (wgrad_dz_slot = grad_down, wgrad_x_slot = X) ----
         const int64_t slot_base64 = (int64_t)state->expert_slot_base[expert_id] + start_slot;
         const int4* bwd_x_i4 = reinterpret_cast<const int4*>(bs->bwd_fc1_input);               // = X
-#if MK_RECV_DIRECT_STAGING
         // grad_act is TMA-fed from recv_tokens (backward dispatch staged grad_down there),
         // so input_buf is not filled here. This loop only stages the per-slot weight-grad
         // inputs for the wgrad GEMMs. Padding rows are unused (dSwiGLU/wgrad bounded by batch_size).
@@ -9253,30 +5257,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
             reinterpret_cast<int4*>(bs->wgrad_x_slot)[slot * hidden_int4 + v] = x_vec;
         }
-#else
-        const int input_vec_stride = COMPUTE_BATCH_SIZE * hidden_int4;
-        const int4* combine_input_i4 = reinterpret_cast<const int4*>(state->combine_input);   // = grad_down
-        int4* grad_down_i4 = reinterpret_cast<int4*>(input_buf);
-        for (int idx = group_thread_id; idx < input_vec_stride; idx += group_num_threads) {
-            int row = idx / hidden_int4;
-            int v = idx - row * hidden_int4;
-            if (row < batch_size) {
-                int rt = s_recv_token_idx[row];
-                const int64_t slot = slot_base64 + row;
-                const int4 grad_vec = combine_input_i4[(int64_t)rt * hidden_int4 + v];
-                const int4 x_vec = bwd_x_i4[(int64_t)rt * hidden_int4 + v];
-                grad_down_i4[idx] = grad_vec;
-                reinterpret_cast<int4*>(bs->wgrad_dz_slot)[slot * hidden_int4 + v] = grad_vec;
-                reinterpret_cast<int4*>(bs->wgrad_x_slot)[slot * hidden_int4 + v] = x_vec;
-            } else {
-                grad_down_i4[idx] = make_int4(0, 0, 0, 0);
-            }
-        }
-#endif
         compute_group_sync(state, group_id, group_size);
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_input_ns = globaltimer_ns();
-#endif
 
         const __nv_bfloat16* Wgu_e = &state->W_gateup[(size_t)expert_id * twoI * hidden];       // [2I,hidden]
         const __nv_bfloat16* Wd_e  = &state->W_down[(size_t)expert_id * hidden * intermediate]; // [hidden,I]
@@ -9300,15 +5281,10 @@ __device__ __forceinline__ void compute_backward_worker_core(
             } else {
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
-            // grad_act A operand = grad_down. Default per-group input_buf descriptor
-            // (m_base=0); under direct-staging TMA-feed straight from recv_tokens
+            // grad_act A operand = grad_down. Direct-staging TMA-feeds straight from recv_tokens
             // (backward dispatch staged grad_down there) with the task's row base.
-            const CUtensorMap* gradact_a_desc = &in_atom.a;
-            uint32_t gradact_a_m_base = 0;
-#if MK_RECV_DIRECT_STAGING
-            gradact_a_desc = &state->recv_tokens_a_tma;
-            gradact_a_m_base = (uint32_t)slot_base64;
-#endif
+            const CUtensorMap* gradact_a_desc = &state->recv_tokens_a_tma;
+            uint32_t gradact_a_m_base = (uint32_t)slot_base64;
             umma::umma_dgrad_mn_persistent(
                 gradact_a_desc,
                 &bs->compute_bwd_tma->wdown[expert_id],
@@ -9317,14 +5293,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_act_accum_iter,
                 gradact_a_m_base);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_up_body_ns = globaltimer_ns();
-#endif
             compute_group_sync(state, group_id, group_size);
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_upgemm_ns = globaltimer_ns();
-#endif
 
         // SwiGLU backward and route-probability gradient. One warp owns each route row,
         // so dTopKWeight needs only a warp reduction and one scalar store (no atomics).
@@ -9414,14 +5384,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
                 batch_size, hidden, twoI,
                 cluster_in_group, num_clusters,
                 cluster_smem, grad_x_accum_iter);
-#if MK_PERF_TRACE_ARGS
-            if (perf_leader) perf_down_body_ns = globaltimer_ns();
-#endif
             compute_group_sync(state, group_id, group_size);
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_downgemm_ns = globaltimer_ns();
-#endif
 
         // ---- per-slot output scatter (identical to forward down output) ----
         const int4* down_i4 = reinterpret_cast<const int4*>(down_buf);
@@ -9438,29 +5402,9 @@ __device__ __forceinline__ void compute_backward_worker_core(
             else
                 slot_out_i4[(int64_t)slot * hidden_int4 + v] = down_i4[idx];
         }
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_out_body_ns = globaltimer_ns();
-#endif
         __threadfence();
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_ph_output_ns = globaltimer_ns();
-#endif
 
         // ---- signal per-token completion (identical to forward) ----
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) {
-            perf_sig_donecount_ns = globaltimer_ns();
-            perf_sig_finalize_ns = perf_sig_donecount_ns;
-            perf_sig_fence_ns = perf_sig_donecount_ns;
-        }
-        if (perf_leader) {
-            int mr = 0;
-            for (int row = 0; row < batch_size; ++row)
-                if (!s_is_single[row]) ++mr;
-            s_perf_multi_expert_rows = mr;
-            s_perf_task_has_multi = (mr != 0);
-        }
-#endif
         for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
             const int recv_token = s_recv_token_idx[row];
             if (s_is_single[row]) {
@@ -9473,55 +5417,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             }
         }
         compute_group_sync(state, group_id, group_size);
-#if MK_PERF_TRACE_ENABLED
-        if (perf_leader) compute_task_end_ns = globaltimer_ns();
-#endif
-#if MK_PERF_TRACE_ARGS
-        if (perf_leader) perf_sig_publish_ns = compute_task_end_ns;
-#endif
 
-#if MK_PERF_TRACE_ENABLED
-        if (perf_leader) {
-#if MK_PERF_TRACE_ARGS
-            last_task_end_ns = compute_task_end_ns;
-#endif
-            int slot = task_idx;
-            if (slot >= 0 && slot < state->max_compute_tasks) {
-                int64_t* rec = state->perf_compute_task + (int64_t)slot * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS;
-                rec[0] = compute_task_start_ns;
-                rec[1] = compute_task_end_ns;
-                rec[2] = sm_id;
-                rec[3] = group_id;
-                rec[5] = batch_size;
-                rec[25] = task.is_flush;
-                rec[26] = 1;
-#if MK_PERF_TRACE_ARGS
-                rec[4] = expert_id;
-                rec[6] = hidden;
-                rec[7] = intermediate;
-                rec[8]  = perf_ph_meta_ns;
-                rec[9]  = perf_ph_input_ns;
-                rec[10] = perf_ph_upgemm_ns;
-                rec[11] = perf_ph_downgemm_ns;
-                rec[12] = perf_ph_output_ns;
-                rec[13] = compute_task_end_ns;
-                rec[14] = perf_up_body_ns;
-                rec[15] = perf_down_body_ns;
-                rec[16] = perf_out_body_ns;
-                rec[17] = perf_sig_donecount_ns;
-                rec[18] = perf_sig_finalize_ns;
-                rec[19] = perf_sig_fence_ns;
-                rec[20] = perf_sig_publish_ns;
-                rec[21] = task_idx;
-                rec[22] = start_slot;
-                rec[23] = start_slot + batch_size;
-                rec[24] = static_cast<int64_t>(state->expert_slot_base[expert_id]) + start_slot;
-                state->perf_compute_multi_expert_rows[slot] = s_perf_multi_expert_rows;
-                state->perf_compute_task_has_multi[slot] = s_perf_task_has_multi;
-#endif
-            }
-        }
-#endif
     }
     if constexpr (kStopAtDispatchDone) {
         asm volatile("barrier.sync 15, %0;" :: "r"(static_cast<int>(blockDim.x)) : "memory");
@@ -9818,13 +5714,13 @@ static void prepare_megakernel_communication_replay_host(
 
     // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
     // Besides the cross-rank barriers, this owns the same RDMA/NVL metadata layout and cleanup sizes.
-    internode::mk_cached_notfy(
+    ::gigamoe::mk_cached_notfy(
         hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
         hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
         hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
-        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false, false);
-    internode::mk_cached_notfy(
+        stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
+    ::gigamoe::mk_cached_notfy(
         combine_hidden_int4, 0, 0, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, hs.num_tokens,
         hs.send_rdma_head, hs.combine_rdma_channel_prefix_matrix,
@@ -9832,7 +5728,7 @@ static void prepare_megakernel_communication_replay_host(
         hs.combine_rdma_buffer_ptr, hs.num_max_combine_rdma_chunked_recv_tokens,
         hs.combine_buffer_ptrs, hs.num_max_combine_nvl_chunked_recv_tokens,
         combine_barrier_signal_ptrs, hs.rank, stream, hs.num_rdma_bytes,
-        hs.num_nvl_bytes, false, false, false);
+        hs.num_nvl_bytes, false, false);
 }
 
 void prepare_megakernel_communication_replay(
@@ -9847,170 +5743,6 @@ void prepare_megakernel_communication_replay(
         hs, dispatch_barrier_signal_ptrs, combine_barrier_signal_ptrs, stream);
 }
 
-#if MK_PERF_TRACE_ENABLED
-static void reset_megakernel_perf_trace_state(const MegaKernelState& hs, cudaStream_t stream) {
-    auto z = [&](void* p, size_t bytes) {
-        if (bytes > 0) CUDA_CHECK(cudaMemsetAsync(p, 0, bytes, stream));
-    };
-    auto f = [&](void* p, size_t bytes) {
-        if (bytes > 0) CUDA_CHECK(cudaMemsetAsync(p, 0xff, bytes, stream));
-    };
-
-    const int NLC = hs.num_logical_channels;
-    const int NPUB = hs.num_pub_warps_total;
-    const size_t lch_ts_bytes = (size_t)NLC * 2 * MegaKernelState::MK_PERF_NUM_LCH_PHASES * sizeof(int64_t);
-    const size_t compute_task_bytes = (size_t)hs.max_compute_tasks * MegaKernelState::MK_PERF_NUM_COMPUTE_FIELDS * sizeof(int64_t);
-    const size_t gather_task_bytes = (size_t)hs.max_compute_tasks * MegaKernelState::MK_PERF_NUM_GATHER_FIELDS * sizeof(int64_t);
-    const size_t async_pub_bytes = (size_t)NPUB * sizeof(int64_t);
-
-    z(hs.perf_dispatch_lch_ts, lch_ts_bytes);
-    z(hs.perf_combine_lch_ts, lch_ts_bytes);
-    z(hs.perf_compute_task, compute_task_bytes);
-    z(hs.perf_compute_task_count, sizeof(int));
-    z(hs.perf_gather_task, gather_task_bytes);
-    z(hs.perf_gather_task_count, sizeof(int));
-    z(hs.perf_async_pub_start_ts, async_pub_bytes);
-    z(hs.perf_async_pub_end_ts, async_pub_bytes);
-    z(hs.perf_async_publish_all_done_ts, sizeof(int64_t));
-    z(hs.perf_sched_ts, 2 * sizeof(int64_t));
-
-#if MK_PERF_TRACE_ARGS
-    const size_t acc_bytes = (size_t)NLC * 2 * sizeof(int64_t);
-    const size_t disp_role_bytes = (size_t)NLC * 2 * MK_DISPATCH_ROLE_COUNT * NUM_MAX_NVL_PEERS * sizeof(int64_t);
-    const size_t disp_recv_bytes = (size_t)NLC * 2 * NUM_MAX_NVL_PEERS * sizeof(int64_t);
-    const size_t disp_prefix_prod_bytes = disp_recv_bytes * (hs.num_ranks / NUM_MAX_NVL_PEERS);
-    const size_t diag_i64_bytes = (size_t)hs.max_compute_tasks * sizeof(int64_t);
-    const size_t diag_i32_bytes = (size_t)hs.max_compute_tasks * sizeof(int);
-    const size_t expert_batch_bytes = (size_t)hs.num_local_experts * hs.max_batches_per_expert;
-
-    z(hs.expert_batch_enqueue_ts, expert_batch_bytes * sizeof(int64_t));
-    z(hs.token_priority_dep_count, (size_t)hs.max_total_recv_tokens * sizeof(int));
-
-    int64_t* const acc_zero[] = {
-        hs.perf_disp_wait_nvl_ns, hs.perf_disp_publish_ns, hs.perf_disp_wait_recvcount_ns,
-        hs.perf_comb_tma_wait_ns, hs.perf_comb_wait_ready_ns, hs.perf_comb_wait_ready_single_ns,
-        hs.perf_comb_wait_ready_multi_ns, hs.perf_comb_wait_ready_flush_ns,
-        hs.perf_comb_wait_ready_full_ns, hs.perf_comb_wait_ready_flush_count,
-        hs.perf_comb_wait_ready_full_count, hs.perf_comb_gather_reduce_ns,
-        hs.perf_comb_gather_single_ns, hs.perf_comb_gather_multi_ns,
-        hs.perf_comb_pack_meta_ns, hs.perf_comb_pack_meta_work_ns,
-        hs.perf_comb_pack_meta_sync_ns, hs.perf_comb_tma_store_ns,
-        hs.perf_comb_tma_wait_max_ns, hs.perf_comb_wait_ready_max_ns,
-        hs.perf_comb_wait_ready_single_max_ns, hs.perf_comb_wait_ready_multi_max_ns,
-        hs.perf_comb_wait_ready_flush_max_ns, hs.perf_comb_wait_ready_full_max_ns,
-        hs.perf_comb_wait_top_ns, hs.perf_comb_wait_top_nhits,
-        hs.perf_comb_wait_top_priority_deps, hs.perf_comb_gather_reduce_max_ns,
-        hs.perf_comb_gather_single_max_ns, hs.perf_comb_gather_multi_max_ns,
-        hs.perf_comb_pack_meta_max_ns, hs.perf_comb_pack_meta_work_max_ns,
-        hs.perf_comb_pack_meta_sync_max_ns, hs.perf_comb_tma_store_max_ns,
-        hs.perf_comb_nhit_sum, hs.perf_comb_token_count,
-        hs.perf_comb_single_token_count, hs.perf_comb_multi_token_count,
-        hs.perf_disp_pub_scan_ns, hs.perf_disp_pub_atomic_ns,
-        hs.perf_disp_pub_fence_ns, hs.perf_disp_pub_store_ns,
-        hs.perf_disp_cta_barrier_ns, hs.perf_disp_channel_barrier_ns,
-        hs.perf_disp_round_barrier_ns, hs.perf_disp_tokens,
-        hs.perf_disp_local_hit_tokens, hs.perf_disp_local_hits,
-        hs.perf_disp_cta_release_ts,
-    };
-    for (int64_t* p : acc_zero) z(p, acc_bytes);
-
-    int64_t* const acc_ff[] = {
-        hs.perf_comb_wait_top_token, hs.perf_comb_wait_top_slot,
-        hs.perf_comb_wait_top_expert, hs.perf_comb_wait_top_from_flush,
-    };
-    for (int64_t* p : acc_ff) f(p, acc_bytes);
-
-    z(hs.perf_disp_role_arrive_ts, disp_role_bytes);
-    z(hs.perf_disp_role_work_ns, disp_role_bytes);
-
-    int64_t* const disp_recv_zero[] = {
-        hs.perf_disp_allrecv_wait_nvl_ns, hs.perf_disp_allrecv_prefix_wait_ns,
-        hs.perf_disp_allrecv_prefix_wait_start_ts, hs.perf_disp_allrecv_prefix_observe_ts,
-        hs.perf_disp_allrecv_prefix_done_ts, hs.perf_disp_allrecv_prefix_raw_start,
-        hs.perf_disp_allrecv_prefix_raw_end, hs.perf_disp_allrecv_token_loop_ns,
-        hs.perf_disp_allrecv_retire_ns, hs.perf_disp_allrecv_publish_ns,
-        hs.perf_disp_allrecv_tokens, hs.perf_disp_allrecv_local_hits,
-    };
-    for (int64_t* p : disp_recv_zero) z(p, disp_recv_bytes);
-    f(hs.perf_disp_allrecv_prefix_slowest_rdma, disp_recv_bytes);
-    f(hs.perf_disp_allrecv_prefix_src_nvl, disp_recv_bytes);
-
-    int64_t* const disp_prefix_zero[] = {
-        hs.perf_disp_prefix_store_begin_ts, hs.perf_disp_prefix_publish_ts,
-        hs.perf_disp_prefix_fence_done_ts, hs.perf_disp_prefix_store_to_fence_ns,
-        hs.perf_disp_prefix_meta_wait_ns, hs.perf_disp_prefix_tokens,
-    };
-    for (int64_t* p : disp_prefix_zero) z(p, disp_prefix_prod_bytes);
-    f(hs.perf_disp_prefix_producer_rank, disp_prefix_prod_bytes);
-    f(hs.perf_disp_prefix_producer_nvl, disp_prefix_prod_bytes);
-    f(hs.perf_disp_prefix_producer_dst_nvl, disp_prefix_prod_bytes);
-    f(hs.perf_disp_prefix_producer_src_rdma, disp_prefix_prod_bytes);
-
-    int64_t* const async_pub_zero[] = {
-        hs.perf_async_pub_wait_ring_ns, hs.perf_async_pub_poll_ns,
-        hs.perf_async_pub_gap_ns, hs.perf_async_pub_start_gap_ns,
-        hs.perf_async_pub_empty_gap_ns, hs.perf_async_pub_done_recheck_ns,
-        hs.perf_async_pub_ring_load_ns, hs.perf_async_pub_head_release_ns,
-        hs.perf_async_pub_syncwarp_ns, hs.perf_async_pub_batch_wall_ns,
-        hs.perf_async_pub_batch_accounted_ns, hs.perf_async_pub_batch_unattributed_ns,
-        hs.perf_async_pub_token_gap_ns, hs.perf_async_pub_helper_unattributed_ns,
-        hs.perf_async_pub_finish_ns, hs.perf_async_pub_work_ns,
-        hs.perf_async_pub_scan_ns, hs.perf_async_pub_atomic_ns,
-        hs.perf_async_pub_fence_ns, hs.perf_async_pub_store_ns,
-        hs.perf_async_pub_drain_ns, hs.perf_async_pub_tokens,
-        hs.perf_async_pub_batch_count, hs.perf_async_pub_head_release_count,
-        hs.perf_async_pub_max_batch, hs.perf_async_pub_local_hit_tokens,
-        hs.perf_async_pub_local_hits,
-    };
-    for (int64_t* p : async_pub_zero) z(p, async_pub_bytes);
-
-    int64_t* const sched_zero[] = {
-        hs.perf_sched_scan_ns, hs.perf_sched_enqueue_ns, hs.perf_sched_idle_ns,
-        hs.perf_sched_priority_ns, hs.perf_sched_normal_ns, hs.perf_sched_tail_flush_ns,
-        hs.perf_sched_publish_total_ns, hs.perf_sched_publish_wait_ns,
-        hs.perf_sched_publish_wait_max_ns, hs.perf_sched_priority_scan_tokens,
-        hs.perf_sched_priority_ready_tokens, hs.perf_sched_priority_full_batch_hits,
-        hs.perf_sched_priority_batch_already_enqueued, hs.perf_sched_priority_already_normal,
-        hs.perf_sched_priority_already_priority, hs.perf_sched_priority_already_tail,
-        hs.perf_sched_normal_after_priority_ns, hs.perf_sched_normal_after_priority_count,
-        hs.perf_sched_priority_not_full, hs.perf_sched_normal_full_batch_enqueues,
-        hs.perf_sched_flush_tail_enqueues, hs.perf_sched_queue_empty_count,
-        hs.perf_sched_queue_empty_after_dispatch_count, hs.perf_sched_max_ready_tail_gap,
-        hs.perf_sched_stall_recv_count, hs.perf_sched_stall_alloc_count,
-        hs.perf_sched_stall_enqueue_cursor, hs.perf_sched_stall_first_unready_ready,
-        hs.perf_sched_stall_dispatch_done,
-        hs.perf_sched_first_done_seen_ts, hs.perf_sched_first_recv_count_advance_ts,
-        hs.perf_sched_first_normal_enqueue_attempt_ts, hs.perf_sched_first_normal_enqueue_success_ts,
-        hs.perf_sched_first_task_publish_ts, hs.perf_sched_first_task_source,
-        hs.perf_sched_first_task_num_tokens,
-    };
-    for (int64_t* p : sched_zero) z(p, sizeof(int64_t));
-    f(hs.perf_sched_publish_wait_max_tail, sizeof(int64_t));
-    f(hs.perf_sched_publish_wait_max_visible_tail, sizeof(int64_t));
-    f(hs.perf_sched_stall_expert, sizeof(int64_t));
-    f(hs.perf_sched_stall_first_unready_slot, sizeof(int64_t));
-    f(hs.perf_sched_first_recv_count_advance_expert, sizeof(int64_t));
-    f(hs.perf_sched_first_recv_count_advance_old, sizeof(int64_t));
-    f(hs.perf_sched_first_recv_count_advance_new, sizeof(int64_t));
-    f(hs.perf_sched_first_task_expert, sizeof(int64_t));
-    f(hs.perf_sched_first_task_batch, sizeof(int64_t));
-    f(hs.perf_sched_first_task_start_slot, sizeof(int64_t));
-
-    int64_t* const diag_zero[] = {
-        hs.perf_task_publish_ts, hs.perf_task_pop_start_ts, hs.perf_task_pop_done_ts,
-        hs.perf_task_bcast_done_ts, hs.perf_task_start_ts, hs.perf_task_prev_end_ts,
-        hs.perf_task_prev_gap_ns,
-    };
-    for (int64_t* p : diag_zero) z(p, diag_i64_bytes);
-    z(hs.perf_compute_multi_expert_rows, diag_i32_bytes);
-    z(hs.perf_compute_task_has_multi, diag_i32_bytes);
-    z(hs.perf_task_source, diag_i32_bytes);
-    z(hs.perf_task_pop_attempts, diag_i32_bytes);
-    z(hs.perf_task_cas_failures, diag_i32_bytes);
-    f(hs.perf_task_group_id, diag_i32_bytes);
-#endif
-}
-#endif
 
 static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaStream_t stream) {
     const int E = hs.num_local_experts;
@@ -10094,9 +5826,6 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.recv_gbl_channel_prefix_matrix, (size_t)NR * NLC * sizeof(int));
     z(hs.recv_rdma_channel_token_count, (size_t)kRDMA * NLC * sizeof(int));
     z(hs.recv_gbl_channel_token_count, (size_t)NR * NLC * sizeof(int));
-#if MK_PERF_TRACE_ENABLED
-    reset_megakernel_perf_trace_state(hs, stream);
-#endif
 }
 
 static void reset_megakernel_post_notify_state(const MegaKernelState& hs, cudaStream_t stream) {
@@ -10217,10 +5946,6 @@ void launch_megakernel_debug_backward(
 
     CUDA_CHECK(cudaGetLastError());
 
-#if MK_PERF_TRACE_ENABLED
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    dump_perf_trace_perfetto(hstate, active_total_sms, "backward");
-#endif
 
     // Weight-gradient operands are consumed by the host-side QuACK grouped GEMMs.
     // Keep this CUDA entry point limited to the megakernel backward itself.
