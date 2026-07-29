@@ -359,18 +359,19 @@ enum class ComputeDType {
 
 }  // namespace megakernel
 
-// Debug snapshot used to develop forward/backward without changing MK-v7.
-namespace megakernel_debug {
+}  // namespace deep_ep
 
-using ComputeDType = megakernel::ComputeDType;
+namespace gigamoe {
+
+using ComputeDType = ::deep_ep::megakernel::ComputeDType;
 struct MegaKernelState;
 struct MegaKernelBackwardState;
 struct MegaKernelBackwardHostContext;
 
-MegaKernelState* allocate_megakernel_state_v7(
+MegaKernelState* allocate_gigamoe_fused_state(
     const int4* x,
     const uint32_t* x_scales,
-    const topk_idx_t* topk_idx,
+    const ::deep_ep::topk_idx_t* topk_idx,
     const float* topk_weights,
     const bool* is_token_in_rank,
     const int* rdma_channel_prefix_matrix,
@@ -441,9 +442,9 @@ MegaKernelState* allocate_megakernel_state_v7(
     int compute_batch_size = 4096,
     int combine_start_head_percent = 70);
 
-void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state = nullptr);
+void free_gigamoe_fused_state(MegaKernelState* device_state, const MegaKernelState* cached_host_state = nullptr);
 void free_megakernel_forward_transient(MegaKernelState* device_state);
-void free_megakernel_forward_transient_from_host(MegaKernelState* host_state);
+void free_gigamoe_forward_transients_from_host(MegaKernelState* host_state);
 void get_megakernel_backward_dimensions(
     MegaKernelState* device_state,
     int* num_tokens,
@@ -455,10 +456,10 @@ void get_megakernel_expert_counts(
     MegaKernelState* device_state,
     int* expert_counts,
     int num_local_experts);
-int get_megakernel_compute_batch_size();
+int get_gigamoe_compute_batch_size_default();
 float* get_output_accum_ptr(MegaKernelState* device_state);
 void* get_combined_x_ptr(MegaKernelState* device_state);
-void launch_megakernel_debug_forward(
+void launch_gigamoe_fused_forward(
     MegaKernelState* device_state,
     const MegaKernelState* host_state,
     int total_sms,
@@ -466,7 +467,7 @@ void launch_megakernel_debug_forward(
     int stage,
     ComputeDType compute_dtype,
     cudaStream_t stream);
-MegaKernelBackwardState* allocate_megakernel_backward_state(
+MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
     MegaKernelState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
@@ -482,21 +483,21 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream,
     const MegaKernelState* cached_fwd_host_state = nullptr);
-void free_megakernel_backward_state(
+void free_gigamoe_fused_backward_state(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context = nullptr);
-void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_context);
+void free_gigamoe_backward_host_context(MegaKernelBackwardHostContext* host_context);
 void prepare_megakernel_communication_replay(
     MegaKernelState* device_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
-void prepare_megakernel_backward_communication_replay(
+void prepare_gigamoe_backward_communication_replay(
     const MegaKernelBackwardHostContext* host_context,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
-void launch_megakernel_debug_backward(
+void launch_gigamoe_fused_backward(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context,
     int total_sms,
@@ -505,19 +506,14 @@ void launch_megakernel_debug_backward(
     ComputeDType compute_dtype,
     cudaStream_t stream);
 
-}  // namespace megakernel_debug
+namespace detail {
+namespace state_cache {
+MegaKernelState* alloc_host();
+void copy_host(MegaKernelState* dst, const MegaKernelState* src);
+void free_host(MegaKernelState* ptr);
+}  // namespace state_cache
+}  // namespace detail
 
-// Opaque host-side helpers for caching MegaKernelState on the host (avoids
-// exposing the full struct definition outside the .cu compilation unit).
-namespace megakernel_state_cache {
-megakernel_debug::MegaKernelState* alloc_host();
-void copy_host(megakernel_debug::MegaKernelState* dst, const megakernel_debug::MegaKernelState* src);
-void free_host(megakernel_debug::MegaKernelState* ptr);
-}  // namespace megakernel_state_cache
-
-}  // namespace deep_ep
-
-namespace gigamoe {
 
 void mk_cached_notfy(int hidden_int4,
                      int num_scales,

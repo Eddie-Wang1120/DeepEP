@@ -3,7 +3,7 @@
 > [!WARNING]
 > This repository contains an experimental version of GigaMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
 
-GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine. It focuses on a fused persistent execution path for dispatch, compute, combine.
+GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine. It is designed for large expert-parallel (EP) configurations with high communication volume, sparse expert activation, and a large number of experts.
 
 ## Performance
 

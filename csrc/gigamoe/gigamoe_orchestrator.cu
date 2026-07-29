@@ -22,12 +22,10 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 
-namespace deep_ep {
-namespace megakernel_debug {
+namespace gigamoe {
 
-using ComputeDType = megakernel::ComputeDType;
-// The compute header defines helper namespaces under deep_ep::megakernel.
-// Alias it so the copied body keeps using unqualified umma::.
+using namespace ::deep_ep;
+using ComputeDType = ::deep_ep::megakernel::ComputeDType;
 namespace umma = ::deep_ep::megakernel::umma;
 
 // ============================================================================
@@ -260,7 +258,7 @@ struct MegaKernelState {
 
     // --- S4.4 (route B2): UMMA compute TMA atoms (device-resident) ---
     // Per-expert 2D multicast TMA atoms for W_gateup, and per-group A(input_buf)
-    // TMA atoms. Built on host (setup_compute_tma_v7), copied to device. nullptr
+    // TMA atoms. Built on host (setup_compute_tma), copied to device. nullptr
     // when UMMA compute is disabled (falls back to WMMA path).
     umma::ComputeTmaAtoms* compute_tma;      // device ptr; wgateup[e]
     umma::ComputeDownTmaAtoms* compute_down_tma;  // device ptr; wdown[e]
@@ -3567,7 +3565,7 @@ static inline cudaError_t free_arena_chunks(void** chunks, int count) {
 // Undefine it and use a local variable / function parameter instead.
 #undef COMPUTE_BATCH_SIZE
 
-MegaKernelState* allocate_megakernel_state_v7(
+MegaKernelState* allocate_gigamoe_fused_state(
     // --- Dispatch input data (from PyTorch tensors) ---
     const int4* x,
     const uint32_t* x_scales,
@@ -4439,7 +4437,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     return device_state;
 }
 
-void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state) {
+void free_gigamoe_fused_state(MegaKernelState* device_state, const MegaKernelState* cached_host_state) {
 #define cudaFree(p) gigamoe_caching_free(p)
     MegaKernelState host_state_copy;
     MegaKernelState* hs = &host_state_copy;
@@ -4521,7 +4519,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
     CUDA_CHECK(cudaFree(host_state.combine_input_src_meta));
     CUDA_CHECK(cudaFree(host_state.gemm_workspace));
     // TMA descriptors are owned by the persistent thread-local cache (see
-    // allocate_megakernel_state_v7). The state only holds borrowed pointers, so it
+    // allocate_gigamoe_fused_state). The state only holds borrowed pointers, so it
     // must NOT free them here; the cache frees them on eviction.
     CUDA_CHECK(cudaFree(host_state.output_accum));
     CUDA_CHECK(cudaFree(host_state.send_rdma_head));
@@ -4545,9 +4543,9 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
 // Release the forward-only working buffers after the kernel has written the caller-owned
 // output. The backward pass allocates a fresh v7 state and only reuses the saved-activation
 // buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) plus expert_count from this forward
-// state (see allocate_megakernel_backward_state). None of the buffers freed here are read
+// state (see allocate_gigamoe_fused_backward_state). None of the buffers freed here are read
 // by the backward, so releasing them now removes them from the forward->backward resident
-// set. Each freed pointer is nulled so the eventual free_megakernel_state_v7 skips it
+// set. Each freed pointer is nulled so the eventual free_gigamoe_fused_state skips it
 // (gigamoe_caching_free is null-safe), avoiding a double free.
 void free_megakernel_forward_transient(MegaKernelState* device_state) {
     if (device_state == nullptr)
@@ -4595,10 +4593,10 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
 
 // Host-only version: uses the cached host_state snapshot directly, avoiding
 // D2H + H2D cudaMemcpy entirely. The device_state is NOT updated (the backward
-// re-creates its own v7 state from the host cache, and eventual free_megakernel_state_v7
+// re-creates its own v7 state from the host cache, and eventual free_gigamoe_fused_state
 // handles the remaining persistent arena chunks via the device copy). This path removes
 // three memcpy operations from the forward critical path.
-void free_megakernel_forward_transient_from_host(MegaKernelState* host_state) {
+void free_gigamoe_forward_transients_from_host(MegaKernelState* host_state) {
     if (host_state == nullptr)
         return;
     if (host_state->transient_arena_chunk_count > 0) {
@@ -4628,7 +4626,7 @@ void free_megakernel_forward_transient_from_host(MegaKernelState* host_state) {
         free_ptr(host_state->combined_topk_weights);
 }
 
-int get_megakernel_compute_batch_size() {
+int get_gigamoe_compute_batch_size_default() {
     return megakernel_config::kComputeBatchSizeDefault;
 }
 
@@ -4671,10 +4669,9 @@ void* get_combined_x_ptr(MegaKernelState* device_state) {
     return host_state.combined_x;
 }
 
-// Debug entry points intentionally live beside the copied forward implementation.
-// Keeping this wrapper thin guarantees that debug-forward and MK-v7 execute the
-// same kernel specialization while the forward implementation is still moving.
-void launch_megakernel_debug_forward(
+// Keep the public fused-forward wrapper adjacent to its implementation so both
+// dispatch paths use the same kernel specialization.
+void launch_gigamoe_fused_forward(
     MegaKernelState* device_state,
     const MegaKernelState* host_state,
     int total_sms,
@@ -4688,7 +4685,7 @@ void launch_megakernel_debug_forward(
 }
 
 // ============================================================================
-// Backward megakernel (MK-v7 debug) — full-fused, reuses the forward comm.
+// Fused GigaMOE backward path reusing forward communication state.
 //
 // The backward re-runs the SAME fused megakernel (dispatch + scheduler + gather + combine)
 // on a patched copy of the forward MegaKernelState, swapping ONLY the compute role for a
@@ -5241,7 +5238,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // allocator inputs, while all derived routing, workspace, FIFO, and counter storage is new.
 // Host-side backward allocation uses fs.compute_batch_size from the forward state directly.
 #undef COMPUTE_BATCH_SIZE
-MegaKernelBackwardState* allocate_megakernel_backward_state(
+MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
     MegaKernelState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
@@ -5299,7 +5296,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
                                    cudaMemcpyHostToDevice, stream));
     }
 
-    MegaKernelState* bwd_device_state = ::deep_ep::megakernel_debug::allocate_megakernel_state_v7(
+    MegaKernelState* bwd_device_state = ::gigamoe::allocate_gigamoe_fused_state(
         reinterpret_cast<const int4*>(grad_output), nullptr,
         fs.topk_idx, fs.topk_weights, fs.is_token_in_rank,
         fs.rdma_channel_prefix_matrix, fs.recv_rdma_rank_prefix_sum,
@@ -5388,9 +5385,9 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     CUDA_CHECK(cudaMemcpyAsync(device_bs, &hs, sizeof(MegaKernelBackwardState),
                                cudaMemcpyHostToDevice, stream));
 
-    // Single sync covers all prior async H2Ds (compute_bwd_tma, allocate_state_v7's
+    // Single sync covers all prior async H2Ds (compute_bwd_tma, allocate_state's
     // state+fill_descs, wgrad_dgu_a_tma, device_bs) plus the single fused_fill_kernel
-    // launch inside allocate_megakernel_state_v7. This mirrors the forward pattern:
+    // launch inside allocate_gigamoe_fused_state. This mirrors the forward pattern:
     // batch all async ops, sync once at the end.
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -5399,7 +5396,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     return device_bs;
 }
 
-void free_megakernel_backward_state(
+void free_gigamoe_fused_backward_state(
     MegaKernelBackwardState* device_bs,
     const MegaKernelBackwardHostContext* host_context
 ) {
@@ -5416,13 +5413,13 @@ void free_megakernel_backward_state(
     // wgrad_* buffers are borrowed from caller-owned Torch tensors.
     CUDA_CHECK(gigamoe_caching_free(hs.compute_bwd_tma));
     CUDA_CHECK(gigamoe_caching_free(hs.wgrad_dgu_a_tma));
-    free_megakernel_state_v7(
+    free_gigamoe_fused_state(
         hs.bwd_device_state,
         host_context != nullptr ? &host_context->bwd_state : nullptr);
     CUDA_CHECK(gigamoe_caching_free(device_bs));
 }
 
-void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_context) {
+void free_gigamoe_backward_host_context(MegaKernelBackwardHostContext* host_context) {
     delete host_context;
 }
 
@@ -5561,7 +5558,7 @@ static void reset_megakernel_post_notify_state(const MegaKernelState& hs, cudaSt
     auto f = [&](void* p, size_t bytes) { CUDA_CHECK(cudaMemsetAsync(p, 0xff, bytes, stream)); };
 
     // Backward allocates a fresh state whose ordinary queues/barriers/slot buffers were already
-    // initialized by allocate_megakernel_state_v7. The cached_notify replay can write the combine
+    // initialized by allocate_gigamoe_fused_state. The cached_notify replay can write the combine
     // send heads, so restore only those before launching the persistent kernel.
     f(hs.send_rdma_head, (size_t)NLC * combine_rdma_head_stride * sizeof(int));
     f(hs.send_nvl_head, (size_t)NLC * combine_nvl_head_stride * sizeof(int));
@@ -5604,7 +5601,7 @@ static void launch_gigamoe_fused_backward_case(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void prepare_megakernel_backward_communication_replay(
+void prepare_gigamoe_backward_communication_replay(
     const MegaKernelBackwardHostContext* host_context,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
@@ -5617,7 +5614,7 @@ void prepare_megakernel_backward_communication_replay(
         combine_barrier_signal_ptrs, stream);
 }
 
-void launch_megakernel_debug_backward(
+void launch_gigamoe_fused_backward(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context,
     int total_sms,
@@ -5632,7 +5629,7 @@ void launch_megakernel_debug_backward(
                    "megakernel debug backward currently supports BF16 only");
 
     // The backward-specific fills (send_rdma_head, send_nvl_head, grad_input) are now
-    // merged into allocate_megakernel_backward_state and executed before the sync there.
+    // merged into allocate_gigamoe_fused_backward_state and executed before the sync there.
     // No separate fused_fill_kernel launch is needed here.
 
     const MegaKernelBackwardState& hbs = host_context->backward_state;
@@ -5679,23 +5676,23 @@ void launch_megakernel_debug_backward(
 #undef MEGAKERNEL_BWD_STAGE_CASE
 }
 
-} // namespace megakernel_debug
+namespace detail {
+namespace state_cache {
 
-namespace megakernel_state_cache {
-
-megakernel_debug::MegaKernelState* alloc_host() {
-    return new megakernel_debug::MegaKernelState{};
+MegaKernelState* alloc_host() {
+    return new MegaKernelState{};
 }
 
-void copy_host(megakernel_debug::MegaKernelState* dst, const megakernel_debug::MegaKernelState* src) {
+void copy_host(MegaKernelState* dst, const MegaKernelState* src) {
     *dst = *src;
 }
 
-void free_host(megakernel_debug::MegaKernelState* ptr) {
+void free_host(MegaKernelState* ptr) {
     delete ptr;
 }
 
-}  // namespace megakernel_state_cache
+}  // namespace state_cache
+}  // namespace detail
 
-} // namespace deep_ep
+}  // namespace gigamoe
 

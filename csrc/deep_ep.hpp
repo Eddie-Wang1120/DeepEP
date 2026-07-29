@@ -50,15 +50,15 @@ private:
 };
 }  // namespace shared_memory
 
-namespace deep_ep {
-
-namespace megakernel_debug {
+namespace gigamoe {
 struct MegaKernelState;
 }
 
+namespace deep_ep {
+
 class MegaKernelAutogradContext {
 public:
-    MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state,
+    MegaKernelAutogradContext(::gigamoe::MegaKernelState* state,
                               int num_tokens,
                               int hidden_dim,
                               int intermediate_dim,
@@ -67,7 +67,7 @@ public:
                               std::vector<int> expert_counts);
     ~MegaKernelAutogradContext();
 
-    megakernel_debug::MegaKernelState* state() const;
+    ::gigamoe::MegaKernelState* state() const;
     int num_tokens() const;
     int hidden_dim() const;
     int intermediate_dim() const;
@@ -78,8 +78,8 @@ public:
     // Host-side snapshot of the forward MegaKernelState, captured at forward-end.
     // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
     // the device state, eliminating the most expensive host stall in the backward path.
-    const megakernel_debug::MegaKernelState& cached_host_state() const;
-    void set_cached_host_state(const megakernel_debug::MegaKernelState& hs);
+    const ::gigamoe::MegaKernelState& cached_host_state() const;
+    void set_cached_host_state(const ::gigamoe::MegaKernelState& hs);
 
     // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
     // training state. The MegaKernelState stores only raw data_ptr()s into these tensors, and
@@ -90,8 +90,8 @@ public:
     void retain_layout_tensors(std::vector<torch::Tensor> tensors);
 
 private:
-    megakernel_debug::MegaKernelState* state_;
-    megakernel_debug::MegaKernelState* cached_host_state_ = nullptr;
+    ::gigamoe::MegaKernelState* state_;
+    ::gigamoe::MegaKernelState* cached_host_state_ = nullptr;
     int num_tokens_;
     int hidden_dim_;
     int intermediate_dim_;

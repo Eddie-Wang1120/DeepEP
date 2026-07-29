@@ -1988,7 +1988,7 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKernelState* state,
+MegaKernelAutogradContext::MegaKernelAutogradContext(::gigamoe::MegaKernelState* state,
                                                      int num_tokens,
                                                      int hidden_dim,
                                                      int intermediate_dim,
@@ -2006,14 +2006,14 @@ MegaKernelAutogradContext::MegaKernelAutogradContext(megakernel_debug::MegaKerne
 MegaKernelAutogradContext::~MegaKernelAutogradContext() {
 #ifndef DISABLE_NVSHMEM
     if (state_ != nullptr)
-        megakernel_debug::free_megakernel_state_v7(
+        ::gigamoe::free_gigamoe_fused_state(
             state_, cached_host_state_);
 #endif
     if (cached_host_state_ != nullptr)
-        megakernel_state_cache::free_host(cached_host_state_);
+        ::gigamoe::detail::state_cache::free_host(cached_host_state_);
 }
 
-megakernel_debug::MegaKernelState* MegaKernelAutogradContext::state() const {
+::gigamoe::MegaKernelState* MegaKernelAutogradContext::state() const {
     return state_;
 }
 
@@ -2045,16 +2045,16 @@ void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor>
     retained_layout_tensors_ = std::move(tensors);
 }
 
-const megakernel_debug::MegaKernelState& MegaKernelAutogradContext::cached_host_state() const {
+const ::gigamoe::MegaKernelState& MegaKernelAutogradContext::cached_host_state() const {
     EP_HOST_ASSERT(cached_host_state_ != nullptr);
     return *cached_host_state_;
 }
 
-void MegaKernelAutogradContext::set_cached_host_state(const megakernel_debug::MegaKernelState& hs) {
+void MegaKernelAutogradContext::set_cached_host_state(const ::gigamoe::MegaKernelState& hs) {
     if (cached_host_state_ != nullptr)
-        megakernel_state_cache::free_host(cached_host_state_);
-    cached_host_state_ = megakernel_state_cache::alloc_host();
-    megakernel_state_cache::copy_host(cached_host_state_, &hs);
+        ::gigamoe::detail::state_cache::free_host(cached_host_state_);
+    cached_host_state_ = ::gigamoe::detail::state_cache::alloc_host();
+    ::gigamoe::detail::state_cache::copy_host(cached_host_state_, &hs);
 }
 
 std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_impl(
@@ -2444,10 +2444,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         {num_tokens, hidden_dim}, x.options().dtype(torch::kBFloat16));
 
     // host_state_out receives the complete host-side MegaKernelState snapshot from
-    // allocate_megakernel_state_v7. The backward uses this directly (via context) instead
+    // allocate_gigamoe_fused_state. The backward uses this directly (via context) instead
     // of a synchronous D2H cudaMemcpy from the device state.
-    megakernel_debug::MegaKernelState* fwd_host_state_ptr =
-        megakernel_state_cache::alloc_host();
+    ::gigamoe::MegaKernelState* fwd_host_state_ptr =
+        ::gigamoe::detail::state_cache::alloc_host();
     auto allocate_state = [&](auto allocator) {
         return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -2513,7 +2513,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         combine_start_head_percent);
     };
 
-    void* state = static_cast<void*>(allocate_state(megakernel_debug::allocate_megakernel_state_v7));
+    void* state = static_cast<void*>(allocate_state(::gigamoe::allocate_gigamoe_fused_state));
 
     // printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
 
@@ -2559,8 +2559,8 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         // internode::barrier();
     }
 
-    megakernel_debug::launch_megakernel_debug_forward(
-        static_cast<megakernel_debug::MegaKernelState*>(state),
+    ::gigamoe::launch_gigamoe_fused_forward(
+        static_cast<::gigamoe::MegaKernelState*>(state),
         fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
@@ -2581,7 +2581,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     if (retain_state) {
         EP_HOST_ASSERT(!use_fp8_compute && "training state currently requires debug BF16 mode");
         context = std::make_shared<MegaKernelAutogradContext>(
-            static_cast<megakernel_debug::MegaKernelState*>(state),
+            static_cast<::gigamoe::MegaKernelState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
             mk_expert_counts);
         // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
@@ -2591,11 +2591,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         // heads, ...) now so they don't stay resident across the forward->backward gap.
         // The returned Torch tensor owns combined_x and is not released with the state.
         // Free transient BEFORE caching and freeing fwd_host_state_ptr.
-        megakernel_debug::free_megakernel_forward_transient_from_host(fwd_host_state_ptr);
+        ::gigamoe::free_gigamoe_forward_transients_from_host(fwd_host_state_ptr);
         // Cache the host-side state snapshot (with transient pointers already freed) so
         // backward can skip the synchronous D2H.
         context->set_cached_host_state(*fwd_host_state_ptr);
-        megakernel_state_cache::free_host(fwd_host_state_ptr);
+        ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
         fwd_host_state_ptr = nullptr;
         // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
         // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
@@ -2611,11 +2611,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
             topk_weights,
         });
     } else {
-        megakernel_debug::free_megakernel_state_v7(
-            static_cast<megakernel_debug::MegaKernelState*>(state),
+        ::gigamoe::free_gigamoe_fused_state(
+            static_cast<::gigamoe::MegaKernelState*>(state),
             fwd_host_state_ptr);
         if (fwd_host_state_ptr != nullptr)
-            megakernel_state_cache::free_host(fwd_host_state_ptr);
+            ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
     }
 
     return {result, context};
@@ -2725,7 +2725,7 @@ Buffer::megakernel_debug_backward(
     }
     const size_t alloc_slots = std::max<size_t>(total_slots, 1);
     const int two_i = 2 * intermediate;
-    const int compute_batch_size = megakernel_debug::get_megakernel_compute_batch_size();
+    const int compute_batch_size = ::gigamoe::get_gigamoe_compute_batch_size_default();
     auto stream = at::cuda::getCurrentCUDAStream();
     auto cu_options = torch::TensorOptions().dtype(torch::kInt32).device(grad_output.device());
     auto cu_seqlens_k = torch::empty({num_local_experts + 1}, cu_options);
@@ -2741,15 +2741,15 @@ Buffer::megakernel_debug_backward(
     auto scratch_act = scratch_act_backing.narrow(0, 0, total_slots);
     auto scratch_dz = scratch_dz_backing.narrow(0, 0, total_slots);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, total_slots);
-    megakernel_debug::MegaKernelBackwardHostContext* backward_host_context = nullptr;
-    auto* backward_state = megakernel_debug::allocate_megakernel_backward_state(
+    ::gigamoe::MegaKernelBackwardHostContext* backward_host_context = nullptr;
+    auto* backward_state = ::gigamoe::allocate_gigamoe_fused_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights_out.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
         scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
         &backward_host_context, stream,
         &context->cached_host_state());
-    megakernel_debug::prepare_megakernel_backward_communication_replay(
+    ::gigamoe::prepare_gigamoe_backward_communication_replay(
         backward_host_context, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
@@ -2765,17 +2765,17 @@ Buffer::megakernel_debug_backward(
         // internode::barrier();
     }
 
-    megakernel_debug::launch_megakernel_debug_backward(
+    ::gigamoe::launch_gigamoe_fused_backward(
         backward_state, backward_host_context, total_sms, smem_size, stage,
-        megakernel_debug::ComputeDType::kBF16, stream);
+        ::gigamoe::ComputeDType::kBF16, stream);
 
     // The backward kernel writes wgrad scratch operands directly into the caller-owned
     // torch tensors (scratch_x/act/dz/dgu). No host-device synchronization is needed here
     // because the caller (QuACK wgrad) launches on the same CUDA stream, so stream ordering
     // guarantees the backward kernel completes before the wgrad GEMMs read the scratch data.
     // Free the backward state using the host-cached copy (no D2H required).
-    megakernel_debug::free_megakernel_backward_state(backward_state, backward_host_context);
-    megakernel_debug::free_megakernel_backward_host_context(backward_host_context);
+    ::gigamoe::free_gigamoe_fused_backward_state(backward_state, backward_host_context);
+    ::gigamoe::free_gigamoe_backward_host_context(backward_host_context);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights_out,
             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
 #else
