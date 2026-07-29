@@ -2182,7 +2182,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     // MegaKernel uses the same DeepEP config objects as the baseline path, but
     // keeps dispatch and combine parameters separate just like original DeepEP.
-    const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker_v2
+    const int num_physical_channels = num_dispatch_sms / 2;  // even/odd SM pairing in dispatch_worker
     // Logical channels = physical channels * stage. notify_dispatch / get_dispatch_layout see
     // the expanded logical-channel count so the prefix matrices are laid out per logical channel,
     // consistent with the dispatch worker (num_logical_channels_per_physical = kStage) and the

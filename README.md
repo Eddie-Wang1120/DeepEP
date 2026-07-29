@@ -66,6 +66,12 @@ GigaMOE uses one persistent kernel to coordinate five types of workers.
 
 The workers communicate through lightweight readiness signals. Dispatch publishes `token ready` signals, the scheduler groups ready tokens into compute batches, and compute publishes results to combine. When a token has multiple local expert hits (`nhit > 1`), gather reduces those partial results before combine consumes them.
 
+## TODO
+
+- [ ] Add FP8 support.
+- [ ] Migrate the communication backend from NVSHMEM to NCCL.
+- [ ] Add SM90 support.
+
 ## Quick start
 
 ### Requirements

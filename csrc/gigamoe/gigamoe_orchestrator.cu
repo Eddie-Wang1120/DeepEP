@@ -1,24 +1,3 @@
-/**
- * gigamoe_orchestrator.cu: Fused dispatch, compute, combine, and backward debug path
- *
- * Architecture:
- *   Single persistent kernel with overlapping phases:
- *   - Dispatch SMs: Full DeepEP dispatch (even SM = forwarder, odd SM = sender)
- *     Uses even/odd SM pairing from internode.cu with 5 warp roles:
- *     kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder,
- *     kForwarderCoordinator, kNVLReceivers
- *   - Compute SMs: Consume publisher-ready expert batches -> GEMM+SwiGLU
- *   - Combine: Serial after all compute done
- *
- * Overlap: Dispatch (NIC) and Compute (TensorCore) run concurrently on different SMs.
- *
- * Key design:
- *   - Dispatch completely reuses DeepEP internode.cu dispatch logic as __device__
- *   - NVLReceivers stage tokens into per-expert slots; publisher warps enqueue ready batches
- *   - Compute consumes the ready-batch FIFO at COMPUTE_BATCH_SIZE granularity
- *   - Flush: publish_all_done -> compute processes tail batches
- */
-
 #include "config.hpp"
 #include "kernels/api.cuh"
 #include "kernels/buffer.cuh"
@@ -28,8 +7,6 @@
 #include "kernels/internode_common.cuh"
 #include "kernels/launch.cuh"
 #include "kernels/utils.cuh"
-// S4.4 (route B2): Blackwell UMMA + 2CTA multicast TMA compute (CuTe). Isolated
-// header; only included here (nvcc TU), never by deep_ep.cpp (g++).
 #include "gigamoe_wrapper.cuh"
 
 #include <cute/arch/simd_sm100.hpp>
@@ -201,12 +178,7 @@ struct MegaKernelState {
     // --- Per-expert receive storage (filled by NVL receiver) ---
     __nv_bfloat16* recv_tokens;       // [num_local_experts * max_tokens_per_expert, hidden]
     int* expert_token_offsets;        // [num_local_experts] — atomic write offset
-    // --- Compact per-expert slot layout (P0 memory optimization scaffolding) ---
-    // Phase 0: placeholder values (expert_slot_base[le]=le*max_tokens_per_expert,
-    // expert_count[le]=max_tokens_per_expert) so addressing is byte-identical to the
-    // legacy `le*max_tpe+slot` scheme. Not read by any kernel yet. Later phases switch
-    // these to real exclusive-prefix-sum bases / real per-expert counts to compact the
-    // per-expert-slot buffers from num_local_experts*max_total_recv_tokens down to Σ count.
+    // --- Compact per-expert slot layout ---
     int* expert_slot_base;            // [num_local_experts] base offset into per-expert-slot buffers
     int* expert_count;                // [num_local_experts] received token count per local expert
     int* recv_token_source_info;      // [max_total_recv_tokens, 2] — (recv_token_idx, topk_slot)
@@ -234,10 +206,9 @@ struct MegaKernelState {
     __nv_bfloat16* bwd_preact;          // [max_total_recv_tokens, num_topk, 2 * intermediate] saved gate/up by recv_token/topk_slot
     bool owns_bwd_fc1_input;
     bool owns_bwd_preact;
-    // Phase 3 (A2): compact preact storage. bwd_preact is keyed by the compact forward slot
-    // (like recv_tokens), and fwd_slot_map translates the cross-pass-stable key
-    // (recv_token, topk_slot) -> forward slot so the backward pass can find it (slot ids are
-    // non-deterministic across the two dispatch runs, but recv_token/topk_slot are stable).
+    // bwd_preact is keyed by the compact forward slot. fwd_slot_map translates the
+    // cross-pass-stable (recv_token, topk_slot) key because slot ids can differ between
+    // the forward and backward dispatch runs.
     int* fwd_slot_map;                  // [max_total_recv_tokens * num_topk] (recv_token,topk_slot) -> forward slot, -1 if none
     bool owns_fwd_slot_map;
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
@@ -377,7 +348,7 @@ struct MegaKernelState {
     int* rdma_reuse_prelude_done;         // state-owned [1] gate: leader sets, others wait
     int rdma_reuse_prelude_enable;        // 1 = run combine RDMA-reuse prelude (forward only)
 
-    // --- Publish offload (dispatch->compute bridge), Stage 1: backing state only ---
+    // --- Publish offload (dispatch->compute bridge) ---
     // receiver copies token data + stashes topk/meta into pending_* (indexed by
     // recv_token_idx, overwrite-safe), then pushes recv_token_idx into its SPSC ring.
     // publisher warp consumes, does the slot alloc / metadata writes / ready publish.
@@ -406,94 +377,6 @@ struct MegaKernelState {
     int transient_arena_chunk_count;
 
 };
-
-__device__ __forceinline__ bool mk_debug_bad_float(float v) {
-    return v != v || v > 3.402823466e38f || v < -3.402823466e38f;
-}
-
-__device__ __forceinline__ bool mk_debug_check_bf16_matrix(
-    const char* stage,
-    const __nv_bfloat16* buf,
-    int rows,
-    int cols,
-    int stride,
-    int rank,
-    int sm_id,
-    int block_id,
-    int group_id,
-    int group_sm_idx,
-    int task_idx,
-    int expert_id) {
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            float v = __bfloat162float(buf[(int64_t)row * stride + col]);
-            if (mk_debug_bad_float(v)) {
-                printf("[MK-NAN][%s] rank=%d block=%d sm=%d group=%d gsm=%d task=%d expert=%d row=%d col=%d v=%f\n",
-                       stage, rank, block_id, sm_id, group_id, group_sm_idx, task_idx, expert_id, row, col, v);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-__device__ __forceinline__ bool mk_debug_check_float_vector(
-    const char* stage,
-    const float* buf,
-    int count,
-    int rank,
-    int sm_id,
-    int block_id,
-    int group_id,
-    int group_sm_idx,
-    int task_idx,
-    int expert_id) {
-    for (int i = 0; i < count; ++i) {
-        float v = buf[i];
-        if (mk_debug_bad_float(v)) {
-            printf("[MK-NAN][%s] rank=%d block=%d sm=%d group=%d gsm=%d task=%d expert=%d idx=%d v=%f\n",
-                   stage, rank, block_id, sm_id, group_id, group_sm_idx, task_idx, expert_id, i, v);
-            return true;
-        }
-    }
-    return false;
-}
-
-// ============================================================================
-// (WMMA compute helpers removed; UMMA/tcgen05 is the only compute path.)
-// ============================================================================
-
-
-// ============================================================================
-// Dispatch Worker v2: Complete copy of DeepEP internode.cu dispatch function
-// as a __device__ function. Uses even/odd SM pattern from DeepEP:
-//   - Even SM (is_forwarder): kRDMAAndNVLForwarder + kForwarderCoordinator warps
-//   - Odd SM (!is_forwarder): kRDMASender + kRDMASenderCoordinator + kNVLReceivers
-//
-// Template params instantiated for MK-v7:
-//   kLowLatencyMode=false, kCachedMode=false,
-//   kNumTMABytesPerWarp=16384, kNumDispatchRDMASenderWarps=7.
-//   kNumRDMARanks is selected at launch by SWITCH_RDMA_RANKS.
-//
-// Only difference from DeepEP: In NVLReceivers section, after copying token
-// data to recv_x, we also route tokens to expert storage + signal compute SMs.
-// ============================================================================
-
-// Map an absolute per-expert slot index back to its local expert id via the
-// expert_slot_base / expert_count arrays. Replaces the legacy `slot / max_tpe`
-// division so it stays correct once the layout switches from fixed stride
-// (base[e]=e*max_tpe) to a real exclusive-prefix-sum (variable stride).
-// num_local_experts is small (e.g. 16), so a linear scan is cheap and only runs
-// in scheduler warps, not the per-element compute loops.
-__device__ __forceinline__ int mk_slot_to_local_expert(const MegaKernelState* state, int slot) {
-    const int ne = state->num_local_experts;
-    for (int e = 0; e < ne; ++e) {
-        const int base = state->expert_slot_base[e];
-        if (slot >= base && slot < base + state->expert_count[e])
-            return e;
-    }
-    return ne - 1;  // fallback; should not happen for a valid allocated slot
-}
 
 // Instantiated template constants
 constexpr int kNumDispatchRDMASenderWarps = 7;
@@ -590,7 +473,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
     return num_hits;
 }
 
-__device__ void publish_worker_v2(int dispatch_sm_idx, int src_nvl_rank, MegaKernelState* state) {
+__device__ void publish_worker(int dispatch_sm_idx, int src_nvl_rank, MegaKernelState* state) {
     const int lane_id = get_lane_id();
     const int pw = get_publish_warp_index(dispatch_sm_idx, src_nvl_rank);
     const int local_expert_begin = state->rank * state->num_local_experts;
@@ -700,7 +583,7 @@ __device__ __forceinline__ void combine_precompute_backward_worker(
     }
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType, bool kDispatchBackwardCompute = false>
-__device__ void dispatch_worker_v2(
+__device__ void dispatch_worker(
     int sm_id,
     int dispatch_sm_idx,  // 0-based index among all dispatch SMs
     MegaKernelState* state,
@@ -723,10 +606,6 @@ __device__ void dispatch_worker_v2(
     const auto rdma_rank = state->rank / NUM_MAX_NVL_PEERS, nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
     const auto num_ranks = state->num_ranks;
 
-    // if (threadIdx.x == 0 && dispatch_sm_idx == 0) {
-    //     printf("rank: %d, sm_id: %d, dispatch_sm_idx: %d num_channels: %d num_logical_channels: %d \n", state->rank, sm_id, dispatch_sm_idx, num_channels, num_logical_channels);
-    // }
-
     constexpr int kDispatchWorkerWarps = kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS;
     EP_DEVICE_ASSERT(num_warps >= kDispatchWorkerWarps);
     EP_DEVICE_ASSERT(num_warps >= kDispatchWorkerWarps + NUM_MAX_NVL_PEERS);
@@ -736,7 +615,7 @@ __device__ void dispatch_worker_v2(
         const int publisher_slot = warp_id - kDispatchWorkerWarps;
         const int paired_receiver_warp = kNumDispatchRDMASenderWarps + 1 + publisher_slot;
         const int src_nvl_rank = (paired_receiver_warp + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS;
-        publish_worker_v2(dispatch_sm_idx, src_nvl_rank, state);
+        publish_worker(dispatch_sm_idx, src_nvl_rank, state);
     }
     const bool dispatch_thread_active = warp_id < kDispatchWorkerWarps;
     if (dispatch_thread_active) {
@@ -817,11 +696,9 @@ __device__ void dispatch_worker_v2(
     void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
     int rs_wr_rank = 0, ws_rr_rank = 0;
     if (warp_role == WarpRole::kRDMAAndNVLForwarder)
-        // printf("enter v0 role\n");
         rs_wr_buffer_ptr = state->buffer_ptrs[nvl_rank], ws_rr_buffer_ptr = state->buffer_ptrs[target_rank],
         rs_wr_rank = nvl_rank, ws_rr_rank = target_rank;
     if (warp_role == WarpRole::kNVLReceivers)
-        // printf("enter v1 role\n");
         rs_wr_buffer_ptr = state->buffer_ptrs[target_rank], ws_rr_buffer_ptr = state->buffer_ptrs[nvl_rank],
         rs_wr_rank = target_rank, ws_rr_rank = nvl_rank;
 
@@ -836,7 +713,6 @@ __device__ void dispatch_worker_v2(
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
     uint32_t tma_phase = 0;
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
-        // printf("enter v2 role\n");
         mbarrier_init(tma_mbarrier, 1);
         fence_barrier_init();
         EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
@@ -901,7 +777,6 @@ __device__ void dispatch_worker_v2(
         receiver_cached_channel_tail_idx = 0;
     // ========== kRDMASender ==========
     if (warp_role == WarpRole::kRDMASender) {
-        // printf("enter v3 role\n");
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens, num_logical_channels, logical_channel_id, token_start_idx, token_end_idx);
 
@@ -947,7 +822,6 @@ __device__ void dispatch_worker_v2(
         auto& global_rdma_tail_idx = sender_global_rdma_tail_idx;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
-            // printf("sender: token_idx: %ld\n", token_idx);
             uint64_t is_token_in_rank_uint64 = 0;
             if (lane_id < kNumRDMARanks) {
                 is_token_in_rank_uint64 =
@@ -1063,7 +937,6 @@ __device__ void dispatch_worker_v2(
 
     // ========== kRDMASenderCoordinator ==========
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
-        // printf("enter v4 role\n");
         EP_DEVICE_ASSERT(num_max_rdma_chunked_recv_tokens % num_max_rdma_chunked_send_tokens == 0);
 
         // Each logical channel owns an independent RDMA queue, so reset CTA-local
@@ -1081,7 +954,6 @@ __device__ void dispatch_worker_v2(
                 num_tokens_to_send -= rdma_channel_prefix_matrix[lane_id * num_logical_channels + logical_channel_id - 1];
         }
 
-        // printf("RdmaSenderCoordinator: num_tokens_to_send: %lld\n", num_tokens_to_send);
 
         auto& last_issued_tail = coordinator_last_issued_tail;
         auto start_time = clock64();
@@ -1138,7 +1010,6 @@ __device__ void dispatch_worker_v2(
 
     // ========== kRDMAAndNVLForwarder ==========
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
-        // printf("enter v5 role\n");
         const auto dst_nvl_rank = target_rank;
 
         // Wait counters to arrive
@@ -1163,13 +1034,9 @@ __device__ void dispatch_worker_v2(
                     src_rdma_channel_prefix = -meta_2 - 1;
                     auto src_rdma_channel_prefix_1 = -meta_3 - 1;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
-                    // if (blockIdx.x == 16 && lane_id == 0) {
-                    // printf("lane_id: %d, src_rdma_channel_prefix: %d, src_rdma_channel_prefix_1: %d, num_tokens_to_recv_from_rdma: %d num_channels: %d channel_id: %d\n", lane_id, src_rdma_channel_prefix, src_rdma_channel_prefix_1, num_tokens_to_recv_from_rdma, num_channels, channel_id);
-                    // }
                     recv_rdma_channel_prefix_matrix[lane_id * num_logical_channels + logical_channel_id] = src_rdma_channel_prefix_1;
                     // Save per-logical-channel token count (non-cumulative) for diagnostics and bounds checks.
                     state->recv_rdma_channel_token_count[lane_id * num_logical_channels + logical_channel_id] = num_tokens_to_recv_from_rdma;
-                    // __threadfence_system();
                     // Match original DeepEP's combine-head namespace inside this logical channel:
                     // rank prefix + cumulative channel prefix, with the outer allocation already sliced by logical_channel_id.
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
@@ -1299,7 +1166,6 @@ __device__ void dispatch_worker_v2(
 
     // ========== kForwarderCoordinator ==========
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
-        // printf("enter v6 role\n");
 
         if (target_rank == 0) {
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
@@ -1337,7 +1203,6 @@ __device__ void dispatch_worker_v2(
 
     // ========== kNVLReceivers ==========
     } else {
-        // printf("enter v7 role\n");
         int src_nvl_rank = target_rank, total_offset = 0;
         const int local_expert_begin = state->rank * (num_experts / num_ranks);
 
@@ -1388,7 +1253,6 @@ __device__ void dispatch_worker_v2(
         }
         __syncwarp();
 
-        // printf("NVLReceivers: num_tokens_to_recv: %d\n", num_tokens_to_recv);
 
         auto& cached_channel_head_idx = receiver_cached_channel_head_idx;
         auto& cached_channel_tail_idx = receiver_cached_channel_tail_idx;
@@ -2078,9 +1942,7 @@ __device__ __forceinline__ void compute_worker_core(
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
-            // Phase 3 (Step 3.3a): record (recv_token, topk_slot) -> compact forward slot,
-            // and repurpose s_topk_slot to carry that compact slot so the preact epilogue
-            // (called with num_topk=0) writes bwd_preact by slot: (recv*0 + slot)*stride = slot*stride.
+            // Record the compact forward slot and use it to index bwd_preact.
             // fwd_slot_map[recv,topk] -> compact forward slot is the same value on every
             // SM of the group (base_offset depends only on the task, not the SM). Only one
             // SM needs to write it — guarding to group_sm_idx==0 removes 47/48 redundant,
@@ -2276,7 +2138,7 @@ __device__ __forceinline__ void compute_worker(
 // ============================================================================
 
 template <int kNumRDMARanks, int kStage>
-__device__ void combine_worker_v2(
+__device__ void combine_worker(
     int combine_sm_idx,       // 0-based index among combine SMs
     MegaKernelState* state
 ) {
@@ -2293,22 +2155,12 @@ __device__ void combine_worker_v2(
     constexpr int kNumRDMARanks_C = kNumRDMARanks;
     const int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
 
-    // if (threadIdx.x == 0 && combine_sm_idx == 0) {
-    //     printf("rank: %d, combine_sm_idx: %d num_channels: %d num_logical_channels: %d \n", state->rank, combine_sm_idx, num_channels, num_logical_channels);
-    // }
-
     // ---- Overlap design (v2: per-channel compute-combine overlap) ----
     // Per-channel pipeline: dispatch(ch) -> normalize(ch) -> combine(ch)
     // Sender SM (even): warp0 does head normalization after channel's dispatch is done,
     //                   then signals channel_normalized. All warps then proceed.
     // Forwarder SM (odd): waits channel_normalized, then uses normalized heads.
 
-    // DEBUG: very first entry point (unconditional, one per SM)
-    // if (threadIdx.x == 0)
-    //     printf("[MK-DEBUG][COMBINE-ENTRY] rank=%d block=%d combine_sm=%d is_forwarder_sm=%d\n",
-    //            state->rank, blockIdx.x, combine_sm_idx, combine_sm_idx % 2 == 1);
-
-    // Compute is currently a placeholder; combine consumes dispatch-filled compact input.
 
     // --- DeepEP combine kernel logic begins (direct port from internode.cu L1741-2269) ---
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
@@ -2491,13 +2343,6 @@ __device__ void combine_worker_v2(
     int combine_coordinator_last_rdma_head = 0;
     int combine_coordinator_last_nvl_head[kNumRDMARanks_C] = {0};
     uint32_t combine_forwarder_tma_phase[kCombineNumTMAStages] = {0};
-    // if (thread_id == 0)
-    //     printf("[MK-DBG][COMBINE][logical-loop-enter] rank=%d block=%d sm=%d combine_sm=%d physical_ch=%d logical_ch=%d is_forwarder_sm=%d dispatch_done=%d normalized=%d barrier=%d\n",
-    //            state->rank, static_cast<int>(blockIdx.x), sm_id, combine_sm_idx, channel_id, logical_channel_id,
-    //            is_forwarder_sm, ld_acquire_sys_global(&state->channel_dispatch_done[logical_channel_id]),
-    //            ld_acquire_sys_global(&state->channel_normalized[logical_channel_id]),
-    //            ld_acquire_sys_global(&state->combine_channel_barrier[logical_channel_id]));
-
     // --- Per-logical-channel head normalization (done by Coordinator on Sender SM) ---
 
     // All warps on this SM wait for channel_normalized[channel_id] before proceeding
@@ -2505,9 +2350,6 @@ __device__ void combine_worker_v2(
     if (!is_forwarder_sm && warp_role == WarpRole::kCoordinator) {
         // Step 1: Wait for this channel's dispatch to complete
         if (lane_id == 0) {
-            // printf("[MK-DBG][COMBINE][normalizer-dispatch-wait] rank=%d block=%d physical_ch=%d logical_ch=%d channel_done=%d need=%d\n",
-            //        state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
-            //        ld_acquire_sys_global(&state->channel_dispatch_done[logical_channel_id]), NUM_MAX_NVL_PEERS);
             auto start_time = clock64();
             while (ld_acquire_sys_global(&state->channel_dispatch_done[logical_channel_id]) < NUM_MAX_NVL_PEERS) {
                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
@@ -2623,10 +2465,6 @@ __device__ void combine_worker_v2(
         __threadfence_system();
         if (lane_id == 0) {
             st_release_sys_global(&state->channel_normalized[logical_channel_id], 1);
-            // printf("[MK-DBG][COMBINE][normalizer-done] rank=%d block=%d physical_ch=%d logical_ch=%d rdma_prefix0=%d gbl_prefix0=%d\n",
-            //        state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
-            //        rdma_channel_prefix_matrix[logical_channel_id],
-            //        gbl_channel_prefix_matrix[logical_channel_id]);
         }
     }
 
@@ -2767,12 +2605,6 @@ __device__ void combine_worker_v2(
                     dst_slot_idx = __shfl_sync(0xffffffff, dst_slot_idx, current_rdma_idx);
 
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
-                    // if (lane_id == 0) {
-                    //     printf("[MK-TRACE][COMBINE][NVL-SENDER][SEND] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d dst_nvl_rank=%d current_rdma_idx=%d token=%lld dst_slot=%d shifted_buffer=%p src_meta_addr=%p topk_weights_addr=%p tma_buffer=%p hidden_int4=%d num_topk=%d\n",
-                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, dst_nvl_rank, current_rdma_idx,
-                    //            (long long)token_idx, dst_slot_idx, shifted_x_buffers, src_meta + token_idx,
-                    //            topk_weights + token_idx * num_topk, tma_buffer, hidden_int4, num_topk);
-                    // }
                     tma_store_wait<0>();
                     // Gather-ready means combine_input already contains the same-rank output:
                     // compute writes nhits==1 tokens directly, gather_worker reduces nhits>1 tokens.
@@ -2835,11 +2667,6 @@ __device__ void combine_worker_v2(
             }
         }
     } else {
-        // if (threadIdx.x == 0) {
-        //     printf("[MK-DEBUG][FWD-ENTER] rank=%d nvl_rank=%d block=%d combine_sm=%d\n",
-        //                state->rank, nvl_rank, blockIdx.x, sm_id);
-        // }
-
         // ========== Forwarder SM: NVLAndRDMAForwarder + RDMAReceiver + Coordinator ==========
         // (direct port from internode.cu L1923-2269)
 
@@ -2998,13 +2825,6 @@ __device__ void combine_worker_v2(
                     // Combine current token
                     auto rdma_slot_idx = token_idx % num_max_rdma_chunked_recv_tokens;
                     void* shifted = send_buffer + rdma_slot_idx * num_bytes_per_token;
-                    // if (lane_id == 0) {
-                    //     int global_token_idx = num_tokens_prefix + token_idx;
-                    //     printf("[MK-TRACE][COMBINE][FWD][COMBINE-START] rank=%d rdma_rank=%d nvl_rank=%d block=%d combine_sm=%d channel=%d warp=%d dst_rdma_rank=%d sub_warp=%d local_token=%d global_token=%d rdma_slot=%d shifted=%p send_buffer=%p num_bytes_per_token=%d hidden_int4=%d hidden_bytes=%d num_topk=%d\n",
-                    //            state->rank, rdma_rank, nvl_rank, blockIdx.x, sm_id, channel_id, warp_id,
-                    //            dst_rdma_rank, sub_warp_id, token_idx, global_token_idx, (int)rdma_slot_idx,
-                    //            shifted, send_buffer, (int)num_bytes_per_token, (int)hidden_int4, (int)hidden_bytes, num_topk);
-                    // }
                     auto get_addr_fn = [&](int src_nvl_rank, int slot_idx, int hidden_int4_idx) -> int4* {
                         return reinterpret_cast<int4*>(nvl_channel_x.buffer(src_nvl_rank) + slot_idx * num_bytes_per_token) +
                             hidden_int4_idx;
@@ -3234,11 +3054,6 @@ __device__ void combine_worker_v2(
         }
     }
     __syncthreads();
-    // if (thread_id == 0)
-    //     printf("[MK-DBG][COMBINE][after-logical-barrier] rank=%d block=%d physical_ch=%d logical_ch=%d barrier=%d\n",
-    //            state->rank, static_cast<int>(blockIdx.x), channel_id, logical_channel_id,
-    //            ld_acquire_sys_global(&state->combine_channel_barrier[logical_channel_id]));
-
     }
 
     __syncthreads();
@@ -3430,24 +3245,13 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
 // ============================================================================
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
-__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) moe_megakernel_v7(
+__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) gigamoe_fused_forward_kernel(
     MegaKernelState* state
 ) {
     const int sm_id = blockIdx.x;
     const int num_dispatch_sms = state->num_dispatch_sms;
     const int num_combine_sms = state->num_combine_sms;
     const int num_compute_sms = state->num_compute_sms;
-
-    // if (threadIdx.x == 0) {
-    //     int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
-    //     int nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
-    //     printf("[MK-TRACE][KERNEL][ENTRY] block=%d blocks=%d rank=%d rdma_rank=%d nvl_rank=%d dispatch_sms=%d combine_sms=%d compute_sms=%d num_tokens=%d num_topk=%d hidden_dim=%d intermediate_dim=%d num_experts=%d num_local_experts=%d max_tokens_per_expert=%d expected_dispatch_done=%d state=%p rdma_buffer=%p combine_rdma_buffer=%p buffer_ptrs=%p combine_buffer_ptrs=%p\n",
-    //            sm_id, gridDim.x, state->rank, rdma_rank, nvl_rank, num_dispatch_sms, num_combine_sms, num_compute_sms,
-    //            state->num_tokens, state->num_topk, state->hidden_dim, state->intermediate_dim,
-    //            state->num_experts, state->num_local_experts, state->max_tokens_per_expert,
-    //            state, state->rdma_buffer_ptr, state->combine_rdma_buffer_ptr,
-    //            state->buffer_ptrs, state->combine_buffer_ptrs);
-    // }
 
     // Role-specific workers reuse the single dynamic shared-memory allocation.
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -3479,12 +3283,12 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     switch (role) {
         case SmRole::kDispatch:
-            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType, false>(sm_id, role_idx, state);
+            dispatch_worker<kNumRDMARanks, kStage, kComputeDType, false>(sm_id, role_idx, state);
             break;
 
         case SmRole::kCombine:
             combine_precompute_worker<kComputeDType>(sm_id, role_idx, num_combine_sms, state, smem_buffer);
-            combine_worker_v2<kNumRDMARanks, kStage>(role_idx, state);
+            combine_worker<kNumRDMARanks, kStage>(role_idx, state);
             break;
 
         case SmRole::kScheduler:
@@ -3512,7 +3316,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
-static void launch_megakernel_v7_case(
+static void launch_gigamoe_fused_forward_case(
     MegaKernelState* device_state,
     const MegaKernelState& host_state,
     int total_sms,
@@ -3523,13 +3327,10 @@ static void launch_megakernel_v7_case(
     constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
     const int num_ranks = host_state.num_ranks;
 
-    // printf("[MK-HOST][LAUNCH] device_state=%p total_sms=%d num_ranks=%d kNumRDMARanks=%d stage=%d compute_dtype=%d block_threads=%d smem_size=%d stream=%p\n",
-        //    device_state, total_sms, num_ranks, kNumRDMARanks, kStage, static_cast<int>(kComputeDType), kThreads, smem_size, stream);
     if (smem_size > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7<kNumRDMARanks, kStage, kComputeDType>,
+        CUDA_CHECK(cudaFuncSetAttribute(gigamoe_fused_forward_kernel<kNumRDMARanks, kStage, kComputeDType>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
-        // printf("[MK-HOST][LAUNCH] set dynamic smem attribute=%d\n", smem_size);
     }
 
     constexpr int num_gather_sms = GATHER_SMS;
@@ -3555,15 +3356,15 @@ static void launch_megakernel_v7_case(
     attr[1].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 2;
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe_megakernel_v7<kNumRDMARanks, kStage, kComputeDType>, device_state));
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, gigamoe_fused_forward_kernel<kNumRDMARanks, kStage, kComputeDType>, device_state));
 #else
-    moe_megakernel_v7<kNumRDMARanks, kStage, kComputeDType><<<launch_total_sms, kThreads, smem_size, stream>>>(device_state);
+    gigamoe_fused_forward_kernel<kNumRDMARanks, kStage, kComputeDType><<<launch_total_sms, kThreads, smem_size, stream>>>(device_state);
 #endif
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void launch_megakernel_v7(
+void launch_gigamoe_fused_forward_impl(
     MegaKernelState* device_state,
     const MegaKernelState* host_state,
     int total_sms,
@@ -3584,7 +3385,7 @@ void launch_megakernel_v7(
                    "megakernel forward currently supports BF16 only");
 
 #define MEGAKERNEL_LAUNCH_STAGE_CASE(kNumRDMARanks, kStage, kComputeDType) \
-    launch_megakernel_v7_case<kNumRDMARanks, kStage, kComputeDType>(device_state, *launcher_host_state, total_sms, smem_size, stream); \
+    launch_gigamoe_fused_forward_case<kNumRDMARanks, kStage, kComputeDType>(device_state, *launcher_host_state, total_sms, smem_size, stream); \
     break
 
 #define MEGAKERNEL_LAUNCH_CASE_WITH_DTYPE(kNumRDMARanks, kComputeDType) \
@@ -3611,15 +3412,13 @@ void launch_megakernel_v7(
 }
 
 
-// Step 1 optimization from .v0: use PyTorch's CUDA caching allocator for long-lived
-// megakernel state buffers, and batch host-side memset initialization into one
-// stream-ordered kernel. This should not change math or kernel scheduling.
-static inline cudaError_t mk_caching_alloc(void** pp, size_t nbytes) {
+// Use PyTorch's CUDA caching allocator for long-lived fused-kernel state buffers.
+static inline cudaError_t gigamoe_caching_alloc(void** pp, size_t nbytes) {
     *pp = (nbytes == 0) ? nullptr : c10::cuda::CUDACachingAllocator::raw_alloc(nbytes);
     return cudaSuccess;
 }
 
-static inline cudaError_t mk_caching_free(void* ptr) {
+static inline cudaError_t gigamoe_caching_free(void* ptr) {
     if (ptr != nullptr)
         c10::cuda::CUDACachingAllocator::raw_delete(ptr);
     return cudaSuccess;
@@ -3726,7 +3525,7 @@ struct MegakernelArenaAllocator {
                 return cudaErrorMemoryAllocation;
             const size_t chunk_bytes = align_up(std::max(nbytes, kMegakernelArenaChunkBytes), kAlign);
             void* chunk = nullptr;
-            cudaError_t err = mk_caching_alloc(&chunk, chunk_bytes);
+            cudaError_t err = gigamoe_caching_alloc(&chunk, chunk_bytes);
             if (err != cudaSuccess)
                 return err;
             chunks.push_back(chunk);
@@ -3753,7 +3552,7 @@ static inline void store_arena_chunks(const MegakernelArenaAllocator& arena, voi
 static inline cudaError_t free_arena_chunks(void** chunks, int count) {
     for (int i = 0; i < count; ++i) {
         if (chunks[i] != nullptr) {
-            cudaError_t err = mk_caching_free(chunks[i]);
+            cudaError_t err = gigamoe_caching_free(chunks[i]);
             if (err != cudaSuccess)
                 return err;
             chunks[i] = nullptr;
@@ -3845,17 +3644,17 @@ MegaKernelState* allocate_megakernel_state_v7(
     MegakernelArenaAllocator transient_arena;
     MegakernelArenaAllocator* arena = &persistent_arena;
 #define cudaMalloc(pp, n) arena->alloc(reinterpret_cast<void**>(pp), (n))
-    auto mk_cache_alloc = [](auto** pp, size_t nbytes) -> cudaError_t {
-        return mk_caching_alloc(reinterpret_cast<void**>(pp), nbytes);
+    auto cache_alloc = [](auto** pp, size_t nbytes) -> cudaError_t {
+        return gigamoe_caching_alloc(reinterpret_cast<void**>(pp), nbytes);
     };
     struct MkFillRec { void* ptr; int byte_value; size_t bytes; };
     std::vector<MkFillRec> mk_fill_recs;
-    auto mk_record_fill = [&](void* ptr, int byte_value, size_t bytes) -> cudaError_t {
+    auto record_deferred_fill = [&](void* ptr, int byte_value, size_t bytes) -> cudaError_t {
         if (bytes != 0)
             mk_fill_recs.push_back({ptr, byte_value, bytes});
         return cudaSuccess;
     };
-#define cudaMemset(p, v, n) mk_record_fill((p), (v), (n))
+#define cudaMemset(p, v, n) record_deferred_fill((p), (v), (n))
 
     // Allocate workspace buffers on device
     int* expert_recv_count;
@@ -4079,8 +3878,7 @@ MegaKernelState* allocate_megakernel_state_v7(
     CUDA_CHECK(cudaMemset(combine_done_count, 0, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&combine_all_done, sizeof(int)));
     CUDA_CHECK(cudaMemset(combine_all_done, 0, sizeof(int)));
-    // Publish-offload backing state (Stage 1: allocate + zero only, no consumer yet).
-    // num_pub_warps_total = one publisher per NVL receiver warp per receiver SM.
+    // One publisher per NVL receiver warp per receiver SM.
     const int num_pub_warps_total = (num_dispatch_sms / 2) * NUM_MAX_NVL_PEERS;
     int* pending_topk_idx;
     float* pending_topk_weights;
@@ -4150,10 +3948,7 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMalloc(&bwd_fc1_input, bwd_fc1_input_bytes));
         CUDA_CHECK(cudaMemset(bwd_fc1_input, 0, bwd_fc1_input_bytes));
     }
-    // Phase 3 (Step 3.3b): compact preact storage. bwd_preact is now indexed by the compact
-    // forward slot (Step 3.3a), so it only needs total_expert_slots (= Σ expert_count = S) rows
-    // instead of the max_total_recv_tokens * num_topk (= R*K) sparse upper bound. Written per-row
-    // by slot (no batched TMA tile over preact), so no padding is required.
+    // bwd_preact is indexed by compact forward slot and needs total_expert_slots rows.
     __nv_bfloat16* bwd_preact = external_bwd_preact;
     const bool owns_bwd_preact = bwd_preact == nullptr;
     const size_t bwd_preact_bytes = (size_t)total_expert_slots * 2 * intermediate_dim * sizeof(__nv_bfloat16);
@@ -4161,9 +3956,7 @@ MegaKernelState* allocate_megakernel_state_v7(
         CUDA_CHECK(cudaMalloc(&bwd_preact, bwd_preact_bytes));
         CUDA_CHECK(cudaMemset(bwd_preact, 0, bwd_preact_bytes));
     }
-    // Phase 3 (A2) scaffolding: (recv_token, topk_slot) -> forward slot translation table.
-    // Init to -1; populated by the forward compute worker (Step 3.2), consumed by backward
-    // (Step 3.3a). Not read/written yet at this step.
+    // Maps (recv_token, topk_slot) to the forward slot; initialized to -1.
     int* fwd_slot_map = external_fwd_slot_map;
     const bool owns_fwd_slot_map = fwd_slot_map == nullptr;
     const size_t fwd_slot_map_bytes = (size_t)max_total_recv_tokens * num_topk * sizeof(int);
@@ -4241,7 +4034,7 @@ MegaKernelState* allocate_megakernel_state_v7(
             umma::ComputeTmaAtoms h_atoms;
             umma::build_compute_tma_atoms(h_atoms, W_gateup, num_local_experts,
                                           intermediate_dim, hidden_dim);
-            CUDA_CHECK(mk_cache_alloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
+            CUDA_CHECK(cache_alloc(&d_compute_tma, sizeof(umma::ComputeTmaAtoms)));
             CUDA_CHECK(cudaMemcpy(d_compute_tma, &h_atoms, sizeof(umma::ComputeTmaAtoms), cudaMemcpyHostToDevice));
 
             std::vector<umma::InputTmaAtom_t> h_in;
@@ -4255,13 +4048,13 @@ MegaKernelState* allocate_megakernel_state_v7(
                                                             compute_batch_size, hidden_dim,
                                                             intermediate_dim, hidden_dim));
             }
-            CUDA_CHECK(mk_cache_alloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
+            CUDA_CHECK(cache_alloc(&d_group_input_tma, num_compute_groups * sizeof(umma::InputTmaAtom_t)));
             CUDA_CHECK(cudaMemcpy(d_group_input_tma, h_in.data(),
                                   num_compute_groups * sizeof(umma::InputTmaAtom_t), cudaMemcpyHostToDevice));
 
             umma::ComputeDownTmaAtoms h_down;
             umma::build_compute_down_tma_atoms(h_down, W_down, num_local_experts, hidden_dim, intermediate_dim);
-            CUDA_CHECK(mk_cache_alloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
+            CUDA_CHECK(cache_alloc(&d_compute_down_tma, sizeof(umma::ComputeDownTmaAtoms)));
             CUDA_CHECK(cudaMemcpy(d_compute_down_tma, &h_down, sizeof(umma::ComputeDownTmaAtoms), cudaMemcpyHostToDevice));
         }
 
@@ -4269,9 +4062,9 @@ MegaKernelState* allocate_megakernel_state_v7(
         // the kernel that used them completed before this slot can be reused.
         TmaCacheEntry& slot = s_tma_cache[s_tma_cache_next];
         if (slot.valid) {
-            if (slot.compute_tma) mk_caching_free(slot.compute_tma);
-            if (slot.group_input_tma) mk_caching_free(slot.group_input_tma);
-            if (slot.compute_down_tma) mk_caching_free(slot.compute_down_tma);
+            if (slot.compute_tma) gigamoe_caching_free(slot.compute_tma);
+            if (slot.group_input_tma) gigamoe_caching_free(slot.group_input_tma);
+            if (slot.compute_down_tma) gigamoe_caching_free(slot.compute_down_tma);
         }
         slot.key = cur_key;
         slot.valid = true;
@@ -4302,9 +4095,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     int num_combine_channels = num_combine_sms / 2;
     EP_HOST_ASSERT(num_combine_channels == num_physical_channels);
     EP_HOST_ASSERT(num_logical_channels >= num_physical_channels);
-
-    // printf("num_tokens: %d, um_rdma_ranks: %d, num_physical_channels: %d, num_logical_channels: %d\n",
-    //        num_tokens, kNumRDMARanks, num_physical_channels, num_logical_channels);
 
     // Per-logical-channel overlap signaling
     int* channel_dispatch_done;
@@ -4437,7 +4227,6 @@ MegaKernelState* allocate_megakernel_state_v7(
     host_state.combine_done_count = combine_done_count;
     host_state.combine_all_done = combine_all_done;
 
-    // Publish-offload backing state (Stage 1)
     host_state.pending_topk_idx = pending_topk_idx;
     host_state.pending_topk_weights = pending_topk_weights;
     host_state.pending_meta = pending_meta;
@@ -4651,7 +4440,7 @@ MegaKernelState* allocate_megakernel_state_v7(
 }
 
 void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelState* cached_host_state) {
-#define cudaFree(p) mk_caching_free(p)
+#define cudaFree(p) gigamoe_caching_free(p)
     MegaKernelState host_state_copy;
     MegaKernelState* hs = &host_state_copy;
     if (cached_host_state != nullptr) {
@@ -4759,7 +4548,7 @@ void free_megakernel_state_v7(MegaKernelState* device_state, const MegaKernelSta
 // state (see allocate_megakernel_backward_state). None of the buffers freed here are read
 // by the backward, so releasing them now removes them from the forward->backward resident
 // set. Each freed pointer is nulled so the eventual free_megakernel_state_v7 skips it
-// (mk_caching_free is null-safe), avoiding a double free.
+// (gigamoe_caching_free is null-safe), avoiding a double free.
 void free_megakernel_forward_transient(MegaKernelState* device_state) {
     if (device_state == nullptr)
         return;
@@ -4785,7 +4574,7 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
         return;
     }
     auto free_and_null = [](auto*& ptr) {
-        CUDA_CHECK(mk_caching_free(static_cast<void*>(ptr)));
+        CUDA_CHECK(gigamoe_caching_free(static_cast<void*>(ptr)));
         ptr = nullptr;
     };
     free_and_null(hs.recv_tokens);
@@ -4820,7 +4609,7 @@ void free_megakernel_forward_transient_from_host(MegaKernelState* host_state) {
     // Fallback: individually free each transient pointer from host snapshot.
     auto free_ptr = [](auto*& ptr) {
         if (ptr != nullptr) {
-            CUDA_CHECK(mk_caching_free(static_cast<void*>(ptr)));
+            CUDA_CHECK(gigamoe_caching_free(static_cast<void*>(ptr)));
             ptr = nullptr;
         }
     };
@@ -4894,7 +4683,7 @@ void launch_megakernel_debug_forward(
     ComputeDType compute_dtype,
     cudaStream_t stream
 ) {
-    launch_megakernel_v7(
+    launch_gigamoe_fused_forward_impl(
         device_state, host_state, total_sms, smem_size, stage, compute_dtype, stream);
 }
 
@@ -4957,24 +4746,24 @@ struct MegaKernelBackwardHostContext {
     std::vector<CUtensorMap> wgrad_dgu_a_tma;
 };
 
-__device__ __forceinline__ float mk_bwd_bf16_from_u32(uint32_t v, int lane) {
+__device__ __forceinline__ float fused_moe_bwd_bf16_from_u32(uint32_t v, int lane) {
     return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&v)[lane]);
 }
 
-__device__ __forceinline__ uint32_t mk_bwd_cvt_f32x2_bf16x2(float lo, float hi) {
+__device__ __forceinline__ uint32_t fused_moe_bwd_pack_bf16x2(float lo, float hi) {
     uint32_t out;
     asm volatile("cvt.rn.satfinite.bf16x2.f32 %0, %1, %2;\n"
                  : "=r"(out) : "f"(hi), "f"(lo));
     return out;
 }
 
-__device__ __forceinline__ void mk_bwd_dswiglu_pair2_side_f32x2(
+__device__ __forceinline__ void fused_moe_bwd_swiglu_pair2_f32x2(
     uint32_t gu0, uint32_t gu1, uint32_t grad01, float route,
     uint32_t& out0, uint32_t& out1, uint32_t& act01, float& route_grad
 ) {
-    float2 gate = {mk_bwd_bf16_from_u32(gu0, 0), mk_bwd_bf16_from_u32(gu1, 0)};
-    float2 up = {mk_bwd_bf16_from_u32(gu0, 1), mk_bwd_bf16_from_u32(gu1, 1)};
-    float2 grad_raw = {mk_bwd_bf16_from_u32(grad01, 0), mk_bwd_bf16_from_u32(grad01, 1)};
+    float2 gate = {fused_moe_bwd_bf16_from_u32(gu0, 0), fused_moe_bwd_bf16_from_u32(gu1, 0)};
+    float2 up = {fused_moe_bwd_bf16_from_u32(gu0, 1), fused_moe_bwd_bf16_from_u32(gu1, 1)};
+    float2 grad_raw = {fused_moe_bwd_bf16_from_u32(grad01, 0), fused_moe_bwd_bf16_from_u32(grad01, 1)};
     float2 grad = {grad_raw.x * route, grad_raw.y * route};
     float2 sig = {
         1.0f / (1.0f + __expf(-gate.x)),
@@ -4986,9 +4775,9 @@ __device__ __forceinline__ void mk_bwd_dswiglu_pair2_side_f32x2(
     cute::fma(sig_minus_silu_sig, silu, {-sig.x, -sig.y}, sig);
     cute::fma(d_silu_grad, sig_minus_silu_sig, grad, silu_grad);
     cute::mul(dgate, d_silu_grad, up);
-    out0 = mk_bwd_cvt_f32x2_bf16x2(dgate.x, silu_grad.x);
-    out1 = mk_bwd_cvt_f32x2_bf16x2(dgate.y, silu_grad.y);
-    act01 = mk_bwd_cvt_f32x2_bf16x2(route * activation.x, route * activation.y);
+    out0 = fused_moe_bwd_pack_bf16x2(dgate.x, silu_grad.x);
+    out1 = fused_moe_bwd_pack_bf16x2(dgate.y, silu_grad.y);
+    act01 = fused_moe_bwd_pack_bf16x2(route * activation.x, route * activation.y);
     route_grad += grad_raw.x * activation.x + grad_raw.y * activation.y;
 }
 
@@ -5161,20 +4950,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
         for (int i = thread_id; i < batch_size; i += blockDim.x) {
             int base_offset = state->expert_slot_base[expert_id] + start_slot + i;
             int recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
-            // while (__builtin_expect(recv_token < 0 || recv_token >= state->max_total_recv_tokens, 0)) {
-            //     __nanosleep(32);
-            //     recv_token = ld_acquire_global(&state->recv_token_source_info[base_offset * 2]);
-            // }
             int topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
-            // while (__builtin_expect(topk_slot < 0 || topk_slot >= state->num_topk, 0)) {
-                // __nanosleep(32);
-                // topk_slot = ld_acquire_global(&state->recv_token_source_info[base_offset * 2 + 1]);
-            // }
             int expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
-            // while (__builtin_expect(expected <= 0, 0)) {
-            //     __nanosleep(32);
-            //     expected = ld_acquire_global(&state->token_compute_expected[recv_token]);
-            // }
             s_recv_token_idx[i] = recv_token;
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
@@ -5254,9 +5031,8 @@ __device__ __forceinline__ void compute_backward_worker_core(
             const int slot = state->expert_slot_base[expert_id] + start_slot + m;
             const int recv_token_m = s_recv_token_idx[m];
             const int topk_slot_m = s_topk_slot[m];
-            // Saved-PreAct path: read gate/up straight from bs->bwd_preact, slot-major by
-            // the forward compact slot. Phase 3 (Step 3.3a): translate the cross-pass-stable
-            // (recv_token, topk_slot) to forward's compact preact slot via fwd_slot_map.
+            // Read saved gate/up values by translating the stable (recv_token, topk_slot)
+            // key to the compact forward slot.
             int fwd_preact_slot = state->fwd_slot_map[(int64_t)recv_token_m * num_topk + topk_slot_m];
             if (fwd_preact_slot < 0) fwd_preact_slot = 0;  // safety net; should not occur for a real hit
             const __nv_bfloat16* gu_src = bs->bwd_preact + (int64_t)fwd_preact_slot * twoI;
@@ -5270,10 +5046,10 @@ __device__ __forceinline__ void compute_backward_worker_core(
                     const int4 gu = gu4[q];
                     const int2 ga = ga4[q];
                     uint32_t o0, o1, o2, o3, a01, a23;
-                    mk_bwd_dswiglu_pair2_side_f32x2(
+                    fused_moe_bwd_swiglu_pair2_f32x2(
                         static_cast<uint32_t>(gu.x), static_cast<uint32_t>(gu.y),
                         static_cast<uint32_t>(ga.x), route, o0, o1, a01, route_grad);
-                    mk_bwd_dswiglu_pair2_side_f32x2(
+                    fused_moe_bwd_swiglu_pair2_f32x2(
                         static_cast<uint32_t>(gu.z), static_cast<uint32_t>(gu.w),
                         static_cast<uint32_t>(ga.y), route, o2, o3, a23, route_grad);
                     const int4 out = make_int4(static_cast<int>(o0), static_cast<int>(o1),
@@ -5399,11 +5175,11 @@ __device__ __forceinline__ void combine_precompute_backward_worker(
         bs, sm_id, combine_sm_idx, num_combine_sms, post_group_count, smem_buffer);
 }
 
-// Backward megakernel: same role layout as moe_megakernel_v7 (dispatch / combine /
+// Backward megakernel: same role layout as gigamoe_fused_forward_kernel (dispatch / combine /
 // scheduler / gather all reused verbatim on the patched bwd state); only the compute
 // role is swapped for compute_backward_worker.
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
-__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) moe_megakernel_v7_backward(
+__global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) gigamoe_fused_backward_kernel(
     MegaKernelBackwardState* bs
 ) {
     MegaKernelState* state = bs->bwd_device_state;
@@ -5438,11 +5214,11 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
     switch (role) {
         case SmRole::kDispatch:
-            dispatch_worker_v2<kNumRDMARanks, kStage, kComputeDType, true>(sm_id, role_idx, state, bs);
+            dispatch_worker<kNumRDMARanks, kStage, kComputeDType, true>(sm_id, role_idx, state, bs);
             break;
         case SmRole::kCombine:
             combine_precompute_backward_worker<kComputeDType>(bs, sm_id, role_idx, num_combine_sms, smem_buffer);
-            combine_worker_v2<kNumRDMARanks, kStage>(role_idx, state);
+            combine_worker<kNumRDMARanks, kStage>(role_idx, state);
             break;
         case SmRole::kScheduler:
             compute_scheduler_worker(state, role_idx, COMPUTE_SCHEDULER_SMS);
@@ -5516,7 +5292,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         umma::build_compute_backward_tma_atoms(
             host_ctx->compute_bwd_tma_atoms, fs.W_down, fs.W_gateup,
             num_local_experts, hidden, intermediate);
-        CUDA_CHECK(mk_caching_alloc(
+        CUDA_CHECK(gigamoe_caching_alloc(
             reinterpret_cast<void**>(&d_compute_bwd_tma), sizeof(umma::ComputeBackwardTmaAtoms)));
         CUDA_CHECK(cudaMemcpyAsync(d_compute_bwd_tma, &host_ctx->compute_bwd_tma_atoms,
                                    sizeof(umma::ComputeBackwardTmaAtoms),
@@ -5556,7 +5332,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         fs.rdma_reuse_dispatch_quiet_done,
         fs.rdma_reuse_combine_clear_done,
         1 /* rdma_reuse_prelude_enable: backward reuses the dispatch RDMA region too.
-             Backward shares dispatch_worker_v2 / combine_worker_v2, so the same
+             Backward shares dispatch_worker / combine_worker, so the same
              dispatch_channel_barrier==2 gate + quiet + phase-B protocol applies. */,
         fs.compute_batch_size,
         fs.combine_start_head_percent);
@@ -5598,7 +5374,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
         }
     }
     CUtensorMap* d_wgrad_dgu_a_tma = nullptr;
-    CUDA_CHECK(mk_caching_alloc(
+    CUDA_CHECK(gigamoe_caching_alloc(
         reinterpret_cast<void**>(&d_wgrad_dgu_a_tma),
         num_dgu_batch_tmas * sizeof(CUtensorMap)));
     CUDA_CHECK(cudaMemcpyAsync(d_wgrad_dgu_a_tma, host_ctx->wgrad_dgu_a_tma.data(),
@@ -5607,7 +5383,7 @@ MegaKernelBackwardState* allocate_megakernel_backward_state(
     hs.wgrad_dgu_a_tma = d_wgrad_dgu_a_tma;
 
     MegaKernelBackwardState* device_bs;
-    CUDA_CHECK(mk_caching_alloc(
+    CUDA_CHECK(gigamoe_caching_alloc(
         reinterpret_cast<void**>(&device_bs), sizeof(MegaKernelBackwardState)));
     CUDA_CHECK(cudaMemcpyAsync(device_bs, &hs, sizeof(MegaKernelBackwardState),
                                cudaMemcpyHostToDevice, stream));
@@ -5638,12 +5414,12 @@ void free_megakernel_backward_state(
         CUDA_CHECK(cudaMemcpy(&hs, device_bs, sizeof(MegaKernelBackwardState), cudaMemcpyDeviceToHost));
     }
     // wgrad_* buffers are borrowed from caller-owned Torch tensors.
-    CUDA_CHECK(mk_caching_free(hs.compute_bwd_tma));
-    CUDA_CHECK(mk_caching_free(hs.wgrad_dgu_a_tma));
+    CUDA_CHECK(gigamoe_caching_free(hs.compute_bwd_tma));
+    CUDA_CHECK(gigamoe_caching_free(hs.wgrad_dgu_a_tma));
     free_megakernel_state_v7(
         hs.bwd_device_state,
         host_context != nullptr ? &host_context->bwd_state : nullptr);
-    CUDA_CHECK(mk_caching_free(device_bs));
+    CUDA_CHECK(gigamoe_caching_free(device_bs));
 }
 
 void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_context) {
@@ -5652,7 +5428,7 @@ void free_megakernel_backward_host_context(MegaKernelBackwardHostContext* host_c
 
 // Establish the post-allocation state for every launch. Routing inputs, weights and the
 // saved forward activation are immutable across replay and are intentionally preserved.
-static void prepare_megakernel_communication_replay_host(
+static void prepare_gigamoe_backward_communication_replay_host(
     const MegaKernelState& hs,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
@@ -5687,7 +5463,7 @@ void prepare_megakernel_communication_replay(
 ) {
     MegaKernelState hs;
     CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
-    prepare_megakernel_communication_replay_host(
+    prepare_gigamoe_backward_communication_replay_host(
         hs, dispatch_barrier_signal_ptrs, combine_barrier_signal_ptrs, stream);
 }
 
@@ -5792,7 +5568,7 @@ static void reset_megakernel_post_notify_state(const MegaKernelState& hs, cudaSt
 }
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
-static void launch_megakernel_v7_backward_case(
+static void launch_gigamoe_fused_backward_case(
     MegaKernelBackwardState* device_bs,
     int total_sms,
     int smem_size,
@@ -5801,7 +5577,7 @@ static void launch_megakernel_v7_backward_case(
     using RdmaCfg = MegaKernelRdmaConfig<kNumRDMARanks>;
     constexpr int kThreads = RdmaCfg::kMegaKernelNumThreads;
     if (smem_size > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(moe_megakernel_v7_backward<kNumRDMARanks, kStage, kComputeDType>,
+        CUDA_CHECK(cudaFuncSetAttribute(gigamoe_fused_backward_kernel<kNumRDMARanks, kStage, kComputeDType>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     constexpr int num_gather_sms = GATHER_SMS;
@@ -5821,9 +5597,9 @@ static void launch_megakernel_v7_backward_case(
     attr[1].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 2;
-    CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe_megakernel_v7_backward<kNumRDMARanks, kStage, kComputeDType>, device_bs));
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, gigamoe_fused_backward_kernel<kNumRDMARanks, kStage, kComputeDType>, device_bs));
 #else
-    moe_megakernel_v7_backward<kNumRDMARanks, kStage, kComputeDType><<<launch_total_sms, kThreads, smem_size, stream>>>(device_bs);
+    gigamoe_fused_backward_kernel<kNumRDMARanks, kStage, kComputeDType><<<launch_total_sms, kThreads, smem_size, stream>>>(device_bs);
 #endif
     CUDA_CHECK(cudaGetLastError());
 }
@@ -5836,7 +5612,7 @@ void prepare_megakernel_backward_communication_replay(
 ) {
     EP_HOST_ASSERT(host_context != nullptr);
     EP_HOST_ASSERT(host_context->backward_state.bwd_device_state != nullptr);
-    prepare_megakernel_communication_replay_host(
+    prepare_gigamoe_backward_communication_replay_host(
         host_context->bwd_state, dispatch_barrier_signal_ptrs,
         combine_barrier_signal_ptrs, stream);
 }
@@ -5876,7 +5652,7 @@ void launch_megakernel_debug_backward(
     EP_HOST_ASSERT(active_total_sms > 0 && active_total_sms <= total_sms);
 
 #define MEGAKERNEL_BWD_STAGE_CASE(kNumRDMARanks, kStage, kComputeDType) \
-    launch_megakernel_v7_backward_case<kNumRDMARanks, kStage, kComputeDType>(backward_state, active_total_sms, smem_size, stream); \
+    launch_gigamoe_fused_backward_case<kNumRDMARanks, kStage, kComputeDType>(backward_state, active_total_sms, smem_size, stream); \
     break
 
 #define MEGAKERNEL_BWD_CASE_WITH_DTYPE(kNumRDMARanks, kComputeDType) \
