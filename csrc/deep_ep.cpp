@@ -1106,13 +1106,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto recv_gbl_rank_prefix_sum = torch::Tensor();
     std::vector<int> num_recv_tokens_per_expert_list;
 
-#if MK_PERF_TRACE_ENABLED
-    cudaEvent_t notify_start_ev, notify_end_ev;
-    AT_CUDA_CHECK(cudaEventCreate(&notify_start_ev));
-    AT_CUDA_CHECK(cudaEventCreate(&notify_end_ev));
-    AT_CUDA_CHECK(cudaEventRecord(notify_start_ev, comm_stream));
-#endif
-
     // Barrier or send sizes
     if (cached_mode) {
         num_recv_tokens = cached_num_recv_tokens;
@@ -1218,16 +1211,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         }
     }
 
-#if MK_PERF_TRACE_ENABLED
-    AT_CUDA_CHECK(cudaEventRecord(notify_end_ev, comm_stream));
-    AT_CUDA_CHECK(cudaEventSynchronize(notify_end_ev));
-    float notify_ms = 0.0f;
-    AT_CUDA_CHECK(cudaEventElapsedTime(&notify_ms, notify_start_ev, notify_end_ev));
-    deepep_perf_trace_notify_dispatch_ms_ = notify_ms;
-    AT_CUDA_CHECK(cudaEventDestroy(notify_start_ev));
-    AT_CUDA_CHECK(cudaEventDestroy(notify_end_ev));
-#endif
-
     // Allocate new tensors
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
@@ -1260,13 +1243,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                              : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
         recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
     }
-
-#if MK_PERF_TRACE_ENABLED
-    cudaEvent_t dispatch_start_ev, dispatch_end_ev;
-    AT_CUDA_CHECK(cudaEventCreate(&dispatch_start_ev));
-    AT_CUDA_CHECK(cudaEventCreate(&dispatch_end_ev));
-    AT_CUDA_CHECK(cudaEventRecord(dispatch_start_ev, comm_stream));
-#endif
 
     // Launch data dispatch
     // NOTES: the buffer size checks are moved into the `.cu` file
@@ -1308,16 +1284,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         comm_stream,
                         num_channels,
                         low_latency_mode);
-
-#if MK_PERF_TRACE_ENABLED
-    AT_CUDA_CHECK(cudaEventRecord(dispatch_end_ev, comm_stream));
-    AT_CUDA_CHECK(cudaEventSynchronize(dispatch_end_ev));
-    float dispatch_ms = 0.0f;
-    AT_CUDA_CHECK(cudaEventElapsedTime(&dispatch_ms, dispatch_start_ev, dispatch_end_ev));
-    deepep_perf_trace_dispatch_ms_ = dispatch_ms;
-    AT_CUDA_CHECK(cudaEventDestroy(dispatch_start_ev));
-    AT_CUDA_CHECK(cudaEventDestroy(dispatch_end_ev));
-#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1507,13 +1473,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     // Launch data combine
     auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
 
-#if MK_PERF_TRACE_ENABLED
-    cudaEvent_t combine_start_ev, combine_end_ev;
-    AT_CUDA_CHECK(cudaEventCreate(&combine_start_ev));
-    AT_CUDA_CHECK(cudaEventCreate(&combine_end_ev));
-    AT_CUDA_CHECK(cudaEventRecord(combine_start_ev, comm_stream));
-#endif
-
     internode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        combined_x.data_ptr(),
                        combined_topk_weights_ptr,
@@ -1543,17 +1502,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        comm_stream,
                        num_channels,
                        low_latency_mode);
-
-#if MK_PERF_TRACE_ENABLED
-    AT_CUDA_CHECK(cudaEventRecord(combine_end_ev, comm_stream));
-    AT_CUDA_CHECK(cudaEventSynchronize(combine_end_ev));
-    float combine_ms = 0.0f;
-    AT_CUDA_CHECK(cudaEventElapsedTime(&combine_ms, combine_start_ev, combine_end_ev));
-    deepep_perf_trace_combine_ms_ = combine_ms;
-    AT_CUDA_CHECK(cudaEventDestroy(combine_start_ev));
-    AT_CUDA_CHECK(cudaEventDestroy(combine_end_ev));
-    dump_deepep_perf_trace();
-#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1592,55 +1540,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     return {};
 #endif
 }
-
-#if MK_PERF_TRACE_ENABLED
-void Buffer::dump_deepep_perf_trace() {
-    // Emit a Perfetto-compatible JSON array for this rank's baseline dispatch/combine timing.
-    // File naming matches what aggregate_mk_perf_traces.py expects.
-    // Per-process iteration counter so consecutive calls emit distinct files
-    // (deepep_perf_trace_rank{R}_{phase}_iter{N}.json) instead of overwriting.
-    static int deepep_trace_iter = 0;
-    const int trace_iter = deepep_trace_iter++;
-    char filename[256];
-    snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_dispatch_iter%d.json", rank, trace_iter);
-    FILE* f = fopen(filename, "w");
-    if (f) {
-        // Export baseline dispatch/combine as separate 0-based spans.
-        double dispatch_us = deepep_perf_trace_dispatch_ms_ * 1000.0;
-        double combine_us = deepep_perf_trace_combine_ms_ * 1000.0;
-        fprintf(f, "[\n");
-        fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
-        fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
-        fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"dispatch\"}},\n", rank);
-        fprintf(f, "{\"name\":\"dispatch\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
-                dispatch_us, rank);
-        fprintf(f, "]\n");
-        fclose(f);
-        // printf("[DEEPEP-PERF] dispatch trace written to %s (dispatch %.3f us)\n", filename, dispatch_us);
-
-        // Combine in a separate file
-        snprintf(filename, sizeof(filename), "deepep_perf_trace_rank%d_combine_iter%d.json", rank, trace_iter);
-        f = fopen(filename, "w");
-        if (f) {
-            fprintf(f, "[\n");
-            fprintf(f, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
-            fprintf(f, "{\"name\":\"deepep_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
-            fprintf(f, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":0,\"args\":{\"name\":\"combine\"}},\n", rank);
-            fprintf(f, "{\"name\":\"combine\",\"cat\":\"deepep\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":0}\n",
-                    combine_us, rank);
-            fprintf(f, "]\n");
-            fclose(f);
-            // printf("[DEEPEP-PERF] combine trace written to %s (%.3f us)\n", filename, combine_us);
-        }
-    } else {
-        printf("[DEEPEP-PERF] Failed to open %s\n", filename);
-    }
-    // Reset for next iteration
-    deepep_perf_trace_notify_dispatch_ms_ = 0.0f;
-    deepep_perf_trace_dispatch_ms_ = 0.0f;
-    deepep_perf_trace_combine_ms_ = 0.0f;
-}
-#endif
 
 void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
 #ifndef DISABLE_NVSHMEM
@@ -2057,7 +1956,7 @@ void MegaKernelAutogradContext::set_cached_host_state(const ::gigamoe::MegaKerne
     ::gigamoe::detail::state_cache::copy_host(cached_host_state_, &hs);
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_impl(
+std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gigamoe_fused_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2252,12 +2151,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     // Keep notify_dispatch's buffer cleanup aligned with the megakernel logical-channel layout.
     // The prefix matrices are regenerated below for logical channels, but the cleanup range must
     // cover every logical-channel RDMA/NVL buffer slice before the megakernel starts using them.
-#if MK_PERF_TRACE_ENABLED
-    cudaEvent_t mk_notify_start_ev, mk_notify_end_ev;
-    AT_CUDA_CHECK(cudaEventCreate(&mk_notify_start_ev));
-    AT_CUDA_CHECK(cudaEventCreate(&mk_notify_end_ev));
-    AT_CUDA_CHECK(cudaEventRecord(mk_notify_start_ev, stream));
-#endif
     internode::notify_dispatch(
         num_tokens_per_rank.data_ptr<int>(),
         moe_recv_counter_mapped,
@@ -2289,10 +2182,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         num_rdma_bytes,
         num_nvl_bytes,
         low_latency_mode);
-#if MK_PERF_TRACE_ENABLED
-    AT_CUDA_CHECK(cudaEventRecord(mk_notify_end_ev, stream));
-#endif
-
     const int source_meta_bytes = internode::get_source_meta_bytes();
     auto get_num_bytes_per_token = [&](int num_topk_idx, int num_topk_weights) {
         return align_up(hidden_int4 * static_cast<int>(sizeof(int4)) + source_meta_bytes +
@@ -2325,46 +2214,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         auto elapsed = std::chrono::steady_clock::now() - wait_start;
         EP_HOST_ASSERT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 30);
     }
-
-#if MK_PERF_TRACE_ENABLED
-    // Emit the megakernel-path notify_dispatch cost as its own Perfetto track so it can be
-    // compared against the DeepEP baseline notify_dispatch. When retention is `all`, each
-    // megakernel forward emits an iteration-tagged file; otherwise the latest file overwrites
-    // the prior one, matching forward/backward trace retention.
-    {
-        AT_CUDA_CHECK(cudaEventSynchronize(mk_notify_end_ev));
-        float mk_notify_ms = 0.0f;
-        AT_CUDA_CHECK(cudaEventElapsedTime(&mk_notify_ms, mk_notify_start_ev, mk_notify_end_ev));
-        AT_CUDA_CHECK(cudaEventDestroy(mk_notify_start_ev));
-        AT_CUDA_CHECK(cudaEventDestroy(mk_notify_end_ev));
-
-        static int mk_notify_trace_iter = 0;
-        const int notify_iter = mk_notify_trace_iter++;
-        const char* trace_retention = std::getenv("MK_PERF_TRACE_RETENTION");
-        const bool keep_all_trace_iters = trace_retention != nullptr && trace_retention[0] == 'a';
-        char notify_fn[256];
-        if (keep_all_trace_iters) {
-            snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify_iter%d.json", rank, notify_iter);
-        } else {
-            snprintf(notify_fn, sizeof(notify_fn), "mk_perf_trace_rank%d_notify.json", rank);
-        }
-        FILE* nf = fopen(notify_fn, "w");
-        if (nf) {
-            const double notify_us = mk_notify_ms * 1000.0;
-            fprintf(nf, "[\n");
-            fprintf(nf, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"name\":\"rank %d\"}},\n", rank, rank);
-            fprintf(nf, "{\"name\":\"mk_base_ts_ns\",\"ph\":\"M\",\"pid\":%d,\"args\":{\"base_ts_ns\":0}},\n", rank);
-            fprintf(nf, "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":%d,\"tid\":90000,\"args\":{\"name\":\"host_notify_dispatch\"}},\n", rank);
-            fprintf(nf, "{\"name\":\"notify_dispatch\",\"cat\":\"mk_notify\",\"ph\":\"X\",\"ts\":0,\"dur\":%.3f,\"pid\":%d,\"tid\":90000}\n",
-                    notify_us, rank);
-            fprintf(nf, "]\n");
-            fclose(nf);
-            // printf("[MK-PERF] rank=%d notify_dispatch trace -> %s (%.3f us)\n", rank, notify_fn, notify_us);
-        } else {
-            printf("[MK-PERF] rank=%d failed to open %s\n", rank, notify_fn);
-        }
-    }
-#endif
 
     // Clean the combine region the DeepEP way: a clean-only cached_notify (num_combined_tokens=0,
     // null heads => no head normalization). Megakernel keeps this host notify for the NVL combine
@@ -2519,32 +2368,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     AT_CUDA_CHECK(cudaGetLastError());
 
-#if MK_PERF_TRACE_ENABLED
-
-    // Align all ranks after notify/state setup and immediately before the timed megakernel launch.
-    // This keeps dispatch fwd_wait_meta / recv_wait_prefix from measuring host-side node launch skew.
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-#ifdef MK_TOKEN_TRACE
-    fprintf(stderr, "[MK-HOST][BARRIER][BEFORE] rank=%d stream=%p\n", rank, stream.stream());
-    fflush(stderr);
-#endif
-    nvshmem_barrier_all();
-#ifdef MK_TOKEN_TRACE
-    fprintf(stderr, "[MK-HOST][BARRIER][AFTER] rank=%d stream=%p\n", rank, stream.stream());
-    fflush(stderr);
-#endif
-
-#endif
-
     // Compute shared memory size
     // Match internode.cu dispatch/combine dynamic shared memory requirements.
     int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
-#ifdef MK_TOKEN_TRACE
-    fprintf(stderr, "[MK-HOST][LAUNCH][BEFORE] rank=%d grid=%d stream=%p state=%p smem=%d dispatch_sms=%d forwarder_sms=%d compute_sms=%d combine_sms=%d logical_channels=%d\n",
-            rank, active_total_sms, stream.stream(), state, smem_size, num_dispatch_sms,
-            num_forwarder_sms, num_compute_sms, num_combine_sms, num_logical_channels);
-    fflush(stderr);
-#endif
     auto compute_dtype = use_fp8_compute
         ? megakernel::ComputeDType::kFP8E4M3
         : megakernel::ComputeDType::kBF16;
@@ -2564,22 +2390,11 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
         fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
-#ifdef MK_TOKEN_TRACE
-    fprintf(stderr, "[MK-HOST][LAUNCH][AFTER_ERROR_CHECK] rank=%d stream=%p state=%p\n",
-            rank, stream.stream(), state);
-    fflush(stderr);
-    fprintf(stderr, "[MK-HOST][SYNC][BEFORE] rank=%d stream=%p\n", rank, stream.stream());
-    fflush(stderr);
-#endif
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-#ifdef MK_TOKEN_TRACE
-    fprintf(stderr, "[MK-HOST][SYNC][AFTER] rank=%d stream=%p\n", rank, stream.stream());
-    fflush(stderr);
-#endif
 
     std::shared_ptr<MegaKernelAutogradContext> context;
     if (retain_state) {
-        EP_HOST_ASSERT(!use_fp8_compute && "training state currently requires debug BF16 mode");
+        EP_HOST_ASSERT(!use_fp8_compute && "GigaMOE training state currently requires BF16 mode");
         context = std::make_shared<MegaKernelAutogradContext>(
             static_cast<::gigamoe::MegaKernelState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
@@ -2620,12 +2435,12 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
     return {result, context};
 #else
-    EP_HOST_ASSERT(false && "megakernel_debug_forward requires NVSHMEM support");
+    EP_HOST_ASSERT(false && "gigamoe_forward requires NVSHMEM support");
     return {torch::Tensor(), nullptr};
 #endif
 }
 
-torch::Tensor Buffer::megakernel_debug_forward(
+torch::Tensor Buffer::gigamoe_forward(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2645,7 +2460,7 @@ torch::Tensor Buffer::megakernel_debug_forward(
     const pybind11::object& W_down_fp8_sf_obj,
     int compute_batch_size,
     int combine_start_head_percent) {
-    return std::get<0>(megakernel_debug_forward_impl(
+    return std::get<0>(gigamoe_fused_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config,
         combine_config, hidden_states_scales_obj, W_gateup_fp8_obj,
@@ -2653,7 +2468,7 @@ torch::Tensor Buffer::megakernel_debug_forward(
         compute_batch_size, combine_start_head_percent));
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::megakernel_debug_forward_train(
+std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gigamoe_forward_train(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2669,7 +2484,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
     int compute_batch_size,
     int combine_start_head_percent) {
     pybind11::object none = pybind11::none();
-    return megakernel_debug_forward_impl(
+    return gigamoe_fused_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage,
         dispatch_config, combine_config, none, none, none, none, none, true,
@@ -2678,7 +2493,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::me
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-Buffer::megakernel_debug_backward(
+Buffer::gigamoe_backward(
     const std::shared_ptr<MegaKernelAutogradContext>& context,
     const torch::Tensor& grad_output,
     const std::optional<torch::Tensor>& grad_topk_weights,
@@ -2835,7 +2650,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer)
-        .def("megakernel_debug_forward", &deep_ep::Buffer::megakernel_debug_forward,
+        .def("gigamoe_forward", &deep_ep::Buffer::gigamoe_forward,
              py::arg("x"),
              py::arg("topk_idx"),
              py::arg("topk_weights"),
@@ -2855,7 +2670,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("W_down_fp8_sf") = py::none(),
              py::arg("compute_batch_size") = 4096,
              py::arg("combine_start_head_percent") = 70)
-        .def("megakernel_debug_forward_train", &deep_ep::Buffer::megakernel_debug_forward_train,
+        .def("gigamoe_forward_train", &deep_ep::Buffer::gigamoe_forward_train,
              py::arg("x"), py::arg("topk_idx"), py::arg("topk_weights"),
              py::arg("W_gateup"), py::arg("W_down"), py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24, py::arg("num_combine_sms") = 24,
@@ -2864,7 +2679,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
              py::arg("compute_batch_size") = 4096,
              py::arg("combine_start_head_percent") = 70)
-        .def("megakernel_debug_backward", &deep_ep::Buffer::megakernel_debug_backward,
+        .def("gigamoe_backward", &deep_ep::Buffer::gigamoe_backward,
              py::arg("context"), py::arg("grad_output"), py::arg("grad_topk_weights") = py::none(),
              py::arg("total_sms") = 148, py::arg("stage") = 1)
         ;

@@ -84,6 +84,9 @@ def prepare_case_inputs(case, rank, num_ranks, num_local_ranks, args, case_idx):
         router_group_topk,
         args.router_score_function,
         'cuda',
+        hotspot_expert_fraction=args.router_hotspot_expert_fraction,
+        hotspot_expert_start=args.router_hotspot_expert_start,
+        hotspot_logit_bias=args.router_hotspot_logit_bias,
     )
 
     torch.manual_seed(1000 + rank + seed_offset)
@@ -176,7 +179,7 @@ def make_megakernel_functions(buffer, x, topk_idx, topk_weights, grad_output, nu
         mk_topk_weights = topk_weights.detach().clone().requires_grad_(True)
         mk_w_gateup.grad = None
         mk_w_down.grad = None
-        mk_output = buffer.megakernel_debug_autograd(
+        mk_output = buffer.gigamoe_autograd(
             mk_x, topk_idx, mk_topk_weights, mk_w_gateup, mk_w_down, num_experts,
             num_dispatch_sms=args.megakernel_comm_sms,
             num_combine_sms=args.megakernel_comm_sms,
@@ -195,7 +198,7 @@ def make_megakernel_functions(buffer, x, topk_idx, topk_weights, grad_output, nu
     return forward, backward
 
 
-def autotune_megakernel(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
+def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                         num_experts, args, num_sms, grad_output, rank,
                         group=None, verbose=True):
     best_time = float('inf')
@@ -278,6 +281,12 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             flush=True,
         )
         print(
+            f'  router hotspot: expert_fraction={args.router_hotspot_expert_fraction}, '
+            f'expert_start={args.router_hotspot_expert_start}, '
+            f'logit_bias={args.router_hotspot_logit_bias}',
+            flush=True,
+        )
+        print(
             f'  autotune search space: compute_batch_size={COMPUTE_BATCH_SIZES}, '
             f'combine_start_head_percent={COMBINE_START_HEAD_PERCENTS}',
             flush=True,
@@ -313,7 +322,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     if rank == 0:
         print('  [perf] Autotuning megakernel...', flush=True)
-    best_result, _all_results = autotune_megakernel(
+    best_result, _all_results = autotune_gigamoe(
         buffer, x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts=num_experts,
         args=args,
@@ -395,7 +404,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     megakernel_mem_start = start_memory_measurement()
     megakernel_x = x.detach().clone().requires_grad_(True)
     megakernel_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-    megakernel_output = buffer.megakernel_debug_autograd(
+    megakernel_output = buffer.gigamoe_autograd(
         megakernel_x, topk_idx, megakernel_topk_weights, megakernel_w_gateup, megakernel_w_down,
         num_experts,
         num_dispatch_sms=args.megakernel_comm_sms,
@@ -500,6 +509,12 @@ def parse_args():
         default='sigmoid')
     parser.add_argument('--router-num-groups', type=int, default=0)
     parser.add_argument('--router-group-topk', type=int, default=0)
+    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.0,
+                        help='Fraction of consecutive experts biased as a communication hotspot')
+    parser.add_argument('--router-hotspot-expert-start', type=int, default=0,
+                        help='First expert id in the hotspot range')
+    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.0,
+                        help='Logit bias added to hotspot experts before top-k selection')
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
                         help='Default megakernel compute batch size used for the memory test')

@@ -707,13 +707,13 @@ class Buffer:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
-    class _MegaKernelDebugFunction(torch.autograd.Function):
+    class _GigaMoEAutogradFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
                     num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
                     dispatch_config, combine_config, grad_topk_weights,
                     compute_batch_size, combine_start_head_percent):
-            output, handle = runtime.megakernel_debug_forward_train(
+            output, handle = runtime.gigamoe_forward_train(
                 x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
                 num_dispatch_sms, num_combine_sms, total_sms, stage,
                 dispatch_config, combine_config,
@@ -739,14 +739,14 @@ class Buffer:
         def backward(ctx, grad_output):
             (grad_x, grad_w_gateup, grad_w_down, grad_topk_weights,
              scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k) = (
-                ctx.runtime.megakernel_debug_backward(
+                ctx.runtime.gigamoe_backward(
                     ctx.handle, grad_output.contiguous(), ctx.grad_topk_weights,
                     ctx.total_sms, ctx.stage))
             try:
                 from quack.gemm_interface import gemm as _quack_gemm
             except Exception as exc:
                 raise RuntimeError(
-                    "QuACK is required for megakernel debug backward wgrad") from exc
+                    "QuACK is required for GigaMOE backward weight gradients") from exc
             if scratch_x.shape[0] > 0:
                 _quack_gemm(
                     scratch_dgu.transpose(0, 1), scratch_x,
@@ -761,7 +761,7 @@ class Buffer:
             return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
                     None, None, None, None, None, None, None, None, None, None)
 
-    def megakernel_debug_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
+    def gigamoe_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
                                   topk_weights: torch.Tensor, W_gateup: torch.Tensor,
                                   W_down: torch.Tensor, num_experts: int,
                                   num_dispatch_sms: int = 24, num_combine_sms: int = 24,
@@ -771,25 +771,25 @@ class Buffer:
                                   grad_topk_weights: Optional[torch.Tensor] = None,
                                   compute_batch_size: int = 4096,
                                   combine_start_head_percent: int = 70) -> torch.Tensor:
-        """Run the BF16 debug megakernel with an input-gradient-only autograd backward."""
+        """Run the BF16 GigaMOE fused path with autograd backward."""
         assert compute_batch_size in (1024, 2048, 4096), \
             f"compute_batch_size must be 1024, 2048, or 4096, got {compute_batch_size}"
         assert 0 <= combine_start_head_percent <= 100, \
             f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         if x.dtype != torch.bfloat16:
-            raise ValueError("megakernel debug autograd currently supports BF16 only")
+            raise ValueError("GigaMOE autograd currently supports BF16 only")
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
         if grad_topk_weights is None:
             grad_topk_weights = torch.zeros(
                 (x.size(0), topk_weights.size(1)), dtype=torch.float32, device=topk_weights.device)
-        return self._MegaKernelDebugFunction.apply(
+        return self._GigaMoEAutogradFunction.apply(
             self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
             dispatch_config, combine_config, grad_topk_weights,
             compute_batch_size, combine_start_head_percent)
 
-    def megakernel_debug_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+    def gigamoe_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                                  W_gateup: torch.Tensor, W_down: torch.Tensor,
                                  num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
                                  total_sms: int = 148, stage: int = 1,
@@ -809,7 +809,7 @@ class Buffer:
             f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
-        return self.runtime.megakernel_debug_forward(
+        return self.runtime.gigamoe_forward(
             x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms,
             total_sms, stage, dispatch_config, combine_config,

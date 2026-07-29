@@ -86,7 +86,7 @@ public:
     // the backward re-runs dispatch/combine off the same state. Without retaining them here they
     // are freed when the forward returns; the caching allocator may then hand their blocks to the
     // backward's own allocations (e.g. torch::zeros for grad_w_*), zeroing rdma_channel_prefix_matrix
-    // and stalling the backward NVL dispatch. See megakernel_debug_backward reuse of fs.*_matrix.
+    // and stalling the backward NVL dispatch. See gigamoe_backward reuse of fs.*_matrix.
     void retain_layout_tensors(std::vector<torch::Tensor> tensors);
 
 private:
@@ -359,7 +359,7 @@ public:
 
     void low_latency_clean_mask_buffer();
 
-    torch::Tensor megakernel_debug_forward(
+    torch::Tensor gigamoe_forward(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -380,7 +380,7 @@ public:
         int compute_batch_size,
         int combine_start_head_percent);
 
-    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_debug_forward_train(
+    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> gigamoe_forward_train(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -397,14 +397,14 @@ public:
         int combine_start_head_percent);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> megakernel_debug_backward(
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> gigamoe_backward(
         const std::shared_ptr<MegaKernelAutogradContext>& context,
         const torch::Tensor& grad_output,
         const std::optional<torch::Tensor>& grad_topk_weights,
         int total_sms,
         int stage);
 
-    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> megakernel_debug_forward_impl(
+    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> gigamoe_fused_forward_impl(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,

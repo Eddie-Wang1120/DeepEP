@@ -147,7 +147,7 @@ def run_megakernel_once(buffer, x, topk_idx, topk_weights, grad_output, num_expe
     mk_w_gateup = W_gateup.detach().clone().requires_grad_(True)
     mk_w_down = W_down.detach().clone().requires_grad_(True)
 
-    mk_output = buffer.megakernel_debug_autograd(
+    mk_output = buffer.gigamoe_autograd(
         mk_x, topk_idx, mk_topk_weights, mk_w_gateup, mk_w_down, num_experts,
         num_dispatch_sms=args.megakernel_comm_sms,
         num_combine_sms=args.megakernel_comm_sms,
@@ -199,6 +199,9 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         router_group_topk,
         args.router_score_function,
         'cuda',
+        hotspot_expert_fraction=args.router_hotspot_expert_fraction,
+        hotspot_expert_start=args.router_hotspot_expert_start,
+        hotspot_logit_bias=args.router_hotspot_logit_bias,
     )
 
     torch.manual_seed(1000 + rank)
@@ -227,6 +230,12 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         print(
             f'  warmup={args.warmup}, repeat={args.repeat}, stage={args.stage}, '
             f'baseline_sms={args.baseline_sms}, megakernel_comm_sms={args.megakernel_comm_sms}',
+            flush=True,
+        )
+        print(
+            f'  router hotspot: expert_fraction={args.router_hotspot_expert_fraction}, '
+            f'expert_start={args.router_hotspot_expert_start}, '
+            f'logit_bias={args.router_hotspot_logit_bias}',
             flush=True,
         )
 
@@ -373,6 +382,12 @@ def parse_args():
         default='sigmoid')
     parser.add_argument('--router-num-groups', type=int, default=0)
     parser.add_argument('--router-group-topk', type=int, default=0)
+    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.0,
+                        help='Fraction of consecutive experts biased as a communication hotspot')
+    parser.add_argument('--router-hotspot-expert-start', type=int, default=0,
+                        help='First expert id in the hotspot range')
+    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.0,
+                        help='Logit bias added to hotspot experts before top-k selection')
     parser.add_argument('--forward-max-abs-tol', type=float, default=1e-2)
     parser.add_argument('--forward-calc-diff-tol', type=float, default=1e-5)
     parser.add_argument('--forward-cos-tol', type=float, default=0.99)

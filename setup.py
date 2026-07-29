@@ -114,13 +114,6 @@ if __name__ == '__main__':
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
-    # MegaKernel performance tracing (Perfetto JSON output per SM)
-    # 0 = disabled, 1 = emit events without args, 2 = emit events with full args
-    mk_perf_trace_level = int(os.getenv('MK_PERF_TRACE', 0))
-    if mk_perf_trace_level:
-        cxx_flags.append(f'-DMK_PERF_TRACE={mk_perf_trace_level}')
-        nvcc_flags.append(f'-DMK_PERF_TRACE={mk_perf_trace_level}')
-
     # MegaKernel token path tracing (printf-based full token lifecycle)
     if int(os.getenv('MK_TOKEN_TRACE', 0)):
         cxx_flags.append('-DMK_TOKEN_TRACE')

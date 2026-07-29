@@ -388,14 +388,38 @@ def megatron_group_limited_topk(scores, topk, num_groups, group_topk):
     return torch.topk(scores.masked_fill(~score_mask.bool(), float('-inf')), k=topk, dim=-1)
 
 
-def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group_topk, score_function, device):
+def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group_topk, score_function, device,
+                                hotspot_expert_fraction=0.0, hotspot_expert_start=0, hotspot_logit_bias=0.0):
+    if not 0.0 <= hotspot_expert_fraction <= 1.0:
+        raise ValueError(
+            f'hotspot_expert_fraction must be in [0, 1], got {hotspot_expert_fraction}')
+    if hotspot_expert_fraction == 0.0:
+        if hotspot_logit_bias != 0.0:
+            raise ValueError('hotspot_logit_bias requires hotspot_expert_fraction > 0')
+    elif hotspot_logit_bias == 0.0:
+        raise ValueError('hotspot_expert_fraction requires a non-zero hotspot_logit_bias')
+
     logits = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
+    routing_logits = logits
+    if hotspot_expert_fraction > 0.0:
+        hotspot_expert_count = math.ceil(num_experts * hotspot_expert_fraction)
+        hotspot_expert_end = hotspot_expert_start + hotspot_expert_count
+        if hotspot_expert_start < 0 or hotspot_expert_end > num_experts:
+            raise ValueError(
+                f'hotspot expert range [{hotspot_expert_start}, {hotspot_expert_end}) is outside '
+                f'[0, {num_experts})')
+        routing_logits = logits.clone()
+        routing_logits[:, hotspot_expert_start:hotspot_expert_end] += hotspot_logit_bias
+
     if score_function == 'softmax':
-        topk_logits, topk_idx = megatron_group_limited_topk(logits, topk, num_groups, group_topk)
+        _, topk_idx = megatron_group_limited_topk(routing_logits, topk, num_groups, group_topk)
+        topk_logits = logits.gather(1, topk_idx)
         topk_weights = torch.softmax(topk_logits, dim=-1, dtype=torch.float32)
     elif score_function in ('sigmoid', 'sqrtsoftplus'):
-        scores = torch.sigmoid(logits.float()) if score_function == 'sigmoid' else F.softplus(logits.float()).sqrt()
-        topk_weights, topk_idx = megatron_group_limited_topk(scores, topk, num_groups, group_topk)
+        scores = torch.sigmoid(logits) if score_function == 'sigmoid' else F.softplus(logits).sqrt()
+        routing_scores = torch.sigmoid(routing_logits) if score_function == 'sigmoid' else F.softplus(routing_logits).sqrt()
+        _, topk_idx = megatron_group_limited_topk(routing_scores, topk, num_groups, group_topk)
+        topk_weights = scores.gather(1, topk_idx)
         if topk > 1:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     else:
