@@ -38,7 +38,7 @@ if __name__ == '__main__':
     _repo_root = os.path.dirname(os.path.abspath(__file__))
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/gigamoe/gigamoe_orchestrator.cu']
+    sources = ['csrc/moe_extension.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/gigamoe/gigamoe_orchestrator.cu']
     include_dirs = [os.path.join(_repo_root, 'csrc')]
     _third_party_root = os.path.join(_repo_root, 'third-party')
 

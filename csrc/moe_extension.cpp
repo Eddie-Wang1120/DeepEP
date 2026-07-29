@@ -1,4 +1,4 @@
-#include "deep_ep.hpp"
+#include "moe_extension.hpp"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
@@ -2124,30 +2124,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     for (int i = 0; i < num_local_experts; ++i)
         moe_recv_expert_counter[i] = -1;
 
-    // DeepEP-aligned buffer cleanup (no host-side full memset + no extra barriers):
-    //   - dispatch region: cleaned in-kernel by notify_dispatch below (its clean_meta range),
-    //     exactly like DeepEP's dispatch.
-    //   - combine region: cleaned in-kernel by internode::cached_notify further below, exactly
-    //     like DeepEP's internode_combine. cached_notify does the clean + a cross-rank barrier
-    //     inside the collective, so no separate intranode/internode barrier is needed.
-    // Both cleans zero only the head/tail metadata (KB), not the MB-scale data payload, and they
-    // run every iteration (including the first), so we no longer memset the whole symmetric buffer.
-
-    // printf("[MK-HOST][NOTIFY-DISPATCH][BEFORE] rank=%d rdma_rank=%d nvl_rank=%d num_ranks=%d num_rdma_ranks=%d num_channels=%d num_tokens=%d hidden_int4=%d num_topk=%d num_experts=%d num_local_experts=%d dispatch_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) combine_cfg=(nvl_send=%d,nvl_recv=%d,rdma_send=%d,rdma_recv=%d) rdma_buffer=%p buffer_ptrs_gpu=%p barrier_signal_ptrs_gpu=%p moe_recv_counter=%p mapped=%p rdma_counter=%p rdma_mapped=%p\n",
-    //        rank, rank / NUM_MAX_NVL_PEERS, rank % NUM_MAX_NVL_PEERS, num_ranks, num_rdma_ranks, num_channels,
-    //        num_tokens, hidden_int4, num_topk, num_experts, num_local_experts,
-    //        dispatch_num_max_nvl_chunked_send_tokens, dispatch_num_max_nvl_chunked_recv_tokens,
-    //        dispatch_num_max_rdma_chunked_send_tokens, dispatch_num_max_rdma_chunked_recv_tokens,
-    //        combine_num_max_nvl_chunked_send_tokens, combine_num_max_nvl_chunked_recv_tokens,
-    //        combine_num_max_rdma_chunked_send_tokens, combine_num_max_rdma_chunked_recv_tokens,
-    //        rdma_buffer_ptr, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, moe_recv_counter, moe_recv_counter_mapped,
-    //        moe_recv_rdma_counter, moe_recv_rdma_counter_mapped);
-    // printf("[MK-HOST][NOTIFY-DISPATCH][TENSORS] rank=%d num_tokens_per_rank=%p num_tokens_per_rdma_rank=%p num_tokens_per_expert=%p is_token_in_rank=%p logical_rdma_cpm=%p recv_rdma_prefix=%p logical_gbl_cpm=%p recv_gbl_prefix=%p\n",
-    //        rank, num_tokens_per_rank.data_ptr<int>(), num_tokens_per_rdma_rank.data_ptr<int>(),
-    //        num_tokens_per_expert_t.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(),
-    //        rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
-    //        gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>());
-
     // Keep notify_dispatch's buffer cleanup aligned with the megakernel logical-channel layout.
     // The prefix matrices are regenerated below for logical channels, but the cleanup range must
     // cover every logical-channel RDMA/NVL buffer slice before the megakernel starts using them.
@@ -2266,16 +2242,9 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     // (The previous *num_topk was an over-allocation assuming a token could occupy num_topk slots
     //  on the same expert, which cannot happen.) The in-kernel overflow check `slot >= cap` -> trap()
     // remains as a safety net.
+
     const int max_tokens_per_expert = std::max(1, max_total_recv_tokens);
-
-    // printf("[MK-HOST][ALLOC][PLAN] rank=%d max_total_recv_tokens=%d max_tokens_per_expert=%d total_expert_slots=%zu num_dispatch_sms=%d num_combine_sms=%d scheduler_sms=%d reserved_sms=%d num_compute_sms=%d compute_groups=%d active_total_sms=%d physical_total_sms=%d\n",
-    //        rank, max_total_recv_tokens, max_tokens_per_expert,
-    //        static_cast<size_t>(num_local_experts) * max_tokens_per_expert,
-    //        num_dispatch_sms, num_combine_sms, compute_scheduler_sms, num_forwarder_sms, num_compute_sms, num_compute_groups, active_total_sms, total_sms);
-
     AT_CUDA_CHECK(cudaGetLastError());
-
-    // printf("[MK-HOST][ALLOC][BEFORE] rank=%d\n", rank);
 
     // Per-local-expert received-token counts for compact slot packing (P0 forward path).
     // moe_recv_expert_counter was populated by notify_dispatch above and equals each local
@@ -2363,8 +2332,6 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     };
 
     void* state = static_cast<void*>(allocate_state(::gigamoe::allocate_gigamoe_fused_state));
-
-    // printf("[MK-HOST][ALLOC][DONE] rank=%d state=%p\n", rank, state);
 
     AT_CUDA_CHECK(cudaGetLastError());
 
