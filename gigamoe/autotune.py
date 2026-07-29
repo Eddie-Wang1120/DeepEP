@@ -52,6 +52,8 @@ class AutotuneResult:
     compute_batch_size: int
     combine_start_head_percent: int
     time_ms: float
+    forward_ms: Optional[float] = None
+    backward_ms: Optional[float] = None
 
 
 def autotune_gigamoe(

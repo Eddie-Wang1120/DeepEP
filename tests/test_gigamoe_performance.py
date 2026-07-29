@@ -1,9 +1,9 @@
-"""Megakernel performance and memory test harness.
+"""GigaMOE performance and memory test harness.
 
-The baseline is DeepEP + TE. The megakernel section first autotunes
-compute_batch_size x combine_start_head_percent, then measures the best
-forward/backward configuration. Memory is measured separately with the default
-megakernel config.
+The baseline is DeepEP + TE. The GigaMOE section autotunes
+compute_batch_size x combine_start_head_percent and reports the fastest
+measured forward/backward configuration. Memory is measured separately with
+the default GigaMOE config.
 """
 
 import argparse
@@ -57,10 +57,10 @@ def test(**kwargs):
 
 
 TEST_CASES = [
-    test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
+    # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=2),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
-    # test(num_tokens=4096, hidden=2048, intermediate=3072, experts_per_rank=8, num_topk=6, num_topk_groups=3),
+    test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
 ]
 
@@ -105,6 +105,21 @@ def prepare_case_inputs(case, rank, num_ranks, num_local_ranks, args, case_idx):
     W_gateup = W_gateup.contiguous()
     return x, topk_idx, topk_weights, W_gate, W_up, W_down, W_gateup, num_experts
 
+
+def report_topk_peak_to_average(topk_idx, num_experts, rank, group):
+    expert_loads = torch.bincount(topk_idx.reshape(-1).to(torch.long), minlength=num_experts)
+    expert_loads = expert_loads.to(dtype=torch.float32)
+    dist.all_reduce(expert_loads, group=group)
+
+    if rank == 0:
+        peak_load = expert_loads.max().item()
+        average_load = expert_loads.mean().item()
+        peak_to_average = peak_load / average_load if average_load else float('nan')
+        print(
+            f'  router top-k load: peak={peak_load:.0f}, average={average_load:.2f}, '
+            f'peak_to_average={peak_to_average:.4f}',
+            flush=True,
+        )
 
 
 def benchmark_forward_backward(forward, backward, warmup_iters, repeat_iters, group=None):
@@ -167,7 +182,7 @@ def make_baseline_functions(x, topk_idx, topk_weights, grad_output, num_experts,
     return forward, backward
 
 
-def make_megakernel_functions(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
+def make_gigamoe_functions(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
                                W_gateup, W_down, num_sms, compute_batch_size, combine_start_head_percent):
     # Pre-allocate weight tensors outside the timed loop to avoid measuring
     # clone bandwidth that has no baseline equivalent.
@@ -181,15 +196,15 @@ def make_megakernel_functions(buffer, x, topk_idx, topk_weights, grad_output, nu
         mk_w_down.grad = None
         mk_output = buffer.gigamoe_autograd(
             mk_x, topk_idx, mk_topk_weights, mk_w_gateup, mk_w_down, num_experts,
-            num_dispatch_sms=args.megakernel_comm_sms,
-            num_combine_sms=args.megakernel_comm_sms,
+            num_dispatch_sms=args.gigamoe_comm_sms,
+            num_combine_sms=args.gigamoe_comm_sms,
             total_sms=num_sms,
             stage=args.stage,
             compute_batch_size=compute_batch_size,
             combine_start_head_percent=combine_start_head_percent,
         )
         if not mk_output.requires_grad:
-            raise AssertionError('Megakernel output is not connected to autograd')
+            raise AssertionError('GigaMOE output is not connected to autograd')
         return mk_output
 
     def backward(output):
@@ -202,6 +217,8 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                         num_experts, args, num_sms, grad_output, rank,
                         group=None, verbose=True):
     best_time = float('inf')
+    best_forward_ms = 0.0
+    best_backward_ms = 0.0
     best_config = (COMPUTE_BATCH_SIZES[0], COMBINE_START_HEAD_PERCENTS[0])
     results: List[Tuple[int, int, float]] = []
 
@@ -214,7 +231,7 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                   f'Starting: compute_batch_size={batch_size}, combine_start_head_percent={percent}%',
                   flush=True)
 
-        forward, backward = make_megakernel_functions(
+        forward, backward = make_gigamoe_functions(
             buffer, x, topk_idx, topk_weights, grad_output,
             num_experts, args, W_gateup, W_down, num_sms, batch_size, percent,
         )
@@ -233,6 +250,8 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
 
         if total_ms < best_time:
             best_time = total_ms
+            best_forward_ms = forward_ms
+            best_backward_ms = backward_ms
             best_config = (batch_size, percent)
 
         if group is not None:
@@ -250,13 +269,15 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
         compute_batch_size=best_config[0],
         combine_start_head_percent=best_config[1],
         time_ms=best_time,
+        forward_ms=best_forward_ms,
+        backward_ms=best_backward_ms,
     )
     return best_result, results
 
 
 def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, case, case_idx):
     if args.stage not in (1, 2):
-        raise ValueError('megakernel debug backward currently supports stage 1 or 2')
+        raise ValueError('gigamoe debug backward currently supports stage 1 or 2')
     if args.warmup < 0:
         raise ValueError(f'--warmup must be >= 0, got {args.warmup}')
     if args.repeat <= 0:
@@ -277,7 +298,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         )
         print(
             f'  warmup={args.warmup}, repeat={args.repeat}, stage={args.stage}, '
-            f'baseline_sms={args.baseline_sms}, megakernel_comm_sms={args.megakernel_comm_sms}',
+            f'baseline_sms={args.baseline_sms}, gigamoe_comm_sms={args.gigamoe_comm_sms}',
             flush=True,
         )
         print(
@@ -291,6 +312,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             f'combine_start_head_percent={COMBINE_START_HEAD_PERCENTS}',
             flush=True,
         )
+
+    report_topk_peak_to_average(topk_idx, num_experts, rank, group)
 
     buffer.set_num_sms(args.baseline_sms)
     te_experts = build_te_grouped_experts(
@@ -321,7 +344,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     torch.cuda.synchronize()
 
     if rank == 0:
-        print('  [perf] Autotuning megakernel...', flush=True)
+        print('  [perf] Autotuning gigamoe...', flush=True)
     best_result, _all_results = autotune_gigamoe(
         buffer, x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts=num_experts,
@@ -332,30 +355,16 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         group=group,
         verbose=True,
     )
+    gigamoe_forward_ms = best_result.forward_ms
+    gigamoe_backward_ms = best_result.backward_ms
+    gigamoe_time_ms = best_result.time_ms
     if rank == 0:
         print(
-            f'  [perf] Megakernel best autotune config: '
+            f'  [perf] GigaMOE best autotune result: '
             f'compute_batch_size={best_result.compute_batch_size}, '
             f'combine_start_head_percent={best_result.combine_start_head_percent}%, '
-            f'total={best_result.time_ms:.4f} ms/iter',
-            flush=True,
-        )
-
-    dist.barrier(group=group)
-    torch.cuda.synchronize()
-
-    megakernel_forward, megakernel_backward = make_megakernel_functions(
-        buffer, x, topk_idx, topk_weights, grad_output,
-        num_experts, args, W_gateup, W_down, num_sms,
-        best_result.compute_batch_size, best_result.combine_start_head_percent,
-    )
-    megakernel_forward_ms, megakernel_backward_ms, megakernel_time_ms = benchmark_forward_backward(
-        megakernel_forward, megakernel_backward, args.warmup, args.repeat, group=group,
-    )
-    if rank == 0:
-        print(
-            f'  [perf] Megakernel best: forward={megakernel_forward_ms:.4f} ms, '
-            f'backward={megakernel_backward_ms:.4f} ms, total={megakernel_time_ms:.4f} ms/iter',
+            f'forward={gigamoe_forward_ms:.4f} ms, '
+            f'backward={gigamoe_backward_ms:.4f} ms, total={gigamoe_time_ms:.4f} ms/iter',
             flush=True,
         )
 
@@ -392,42 +401,42 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     if rank == 0:
         print(
-            f'  [memory] Measuring megakernel with default config '
+            f'  [memory] Measuring gigamoe with default config '
             f'(compute_batch_size={args.compute_batch_size}, '
             f'combine_start_head_percent={args.combine_start_head_percent})...',
             flush=True,
         )
     # Pre-allocate weight clones outside the measurement interval so that
     # weight memory does not pollute the activation/peak comparison.
-    megakernel_w_gateup = W_gateup.detach().clone().requires_grad_(True)
-    megakernel_w_down = W_down.detach().clone().requires_grad_(True)
-    megakernel_mem_start = start_memory_measurement()
-    megakernel_x = x.detach().clone().requires_grad_(True)
-    megakernel_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-    megakernel_output = buffer.gigamoe_autograd(
-        megakernel_x, topk_idx, megakernel_topk_weights, megakernel_w_gateup, megakernel_w_down,
+    gigamoe_w_gateup = W_gateup.detach().clone().requires_grad_(True)
+    gigamoe_w_down = W_down.detach().clone().requires_grad_(True)
+    gigamoe_mem_start = start_memory_measurement()
+    gigamoe_x = x.detach().clone().requires_grad_(True)
+    gigamoe_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+    gigamoe_output = buffer.gigamoe_autograd(
+        gigamoe_x, topk_idx, gigamoe_topk_weights, gigamoe_w_gateup, gigamoe_w_down,
         num_experts,
-        num_dispatch_sms=args.megakernel_comm_sms,
-        num_combine_sms=args.megakernel_comm_sms,
+        num_dispatch_sms=args.gigamoe_comm_sms,
+        num_combine_sms=args.gigamoe_comm_sms,
         total_sms=num_sms,
         stage=args.stage,
         compute_batch_size=args.compute_batch_size,
         combine_start_head_percent=args.combine_start_head_percent,
     )
-    if not megakernel_output.requires_grad:
-        raise AssertionError('Megakernel output is not connected to autograd')
-    megakernel_activation_retained = record_forward_memory(megakernel_mem_start)
-    megakernel_output.backward(grad_output)
-    megakernel_memory = finish_memory_measurement(
-        megakernel_mem_start, megakernel_activation_retained, 'Megakernel')
+    if not gigamoe_output.requires_grad:
+        raise AssertionError('GigaMOE output is not connected to autograd')
+    gigamoe_activation_retained = record_forward_memory(gigamoe_mem_start)
+    gigamoe_output.backward(grad_output)
+    gigamoe_memory = finish_memory_measurement(
+        gigamoe_mem_start, gigamoe_activation_retained, 'GigaMOE')
     if rank == 0:
-        report_memory_comparison(baseline_memory, megakernel_memory, baseline_name)
+        report_memory_comparison(baseline_memory, gigamoe_memory, baseline_name)
         print(
             f'  [summary] case {case_idx + 1}: '
             f'baseline(fwd={baseline_forward_ms:.4f}, bwd={baseline_backward_ms:.4f}, '
             f'total={baseline_time_ms:.4f}) ms/iter, '
-            f'megakernel(best, fwd={megakernel_forward_ms:.4f}, '
-            f'bwd={megakernel_backward_ms:.4f}, total={megakernel_time_ms:.4f}) ms/iter',
+            f'gigamoe(best, fwd={gigamoe_forward_ms:.4f}, '
+            f'bwd={gigamoe_backward_ms:.4f}, total={gigamoe_time_ms:.4f}) ms/iter',
             flush=True,
         )
 
@@ -494,7 +503,7 @@ def run_mpirun(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Measure and autotune megakernel performance and memory against DeepEP + TE')
+        description='Measure and autotune gigamoe performance and memory against DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
     parser.add_argument('--warmup', '--warmup-iters', dest='warmup', type=int, default=10,
@@ -503,23 +512,23 @@ def parse_args():
                         help='Timed iterations for each benchmark')
     parser.add_argument('--stage', type=int, default=1)
     parser.add_argument('--baseline-sms', type=int, default=48)
-    parser.add_argument('--megakernel-comm-sms', type=int, default=48)
+    parser.add_argument('--gigamoe-comm-sms', type=int, default=48)
     parser.add_argument(
         '--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'],
         default='sigmoid')
     parser.add_argument('--router-num-groups', type=int, default=0)
     parser.add_argument('--router-group-topk', type=int, default=0)
-    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.0,
+    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.015625,
                         help='Fraction of consecutive experts biased as a communication hotspot')
     parser.add_argument('--router-hotspot-expert-start', type=int, default=0,
                         help='First expert id in the hotspot range')
-    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.0,
+    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.13,
                         help='Logit bias added to hotspot experts before top-k selection')
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
-                        help='Default megakernel compute batch size used for the memory test')
+                        help='Default gigamoe compute batch size used for the memory test')
     parser.add_argument('--combine-start-head-percent', type=int, default=70,
-                        help='Default megakernel combine threshold used for the memory test')
+                        help='Default gigamoe combine threshold used for the memory test')
     parser.add_argument('--case-seed-offset', type=int, default=0,
                         help='Extra seed offset for repeated benchmark runs')
     parser.add_argument('--mpirun', action='store_true')

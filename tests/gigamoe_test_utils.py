@@ -13,44 +13,11 @@ import gigamoe
 os.environ.setdefault('NVTE_CUTEDSL_FUSED_GROUPED_MLP', '1')
 os.environ.setdefault('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '1')
 
-try:
-    import transformer_engine.pytorch.ops as te_ops
-    from transformer_engine.common import recipe as te_recipe
-    from transformer_engine.pytorch import fp8_autocast, moe_permute_with_probs, moe_unpermute
-except ImportError:
-    te_ops = None
-    te_recipe = None
-    fp8_autocast = None
-    moe_permute_with_probs = None
-    moe_unpermute = None
-
-
-def null_decorator(func=None, *args, **kwargs):
-    if func is not None:
-        return func
-    return lambda f: f
-
-
-HAVE_TRITON_AVAILABLE = False
-try:
-    import triton
-    import triton.language as tl
-
-    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
-        HAVE_TRITON = False
-    else:
-        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
-        HAVE_TRITON_AVAILABLE = True
-except ImportError:
-    HAVE_TRITON = False
-
-if not HAVE_TRITON:
-    triton = MagicMock()
-    triton.jit = null_decorator
-    triton.autotune = null_decorator
-    triton.heuristics = null_decorator
-    tl = MagicMock()
-
+import transformer_engine.pytorch.ops as te_ops
+from transformer_engine.common import recipe as te_recipe
+from transformer_engine.pytorch import fp8_autocast, moe_permute_with_probs, moe_unpermute
+import triton
+import triton.language as tl
 
 @triton.jit
 def _indices_to_multihot_kernel(
@@ -285,11 +252,11 @@ def finish_memory_measurement(start_allocated, activation_retained, phase):
     return activation_retained, peak_allocated, peak_reserved
 
 
-def report_memory_comparison(baseline_memory, megakernel_memory, baseline_name):
+def report_memory_comparison(baseline_memory, gigamoe_memory, baseline_name):
     names = ('forward activation retained', 'peak allocated increment (fwd+bwd)', 'peak reserved')
-    print(f'  [Memory comparison] Megakernel - {baseline_name}:', flush=True)
-    for name, baseline_value, megakernel_value in zip(names, baseline_memory, megakernel_memory):
-        delta = megakernel_value - baseline_value
+    print(f'  [Memory comparison] GigaMOE - {baseline_name}:', flush=True)
+    for name, baseline_value, gigamoe_value in zip(names, baseline_memory, gigamoe_memory):
+        delta = gigamoe_value - baseline_value
         ratio = 100.0 * delta / baseline_value if baseline_value else float('nan')
         print(f'    {name}: {delta / 1024 ** 2:+.2f} MiB ({ratio:+.2f}%)', flush=True)
 
@@ -359,8 +326,6 @@ def moe_compute_on_recv_te(recv_x, recv_topk_idx, recv_topk_weights, recv_num_to
                            te_experts, workspace, experts_per_rank, use_fp8=False):
     if moe_permute_with_probs is None or moe_unpermute is None:
         raise RuntimeError('Transformer Engine MoE operators are required for the Megatron baseline')
-    if not HAVE_TRITON_AVAILABLE:
-        raise RuntimeError('Triton is required for the Megatron baseline')
     assert recv_topk_weights.dtype == torch.float32
     routing_map, probs_map = fused_indices_to_multihot(recv_topk_idx, recv_topk_weights, experts_per_rank)
     tokens_per_expert = _tokens_per_expert_tensor(recv_num_tokens_per_expert_list, recv_x.device)

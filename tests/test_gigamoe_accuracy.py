@@ -1,4 +1,4 @@
-"""Megakernel precision test against the DeepEP + TE baseline."""
+"""GigaMOE precision test against the DeepEP + TE baseline."""
 
 import argparse
 import os
@@ -69,12 +69,12 @@ def compare_tensor(name, baseline, actual, rank, max_abs_tol, calc_diff_tol, cos
 
     if not passed:
 
-        print(f'[Rank {rank}] === Megakernel {name} vs DeepEP + TE Precision Alignment ===', flush=True)
+        print(f'[Rank {rank}] === GigaMOE {name} vs DeepEP + TE Precision Alignment ===', flush=True)
         print(f'  calc_diff (lower=better): {diff:.6e} (tol={calc_diff_tol:.1e})', flush=True)
         print(f'  max_abs_diff: {max_abs_diff:.6e} (tol={max_abs_tol:.1e})', flush=True)
         print(f'  cosine_similarity: {cos_sim:.6f} (tol={cos_tol:.6f})', flush=True)
         print(f'  baseline norm: {baseline.float().norm().item():.6e}', flush=True)
-        print(f'  megakernel norm: {actual.float().norm().item():.6e}', flush=True)
+        print(f'  gigamoe norm: {actual.float().norm().item():.6e}', flush=True)
 
         raise AssertionError(
             f'{name} mismatch on rank {rank}: calc_diff={diff}, '
@@ -140,7 +140,7 @@ def run_te_baseline(x, topk_idx, topk_weights, grad_output, num_experts, experts
     return te_experts, reference
 
 
-def run_megakernel_once(buffer, x, topk_idx, topk_weights, grad_output, num_experts,
+def run_gigamoe_once(buffer, x, topk_idx, topk_weights, grad_output, num_experts,
                         args, W_gateup, W_down, num_sms):
     mk_x = x.detach().clone().requires_grad_(True)
     mk_topk_weights = topk_weights.detach().clone().requires_grad_(True)
@@ -149,23 +149,23 @@ def run_megakernel_once(buffer, x, topk_idx, topk_weights, grad_output, num_expe
 
     mk_output = buffer.gigamoe_autograd(
         mk_x, topk_idx, mk_topk_weights, mk_w_gateup, mk_w_down, num_experts,
-        num_dispatch_sms=args.megakernel_comm_sms,
-        num_combine_sms=args.megakernel_comm_sms,
+        num_dispatch_sms=args.gigamoe_comm_sms,
+        num_combine_sms=args.gigamoe_comm_sms,
         total_sms=num_sms,
         stage=args.stage,
         compute_batch_size=args.compute_batch_size,
         combine_start_head_percent=args.combine_start_head_percent,
     )
     if not mk_output.requires_grad:
-        raise AssertionError('Megakernel output is not connected to autograd')
+        raise AssertionError('GigaMOE output is not connected to autograd')
     mk_output.backward(grad_output)
 
     if mk_x.grad is None:
-        raise AssertionError('Megakernel backward did not return dX')
+        raise AssertionError('GigaMOE backward did not return dX')
     if mk_w_gateup.grad is None or mk_w_down.grad is None:
-        raise AssertionError('Megakernel backward did not return expert weight gradients')
+        raise AssertionError('GigaMOE backward did not return expert weight gradients')
     if mk_topk_weights.grad is None:
-        raise AssertionError('Megakernel backward did not return dTopKWeights')
+        raise AssertionError('GigaMOE backward did not return dTopKWeights')
 
     return {
         'output': mk_output.detach(),
@@ -178,7 +178,7 @@ def run_megakernel_once(buffer, x, topk_idx, topk_weights, grad_output, num_expe
 
 def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, case, case_idx):
     if args.stage not in (1, 2):
-        raise ValueError('megakernel debug backward currently supports stage 1 or 2')
+        raise ValueError('gigamoe debug backward currently supports stage 1 or 2')
     if args.repeat <= 0:
         raise ValueError(f'--repeat must be positive, got {args.repeat}')
 
@@ -229,7 +229,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         )
         print(
             f'  warmup={args.warmup}, repeat={args.repeat}, stage={args.stage}, '
-            f'baseline_sms={args.baseline_sms}, megakernel_comm_sms={args.megakernel_comm_sms}',
+            f'baseline_sms={args.baseline_sms}, gigamoe_comm_sms={args.gigamoe_comm_sms}',
             flush=True,
         )
         print(
@@ -279,8 +279,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     for w in range(args.warmup):
         if local_rank == 0:
-            print(f'[Rank {rank}] Megakernel warmup {w + 1}/{args.warmup}', flush=True)
-        warmup_result = run_megakernel_once(
+            print(f'[Rank {rank}] GigaMOE warmup {w + 1}/{args.warmup}', flush=True)
+        warmup_result = run_gigamoe_once(
             buffer, x, topk_idx, topk_weights, grad_output, num_experts,
             args, W_gateup, W_down, num_sms,
         )
@@ -295,8 +295,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     for repeat_idx in range(args.repeat):
         if local_rank == 0:
-            print(f'[Rank {rank}] Megakernel repeat {repeat_idx + 1}/{args.repeat}', flush=True)
-        result = run_megakernel_once(
+            print(f'[Rank {rank}] GigaMOE repeat {repeat_idx + 1}/{args.repeat}', flush=True)
+        result = run_gigamoe_once(
             buffer, x, topk_idx, topk_weights, grad_output, num_experts,
             args, W_gateup, W_down, num_sms,
         )
@@ -363,20 +363,20 @@ def run_mpirun(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Compare megakernel forward/backward with DeepEP + TE')
+    parser = argparse.ArgumentParser(description='Compare gigamoe forward/backward with DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
     parser.add_argument('--warmup', type=int, default=100,
-                        help='Number of warmup iterations for the megakernel before the measured repeats')
+                        help='Number of warmup iterations for the gigamoe before the measured repeats')
     parser.add_argument('--repeat', type=int, default=10000,
-                        help='Number of measured megakernel repeats to compare against the baseline')
+                        help='Number of measured gigamoe repeats to compare against the baseline')
     parser.add_argument('--skip-baseline', action='store_true',
                         help=argparse.SUPPRESS)
     parser.add_argument('--check-warmup-precision', action='store_true',
-                        help='Compare the megakernel warmup iterations against the baseline reference')
+                        help='Compare the gigamoe warmup iterations against the baseline reference')
     parser.add_argument('--stage', type=int, default=1)
     parser.add_argument('--baseline-sms', type=int, default=48)
-    parser.add_argument('--megakernel-comm-sms', type=int, default=48)
+    parser.add_argument('--gigamoe-comm-sms', type=int, default=48)
     parser.add_argument(
         '--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'],
         default='sigmoid')
@@ -396,9 +396,9 @@ def parse_args():
     parser.add_argument('--backward-cos-tol', type=float, default=0.99)
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
-                        help='Megakernel compute batch size per expert')
+                        help='GigaMOE compute batch size per expert')
     parser.add_argument('--combine-start-head-percent', type=int, default=70,
-                        help='Megakernel combine SM start threshold percentage')
+                        help='GigaMOE combine SM start threshold percentage')
     parser.add_argument('--mpirun', action='store_true')
     args = parser.parse_args()
 
