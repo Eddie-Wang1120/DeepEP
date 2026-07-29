@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from packaging import version
 
-import deep_ep
+import gigamoe
 
 os.environ.setdefault('NVTE_CUTEDSL_FUSED_GROUPED_MLP', '1')
 os.environ.setdefault('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '1')
@@ -424,4 +424,4 @@ def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f'Unsupported router score function: {score_function}')
-    return topk_weights.contiguous(), topk_idx.to(deep_ep.topk_idx_t).contiguous()
+    return topk_weights.contiguous(), topk_idx.to(gigamoe.topk_idx_t).contiguous()

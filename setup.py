@@ -114,17 +114,6 @@ if __name__ == '__main__':
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
-    # MegaKernel token path tracing (printf-based full token lifecycle)
-    if int(os.getenv('MK_TOKEN_TRACE', 0)):
-        cxx_flags.append('-DMK_TOKEN_TRACE')
-        nvcc_flags.append('-DMK_TOKEN_TRACE')
-
-    # MegaKernel gather reduce path:
-    #   0 = fast full-block reduce (default), 1 = align with original combine warp reduce
-    if int(os.getenv('GATHER_ALIGN', 0)):
-        cxx_flags.append('-DGATHER_ALIGN')
-        nvcc_flags.append('-DGATHER_ALIGN')
-
     # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
     #   1 = 1-CTA UMMA (default), 2 = 2-CTA UMMA. (WMMA path removed.)
     mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '1'))
@@ -164,9 +153,9 @@ if __name__ == '__main__':
     except Exception as _:
         revision = ''
 
-    setuptools.setup(name='deep_ep',
-                     version='1.2.1' + revision,
-                     packages=setuptools.find_packages(include=['deep_ep']),
+    setuptools.setup(name='gigamoe',
+                     version='0.0.1' + revision,
+                     packages=setuptools.find_packages(include=['gigamoe']),
                      ext_modules=[
                          CUDAExtension(name='deep_ep_cpp',
                                        include_dirs=include_dirs,

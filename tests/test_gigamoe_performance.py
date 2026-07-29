@@ -23,8 +23,8 @@ import torch.distributed as dist
 
 from utils import init_dist
 
-import deep_ep
-from deep_ep.autotune import (
+import gigamoe
+from gigamoe.autotune import (
     AutotuneResult,
     COMPUTE_BATCH_SIZES,
     COMBINE_START_HEAD_PERCENTS,
@@ -435,7 +435,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 def run_worker(local_rank, num_local_ranks, args):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    buffer = deep_ep.Buffer(
+    buffer = gigamoe.Buffer(
         group, int(2e9), int(1e9), low_latency_mode=False,
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
@@ -472,7 +472,7 @@ def run_mpirun(args):
     torch.cuda.set_device(0)
     group = dist.new_group(list(range(world_size)))
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    buffer = deep_ep.Buffer(
+    buffer = gigamoe.Buffer(
         group, int(2e9), int(1e9), low_latency_mode=False,
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
