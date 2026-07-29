@@ -212,7 +212,7 @@ class MegatronFusedDispatch(torch.autograd.Function):
     def forward(ctx, x, token_indices, token_probs, num_experts, buffer):
         layout = buffer.get_dispatch_layout(token_indices, num_experts)
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = layout
-        recv_x, recv_indices, recv_probs, tokens_per_expert, handle, _ = buffer.dispatch(
+        recv_x, recv_indices, recv_probs, tokens_per_expert, handle, _ = buffer.deepep_dispatch(
             x=x,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -227,7 +227,7 @@ class MegatronFusedDispatch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_x, _grad_indices, grad_probs, _grad_tokens_per_expert, _grad_handle):
-        combined_x, combined_probs, _ = ctx.buffer.combine(
+        combined_x, combined_probs, _ = ctx.buffer.deepep_combine(
             grad_x.contiguous(), ctx.handle,
             topk_weights=None if grad_probs is None else grad_probs.float(),
         )
@@ -237,14 +237,14 @@ class MegatronFusedDispatch(torch.autograd.Function):
 class MegatronFusedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, buffer, handle):
-        output, _, _ = buffer.combine(x=x, handle=handle)
+        output, _, _ = buffer.deepep_combine(x=x, handle=handle)
         ctx.buffer = buffer
         ctx.handle = handle
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_x, _, _, _, _, _ = ctx.buffer.dispatch(
+        grad_x, _, _, _, _, _ = ctx.buffer.deepep_dispatch(
             grad_output.contiguous(), handle=ctx.handle)
         return grad_x, None, None
 

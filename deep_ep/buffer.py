@@ -319,7 +319,7 @@ class Buffer:
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
 
     # noinspection PyTypeChecker
-    def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    def deepep_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  handle: Optional[Tuple] = None,
                  num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
                  is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
@@ -402,7 +402,7 @@ class Buffer:
                 event)
 
     # noinspection PyTypeChecker
-    def combine(self, x: torch.Tensor, handle: Tuple,
+    def deepep_combine(self, x: torch.Tensor, handle: Tuple,
                 topk_weights: Optional[torch.Tensor] = None,
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 config: Optional[Config] = None,
@@ -418,7 +418,7 @@ class Buffer:
 
         Arguments:
             x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its original ranks.
-            handle: a must-set communication handle, you can obtain this from the dispatch function.
+            handle: a must-set communication handle, you can obtain this from deepep_dispatch.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the tokens' top-k weights for reducing to its original ranks.
             bias: 0, 1 or 2 `[num_tokens, hidden]` with `torch.bfloat16` final bias to the output.
             config: the performance tuning config.
@@ -448,6 +448,10 @@ class Buffer:
                                                                           getattr(previous_event, 'event',
                                                                                   None), async_finish, allocate_on_comm_stream)
         return recv_x, recv_topk_weights, EventOverlap(event)
+
+    # Compatibility aliases for unmodified third-party callers.
+    dispatch = deepep_dispatch
+    combine = deepep_combine
 
     # noinspection PyTypeChecker
     def internode_dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

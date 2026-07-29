@@ -2789,7 +2789,7 @@ Buffer::megakernel_debug_backward(
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "DeepEP: an efficient expert-parallel communication library";
+    m.doc() = "GigaMOE: a cross-node Mixture-of-Experts (MoE) training engine";
 
     pybind11::class_<deep_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),
@@ -2867,9 +2867,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("megakernel_debug_backward", &deep_ep::Buffer::megakernel_debug_backward,
              py::arg("context"), py::arg("grad_output"), py::arg("grad_topk_weights") = py::none(),
              py::arg("total_sms") = 148, py::arg("stage") = 1)
-#if MK_PERF_TRACE_ENABLED
-        .def("dump_deepep_perf_trace", &deep_ep::Buffer::dump_deepep_perf_trace)
-#endif
         ;
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);

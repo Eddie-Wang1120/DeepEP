@@ -1,9 +1,9 @@
 """Megakernel performance and memory test harness.
 
-The megakernel section first autotunes compute_batch_size x
-combine_start_head_percent, then measures the best forward/backward
-configuration. Memory is measured separately with the default megakernel
-config.
+The baseline is DeepEP + TE. The megakernel section first autotunes
+compute_batch_size x combine_start_head_percent, then measures the best
+forward/backward configuration. Memory is measured separately with the default
+megakernel config.
 """
 
 import argparse
@@ -31,9 +31,12 @@ from deep_ep.autotune import (
 )
 
 from gigamoe_test_utils import (
-    benchmark_cuda_events,
+    build_te_grouped_experts,
+    clear_parameter_grads,
     make_megatron_router_inputs,
     record_forward_memory,
+    report_memory_comparison,
+    run_megatron_fused_baseline,
     start_memory_measurement,
     finish_memory_measurement,
 )
@@ -56,6 +59,7 @@ def test(**kwargs):
 TEST_CASES = [
     test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=2),
+    # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
     # test(num_tokens=4096, hidden=2048, intermediate=3072, experts_per_rank=8, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
 ]
@@ -100,14 +104,74 @@ def prepare_case_inputs(case, rank, num_ranks, num_local_ranks, args, case_idx):
 
 
 
-def make_megakernel_step(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
-                         W_gateup, W_down, num_sms, compute_batch_size, combine_start_head_percent):
+def benchmark_forward_backward(forward, backward, warmup_iters, repeat_iters, group=None):
+    if warmup_iters < 0:
+        raise ValueError(f'warmup_iters must be >= 0, got {warmup_iters}')
+    if repeat_iters <= 0:
+        raise ValueError(f'repeat_iters must be > 0, got {repeat_iters}')
+
+    if group is not None:
+        dist.barrier(group=group)
+    torch.cuda.synchronize()
+
+    for _ in range(warmup_iters):
+        backward(forward())
+    torch.cuda.synchronize()
+
+    if group is not None:
+        dist.barrier(group=group)
+
+    forward_events = []
+    backward_events = []
+    for _ in range(repeat_iters):
+        forward_start = torch.cuda.Event(enable_timing=True)
+        forward_end = torch.cuda.Event(enable_timing=True)
+        backward_start = torch.cuda.Event(enable_timing=True)
+        backward_end = torch.cuda.Event(enable_timing=True)
+
+        forward_start.record()
+        output = forward()
+        forward_end.record()
+        backward_start.record()
+        backward(output)
+        backward_end.record()
+        forward_events.append((forward_start, forward_end))
+        backward_events.append((backward_start, backward_end))
+
+    torch.cuda.synchronize()
+    forward_ms = sum(start.elapsed_time(end) for start, end in forward_events) / repeat_iters
+    backward_ms = sum(start.elapsed_time(end) for start, end in backward_events) / repeat_iters
+    return forward_ms, backward_ms, forward_ms + backward_ms
+
+
+def make_baseline_functions(x, topk_idx, topk_weights, grad_output, num_experts, experts_per_rank, buffer,
+                            te_experts):
+    def forward():
+        clear_parameter_grads(te_experts)
+        baseline_x = x.detach().clone().requires_grad_(True)
+        baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+        baseline_output = run_megatron_fused_baseline(
+            baseline_x, topk_idx, baseline_topk_weights, num_experts,
+            experts_per_rank, buffer, te_experts,
+        )
+        if not baseline_output.requires_grad:
+            raise AssertionError('DeepEP + TE output is not connected to autograd')
+        return baseline_output
+
+    def backward(output):
+        output.backward(grad_output)
+
+    return forward, backward
+
+
+def make_megakernel_functions(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
+                               W_gateup, W_down, num_sms, compute_batch_size, combine_start_head_percent):
     # Pre-allocate weight tensors outside the timed loop to avoid measuring
     # clone bandwidth that has no baseline equivalent.
     mk_w_gateup = W_gateup.detach().clone().requires_grad_(True)
     mk_w_down = W_down.detach().clone().requires_grad_(True)
 
-    def step():
+    def forward():
         mk_x = x.detach().clone().requires_grad_(True)
         mk_topk_weights = topk_weights.detach().clone().requires_grad_(True)
         mk_w_gateup.grad = None
@@ -123,9 +187,12 @@ def make_megakernel_step(buffer, x, topk_idx, topk_weights, grad_output, num_exp
         )
         if not mk_output.requires_grad:
             raise AssertionError('Megakernel output is not connected to autograd')
-        mk_output.backward(grad_output)
+        return mk_output
 
-    return step
+    def backward(output):
+        output.backward(grad_output)
+
+    return forward, backward
 
 
 def autotune_megakernel(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
@@ -144,24 +211,25 @@ def autotune_megakernel(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                   f'Starting: compute_batch_size={batch_size}, combine_start_head_percent={percent}%',
                   flush=True)
 
-        step = make_megakernel_step(
+        forward, backward = make_megakernel_functions(
             buffer, x, topk_idx, topk_weights, grad_output,
             num_experts, args, W_gateup, W_down, num_sms, batch_size, percent,
         )
-        avg_ms = benchmark_cuda_events(
-            step, args.warmup, args.repeat, group=group,
+        forward_ms, backward_ms, total_ms = benchmark_forward_backward(
+            forward, backward, args.warmup, args.repeat, group=group,
         )
 
-        results.append((batch_size, percent, avg_ms))
+        results.append((batch_size, percent, total_ms))
 
         if verbose and rank == 0:
             print(f'  [autotune] [{config_idx + 1}/{total_configs}] '
                   f'compute_batch_size={batch_size:4d}, '
-                  f'combine_start_head_percent={percent:2d}% -> {avg_ms:.4f} ms/iter',
-                  flush=True)
+                  f'combine_start_head_percent={percent:2d}% -> '
+                  f'forward={forward_ms:.4f} ms, backward={backward_ms:.4f} ms, '
+                  f'total={total_ms:.4f} ms/iter', flush=True)
 
-        if avg_ms < best_time:
-            best_time = avg_ms
+        if total_ms < best_time:
+            best_time = total_ms
             best_config = (batch_size, percent)
 
         if group is not None:
@@ -206,7 +274,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         )
         print(
             f'  warmup={args.warmup}, repeat={args.repeat}, stage={args.stage}, '
-            f'megakernel_comm_sms={args.megakernel_comm_sms}',
+            f'baseline_sms={args.baseline_sms}, megakernel_comm_sms={args.megakernel_comm_sms}',
             flush=True,
         )
         print(
@@ -215,10 +283,30 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             flush=True,
         )
 
-    buffer.set_num_sms(args.megakernel_comm_sms)
+    buffer.set_num_sms(args.baseline_sms)
+    te_experts = build_te_grouped_experts(
+        W_gate.detach(), W_up.detach(), W_down.detach(), case.experts_per_rank)
+    for parameter in te_experts.parameters():
+        parameter.requires_grad_(True)
 
     torch.manual_seed(2000 + rank + case_idx * 1000003 + args.case_seed_offset)
     grad_output = torch.randn_like(x)
+
+    if rank == 0:
+        print('  [perf] Benchmarking DeepEP + TE baseline...', flush=True)
+    baseline_forward, baseline_backward = make_baseline_functions(
+        x, topk_idx, topk_weights, grad_output,
+        num_experts, case.experts_per_rank, buffer, te_experts,
+    )
+    baseline_forward_ms, baseline_backward_ms, baseline_time_ms = benchmark_forward_backward(
+        baseline_forward, baseline_backward, args.warmup, args.repeat, group=group)
+    if rank == 0:
+        print(
+            f'  [perf] DeepEP + TE baseline: forward={baseline_forward_ms:.4f} ms, '
+            f'backward={baseline_backward_ms:.4f} ms, total={baseline_time_ms:.4f} ms/iter',
+            flush=True,
+        )
+    clear_parameter_grads(te_experts)
 
     dist.barrier(group=group)
     torch.cuda.synchronize()
@@ -240,27 +328,54 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
             f'  [perf] Megakernel best autotune config: '
             f'compute_batch_size={best_result.compute_batch_size}, '
             f'combine_start_head_percent={best_result.combine_start_head_percent}%, '
-            f'forward/backward={best_result.time_ms:.4f} ms/iter',
+            f'total={best_result.time_ms:.4f} ms/iter',
             flush=True,
         )
 
     dist.barrier(group=group)
     torch.cuda.synchronize()
 
-    best_step = make_megakernel_step(
+    megakernel_forward, megakernel_backward = make_megakernel_functions(
         buffer, x, topk_idx, topk_weights, grad_output,
         num_experts, args, W_gateup, W_down, num_sms,
         best_result.compute_batch_size, best_result.combine_start_head_percent,
     )
-    megakernel_time_ms = benchmark_cuda_events(
-        best_step, args.warmup, args.repeat, group=group,
+    megakernel_forward_ms, megakernel_backward_ms, megakernel_time_ms = benchmark_forward_backward(
+        megakernel_forward, megakernel_backward, args.warmup, args.repeat, group=group,
     )
     if rank == 0:
-        print(f'  [perf] Megakernel best forward/backward: {megakernel_time_ms:.4f} ms/iter', flush=True)
+        print(
+            f'  [perf] Megakernel best: forward={megakernel_forward_ms:.4f} ms, '
+            f'backward={megakernel_backward_ms:.4f} ms, total={megakernel_time_ms:.4f} ms/iter',
+            flush=True,
+        )
 
     dist.barrier(group=group)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
+
+    dist.barrier(group=group)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    baseline_name = 'DeepEP + TE'
+    if rank == 0:
+        print('  [memory] Measuring DeepEP + TE baseline...', flush=True)
+    clear_parameter_grads(te_experts)
+    baseline_mem_start = start_memory_measurement()
+    baseline_x = x.detach().clone().requires_grad_(True)
+    baseline_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+    baseline_output = run_megatron_fused_baseline(
+        baseline_x, topk_idx, baseline_topk_weights, num_experts,
+        case.experts_per_rank, buffer, te_experts,
+    )
+    if not baseline_output.requires_grad:
+        raise AssertionError('DeepEP + TE output is not connected to autograd')
+    baseline_activation_retained = record_forward_memory(baseline_mem_start)
+    baseline_output.backward(grad_output)
+    baseline_memory = finish_memory_measurement(
+        baseline_mem_start, baseline_activation_retained, baseline_name)
+    clear_parameter_grads(te_experts)
 
     dist.barrier(group=group)
     torch.cuda.synchronize()
@@ -296,10 +411,14 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     megakernel_output.backward(grad_output)
     megakernel_memory = finish_memory_measurement(
         megakernel_mem_start, megakernel_activation_retained, 'Megakernel')
-
     if rank == 0:
+        report_memory_comparison(baseline_memory, megakernel_memory, baseline_name)
         print(
-            f'  [summary] case {case_idx + 1}: megakernel(best)={megakernel_time_ms:.4f} ms/iter',
+            f'  [summary] case {case_idx + 1}: '
+            f'baseline(fwd={baseline_forward_ms:.4f}, bwd={baseline_backward_ms:.4f}, '
+            f'total={baseline_time_ms:.4f}) ms/iter, '
+            f'megakernel(best, fwd={megakernel_forward_ms:.4f}, '
+            f'bwd={megakernel_backward_ms:.4f}, total={megakernel_time_ms:.4f}) ms/iter',
             flush=True,
         )
 
@@ -366,7 +485,7 @@ def run_mpirun(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Measure and autotune megakernel performance and memory')
+        description='Measure and autotune megakernel performance and memory against DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-cases', type=int, default=1)
     parser.add_argument('--warmup', '--warmup-iters', dest='warmup', type=int, default=10,
@@ -374,6 +493,7 @@ def parse_args():
     parser.add_argument('--repeat', '--num-iters', dest='repeat', type=int, default=1000,
                         help='Timed iterations for each benchmark')
     parser.add_argument('--stage', type=int, default=1)
+    parser.add_argument('--baseline-sms', type=int, default=48)
     parser.add_argument('--megakernel-comm-sms', type=int, default=48)
     parser.add_argument(
         '--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'],

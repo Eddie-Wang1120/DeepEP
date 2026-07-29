@@ -426,13 +426,6 @@ public:
         int compute_batch_size,
         int combine_start_head_percent);
 
-#if MK_PERF_TRACE_ENABLED
-    // Baseline trace events use the same Perfetto JSON format as megakernel traces.
-    float deepep_perf_trace_notify_dispatch_ms_ = 0.0f;
-    float deepep_perf_trace_dispatch_ms_ = 0.0f;
-    float deepep_perf_trace_combine_ms_ = 0.0f;
-    void dump_deepep_perf_trace();
-#endif
 };
 
 }  // namespace deep_ep
