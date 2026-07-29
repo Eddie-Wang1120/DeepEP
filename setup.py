@@ -125,8 +125,6 @@ if __name__ == '__main__':
         cxx_flags.append('-DENABLE_FAST_DEBUG')
         nvcc_flags.append('-DENABLE_FAST_DEBUG')
 
-    # cxx_flags.append("TORCH_USE_CUDA_DSA")
-
     # Put them together
     extra_compile_args = {
         'cxx': cxx_flags,

@@ -51,23 +51,23 @@ private:
 }  // namespace shared_memory
 
 namespace gigamoe {
-struct MegaKernelState;
+struct GigaMoEState;
 }
 
 namespace deep_ep {
 
-class MegaKernelAutogradContext {
+class GigaMoEAutogradContext {
 public:
-    MegaKernelAutogradContext(::gigamoe::MegaKernelState* state,
+    GigaMoEAutogradContext(::gigamoe::GigaMoEState* state,
                               int num_tokens,
                               int hidden_dim,
                               int intermediate_dim,
                               int num_topk,
                               int num_local_experts,
                               std::vector<int> expert_counts);
-    ~MegaKernelAutogradContext();
+    ~GigaMoEAutogradContext();
 
-    ::gigamoe::MegaKernelState* state() const;
+    ::gigamoe::GigaMoEState* state() const;
     int num_tokens() const;
     int hidden_dim() const;
     int intermediate_dim() const;
@@ -75,14 +75,14 @@ public:
     int num_local_experts() const;
     const std::vector<int>& expert_counts() const;
 
-    // Host-side snapshot of the forward MegaKernelState, captured at forward-end.
+    // Host-side snapshot of the forward GigaMoEState, captured at forward-end.
     // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
     // the device state, eliminating the most expensive host stall in the backward path.
-    const ::gigamoe::MegaKernelState& cached_host_state() const;
-    void set_cached_host_state(const ::gigamoe::MegaKernelState& hs);
+    const ::gigamoe::GigaMoEState& cached_host_state() const;
+    void set_cached_host_state(const ::gigamoe::GigaMoEState& hs);
 
     // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
-    // training state. The MegaKernelState stores only raw data_ptr()s into these tensors, and
+    // training state. The GigaMoEState stores only raw data_ptr()s into these tensors, and
     // the backward re-runs dispatch/combine off the same state. Without retaining them here they
     // are freed when the forward returns; the caching allocator may then hand their blocks to the
     // backward's own allocations (e.g. torch::zeros for grad_w_*), zeroing rdma_channel_prefix_matrix
@@ -90,8 +90,8 @@ public:
     void retain_layout_tensors(std::vector<torch::Tensor> tensors);
 
 private:
-    ::gigamoe::MegaKernelState* state_;
-    ::gigamoe::MegaKernelState* cached_host_state_ = nullptr;
+    ::gigamoe::GigaMoEState* state_;
+    ::gigamoe::GigaMoEState* cached_host_state_ = nullptr;
     int num_tokens_;
     int hidden_dim_;
     int intermediate_dim_;
@@ -380,7 +380,7 @@ public:
         int compute_batch_size,
         int combine_start_head_percent);
 
-    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> gigamoe_forward_train(
+    std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> gigamoe_forward_train(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -398,13 +398,13 @@ public:
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> gigamoe_backward(
-        const std::shared_ptr<MegaKernelAutogradContext>& context,
+        const std::shared_ptr<GigaMoEAutogradContext>& context,
         const torch::Tensor& grad_output,
         const std::optional<torch::Tensor>& grad_topk_weights,
         int total_sms,
         int stage);
 
-    std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> gigamoe_fused_forward_impl(
+    std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> gigamoe_fused_forward_impl(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,

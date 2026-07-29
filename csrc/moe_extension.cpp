@@ -1887,7 +1887,7 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-MegaKernelAutogradContext::MegaKernelAutogradContext(::gigamoe::MegaKernelState* state,
+GigaMoEAutogradContext::GigaMoEAutogradContext(::gigamoe::GigaMoEState* state,
                                                      int num_tokens,
                                                      int hidden_dim,
                                                      int intermediate_dim,
@@ -1902,7 +1902,7 @@ MegaKernelAutogradContext::MegaKernelAutogradContext(::gigamoe::MegaKernelState*
       num_local_experts_(num_local_experts),
       expert_counts_(std::move(expert_counts)) {}
 
-MegaKernelAutogradContext::~MegaKernelAutogradContext() {
+GigaMoEAutogradContext::~GigaMoEAutogradContext() {
 #ifndef DISABLE_NVSHMEM
     if (state_ != nullptr)
         ::gigamoe::free_gigamoe_fused_state(
@@ -1912,51 +1912,51 @@ MegaKernelAutogradContext::~MegaKernelAutogradContext() {
         ::gigamoe::detail::state_cache::free_host(cached_host_state_);
 }
 
-::gigamoe::MegaKernelState* MegaKernelAutogradContext::state() const {
+::gigamoe::GigaMoEState* GigaMoEAutogradContext::state() const {
     return state_;
 }
 
-int MegaKernelAutogradContext::num_tokens() const {
+int GigaMoEAutogradContext::num_tokens() const {
     return num_tokens_;
 }
 
-int MegaKernelAutogradContext::hidden_dim() const {
+int GigaMoEAutogradContext::hidden_dim() const {
     return hidden_dim_;
 }
 
-int MegaKernelAutogradContext::intermediate_dim() const {
+int GigaMoEAutogradContext::intermediate_dim() const {
     return intermediate_dim_;
 }
 
-int MegaKernelAutogradContext::num_topk() const {
+int GigaMoEAutogradContext::num_topk() const {
     return num_topk_;
 }
 
-int MegaKernelAutogradContext::num_local_experts() const {
+int GigaMoEAutogradContext::num_local_experts() const {
     return num_local_experts_;
 }
 
-const std::vector<int>& MegaKernelAutogradContext::expert_counts() const {
+const std::vector<int>& GigaMoEAutogradContext::expert_counts() const {
     return expert_counts_;
 }
 
-void MegaKernelAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
+void GigaMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
     retained_layout_tensors_ = std::move(tensors);
 }
 
-const ::gigamoe::MegaKernelState& MegaKernelAutogradContext::cached_host_state() const {
+const ::gigamoe::GigaMoEState& GigaMoEAutogradContext::cached_host_state() const {
     EP_HOST_ASSERT(cached_host_state_ != nullptr);
     return *cached_host_state_;
 }
 
-void MegaKernelAutogradContext::set_cached_host_state(const ::gigamoe::MegaKernelState& hs) {
+void GigaMoEAutogradContext::set_cached_host_state(const ::gigamoe::GigaMoEState& hs) {
     if (cached_host_state_ != nullptr)
         ::gigamoe::detail::state_cache::free_host(cached_host_state_);
     cached_host_state_ = ::gigamoe::detail::state_cache::alloc_host();
     ::gigamoe::detail::state_cache::copy_host(cached_host_state_, &hs);
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gigamoe_fused_forward_impl(
+std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigamoe_fused_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2065,10 +2065,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     }
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups -> gather, leaving any remainder reserved.
-    constexpr int compute_group_size = megakernel_config::kComputeGroupSize;
-    constexpr int compute_cluster_dim = megakernel_config::kComputeClusterDim;
-    constexpr int compute_scheduler_sms = megakernel_config::kComputeSchedulerSms;
-    constexpr int gather_sms = megakernel_config::kGatherSms;
+    constexpr int compute_group_size = gigamoe_config::kComputeGroupSize;
+    constexpr int compute_cluster_dim = gigamoe_config::kComputeClusterDim;
+    constexpr int compute_scheduler_sms = gigamoe_config::kComputeSchedulerSms;
+    constexpr int gather_sms = gigamoe_config::kGatherSms;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;
@@ -2201,7 +2201,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
         // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify skips
         // RDMA metadata clean so the in-kernel combine prelude is the single owner of that clear.
         void* combine_rdma_ptr = rdma_buffer_ptr;
-        ::gigamoe::mk_cached_notfy(hidden_int4,
+        ::gigamoe::gigamoe_cached_notify(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
                                  num_topk,   // num_topk_weights
@@ -2261,10 +2261,10 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     auto result = torch::empty(
         {num_tokens, hidden_dim}, x.options().dtype(torch::kBFloat16));
 
-    // host_state_out receives the complete host-side MegaKernelState snapshot from
+    // host_state_out receives the complete host-side GigaMoEState snapshot from
     // allocate_gigamoe_fused_state. The backward uses this directly (via context) instead
     // of a synchronous D2H cudaMemcpy from the device state.
-    ::gigamoe::MegaKernelState* fwd_host_state_ptr =
+    ::gigamoe::GigaMoEState* fwd_host_state_ptr =
         ::gigamoe::detail::state_cache::alloc_host();
     auto allocate_state = [&](auto allocator) {
         return allocator(
@@ -2353,17 +2353,17 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
     }
 
     ::gigamoe::launch_gigamoe_fused_forward(
-        static_cast<::gigamoe::MegaKernelState*>(state),
+        static_cast<::gigamoe::GigaMoEState*>(state),
         fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::shared_ptr<MegaKernelAutogradContext> context;
+    std::shared_ptr<GigaMoEAutogradContext> context;
     if (retain_state) {
         EP_HOST_ASSERT(!use_fp8_compute && "GigaMOE training state currently requires BF16 mode");
-        context = std::make_shared<MegaKernelAutogradContext>(
-            static_cast<::gigamoe::MegaKernelState*>(state),
+        context = std::make_shared<GigaMoEAutogradContext>(
+            static_cast<::gigamoe::GigaMoEState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
             mk_expert_counts);
         // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
@@ -2379,7 +2379,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
         context->set_cached_host_state(*fwd_host_state_ptr);
         ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
         fwd_host_state_ptr = nullptr;
-        // The MegaKernelState keeps only raw data_ptr()s into these notify_dispatch-produced
+        // The GigaMoEState keeps only raw data_ptr()s into these notify_dispatch-produced
         // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
         // they outlive this forward call (otherwise the backward reads dangling/zeroed memory —
         // notably rdma_channel_prefix_matrix, which stalls the backward NVL dispatch).
@@ -2394,7 +2394,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
         });
     } else {
         ::gigamoe::free_gigamoe_fused_state(
-            static_cast<::gigamoe::MegaKernelState*>(state),
+            static_cast<::gigamoe::GigaMoEState*>(state),
             fwd_host_state_ptr);
         if (fwd_host_state_ptr != nullptr)
             ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
@@ -2435,7 +2435,7 @@ torch::Tensor Buffer::gigamoe_forward(
         compute_batch_size, combine_start_head_percent));
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gigamoe_forward_train(
+std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigamoe_forward_train(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2461,7 +2461,7 @@ std::tuple<torch::Tensor, std::shared_ptr<MegaKernelAutogradContext>> Buffer::gi
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 Buffer::gigamoe_backward(
-    const std::shared_ptr<MegaKernelAutogradContext>& context,
+    const std::shared_ptr<GigaMoEAutogradContext>& context,
     const torch::Tensor& grad_output,
     const std::optional<torch::Tensor>& grad_topk_weights,
     int total_sms,
@@ -2588,9 +2588,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
-    pybind11::class_<deep_ep::MegaKernelAutogradContext,
-                     std::shared_ptr<deep_ep::MegaKernelAutogradContext>>(
-        m, "MegaKernelAutogradContext");
+    pybind11::class_<deep_ep::GigaMoEAutogradContext,
+                     std::shared_ptr<deep_ep::GigaMoEAutogradContext>>(
+        m, "GigaMoEAutogradContext");
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())

@@ -600,7 +600,7 @@ void cached_notify(int hidden_int4,
 // reserved for original DeepEP. Clean-only megakernel replays use fixed geometry to avoid
 // logical-channel expansion exceeding per-block limits; head-normalization replays use the
 // standard geometry but still go through this separate megakernel entry point.
-void mk_cached_notfy(int hidden_int4,
+void gigamoe_cached_notify(int hidden_int4,
                      int num_scales,
                      int num_topk_idx,
                      int num_topk_weights,

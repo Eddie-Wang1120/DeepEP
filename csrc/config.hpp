@@ -5,7 +5,7 @@
 
 namespace deep_ep {
 
-namespace megakernel_config {
+namespace gigamoe_config {
 
 constexpr int kComputeBatchSizeDefault = 4096;  // Default tokens per expert batch before triggering GEMM.
 constexpr int kComputeGroupSize = 48;    // SMs cooperating on one expert batch.
@@ -29,7 +29,7 @@ static_assert(kGatherSchedMaxWarps == (800 - kGatherSchedTidBegin) / 32,
 static_assert(kComputeGroupSize > 0, "kComputeGroupSize must be positive");
 static_assert(kComputeSchedulerSms > 0, "kComputeSchedulerSms must be positive");
 
-}  // namespace megakernel_config
+}  // namespace gigamoe_config
 
 template <typename dtype_t>
 __host__ __device__ constexpr dtype_t ceil_div(dtype_t a, dtype_t b) {

@@ -37,22 +37,22 @@ namespace umma = ::deep_ep::megakernel::umma;
 // The old compile-time constant is removed; use state->compute_batch_size everywhere in device code,
 // and the local `compute_batch_size` variable in host allocation functions.
 // COMPUTE_BATCH_SIZE macro kept as an alias to state->compute_batch_size for device code
-// that is called with a MegaKernelState* named `state` in scope.
+// that is called with a GigaMoEState* named `state` in scope.
 // Host-side code must #undef and use a local variable instead.
 #define COMPUTE_BATCH_SIZE (state->compute_batch_size)
-constexpr int COMPUTE_GROUP_SIZE = megakernel_config::kComputeGroupSize;
-constexpr int COMPUTE_SCHEDULER_SMS = megakernel_config::kComputeSchedulerSms;
-constexpr int GATHER_SMS = megakernel_config::kGatherSms;
-constexpr int GATHER_SCHED_TID_BEGIN = megakernel_config::kGatherSchedTidBegin;
-constexpr int NORMAL_SCHED_THREADS = megakernel_config::kNormalSchedThreads;
-constexpr int GATHER_SCHED_MAX_WARPS = megakernel_config::kGatherSchedMaxWarps;
-constexpr int MK_COMPUTE_CLUSTER_DIM = megakernel_config::kComputeClusterDim;
-// COMBINE_START_HEAD_PERCENT is now a runtime field in MegaKernelState.
-constexpr int MK_TIMEOUT_LOG_BUDGET = megakernel_config::kTimeoutLogBudget;
-constexpr int MK_DISPATCH_ROLE_COUNT = megakernel_config::kDispatchRoleCount;
-constexpr int PUB_RING_DEPTH = megakernel_config::kPubRingDepth;
-constexpr int PUB_CONSUME_BATCH = megakernel_config::kPubConsumeBatch;
-constexpr int PUB_PRODUCE_BATCH = megakernel_config::kPubProduceBatch;
+constexpr int COMPUTE_GROUP_SIZE = gigamoe_config::kComputeGroupSize;
+constexpr int COMPUTE_SCHEDULER_SMS = gigamoe_config::kComputeSchedulerSms;
+constexpr int GATHER_SMS = gigamoe_config::kGatherSms;
+constexpr int GATHER_SCHED_TID_BEGIN = gigamoe_config::kGatherSchedTidBegin;
+constexpr int NORMAL_SCHED_THREADS = gigamoe_config::kNormalSchedThreads;
+constexpr int GATHER_SCHED_MAX_WARPS = gigamoe_config::kGatherSchedMaxWarps;
+constexpr int MK_COMPUTE_CLUSTER_DIM = gigamoe_config::kComputeClusterDim;
+// COMBINE_START_HEAD_PERCENT is now a runtime field in GigaMoEState.
+constexpr int MK_TIMEOUT_LOG_BUDGET = gigamoe_config::kTimeoutLogBudget;
+constexpr int MK_DISPATCH_ROLE_COUNT = gigamoe_config::kDispatchRoleCount;
+constexpr int PUB_RING_DEPTH = gigamoe_config::kPubRingDepth;
+constexpr int PUB_CONSUME_BATCH = gigamoe_config::kPubConsumeBatch;
+constexpr int PUB_PRODUCE_BATCH = gigamoe_config::kPubProduceBatch;
 
 enum TimeoutLogSite {
     kTimeoutLogComputeRoundFlush = 0,
@@ -115,7 +115,7 @@ struct MegaKernelBackwardState;
 // stays well under this cap for realistic cases.
 constexpr int kMegakernelArenaChunkCap = 128;
 
-struct MegaKernelState {
+struct GigaMoEState {
     int* timeout_log_counters;        // [kTimeoutLogCount] per-site bounded logging budget
     // --- DeepEP NVSHMEM infrastructure (from Buffer object) ---
     void* rdma_buffer_ptr;            // Symmetric RDMA buffer base (for SymBuffer construction)
@@ -387,7 +387,7 @@ __device__ __forceinline__ int get_publish_warp_index(int dispatch_sm_idx, int s
 }
 
 __device__ __forceinline__ int publish_recv_token_from_pending(
-    MegaKernelState* state,
+    GigaMoEState* state,
     int recv_token_idx,
     int local_expert_begin,
     int num_topk,
@@ -471,7 +471,7 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
     return num_hits;
 }
 
-__device__ void publish_worker(int dispatch_sm_idx, int src_nvl_rank, MegaKernelState* state) {
+__device__ void publish_worker(int dispatch_sm_idx, int src_nvl_rank, GigaMoEState* state) {
     const int lane_id = get_lane_id();
     const int pw = get_publish_warp_index(dispatch_sm_idx, src_nvl_rank);
     const int local_expert_begin = state->rank * state->num_local_experts;
@@ -522,7 +522,7 @@ __device__ void publish_worker(int dispatch_sm_idx, int src_nvl_rank, MegaKernel
     }
 }
 
-__device__ __forceinline__ void compute_group_sync(MegaKernelState* state, int group_id, int group_size) {
+__device__ __forceinline__ void compute_group_sync(GigaMoEState* state, int group_id, int group_size) {
     EP_DEVICE_ASSERT(group_size > 0 && group_size <= COMPUTE_GROUP_SIZE);
     EP_DEVICE_ASSERT(group_id >= 0 && group_id < state->num_compute_groups);
     __syncthreads();
@@ -546,7 +546,7 @@ __device__ __forceinline__ void compute_worker(
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
-    MegaKernelState* state,
+    GigaMoEState* state,
     uint8_t* smem_buffer
 );
 
@@ -584,7 +584,7 @@ template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType, bool kDispa
 __device__ void dispatch_worker(
     int sm_id,
     int dispatch_sm_idx,  // 0-based index among all dispatch SMs
-    MegaKernelState* state,
+    GigaMoEState* state,
     MegaKernelBackwardState* backward_state = nullptr
 ) {
     using namespace internode;
@@ -1478,7 +1478,7 @@ __device__ void dispatch_worker(
 // Compute Scheduler + Worker: scheduler enqueues expert batches, compute groups run GEMM+SwiGLU
 // ============================================================================
 
-__device__ __forceinline__ bool timeout_log_once(MegaKernelState* state, int site_id) {
+__device__ __forceinline__ bool timeout_log_once(GigaMoEState* state, int site_id) {
     if (site_id < 0 || site_id >= kTimeoutLogCount)
         return false;
     if (state->timeout_log_counters == nullptr)
@@ -1505,7 +1505,7 @@ __device__ __forceinline__ int scheduler_compute_all(int predicate, int* shared_
 }
 
 __device__ __forceinline__ int scheduler_compute_all_until_publish_done(
-    int predicate, int* shared_result, int num_threads, MegaKernelState* state, int* dispatch_done) {
+    int predicate, int* shared_result, int num_threads, GigaMoEState* state, int* dispatch_done) {
     if (threadIdx.x == 0) {
         if (*dispatch_done == 0 && ld_acquire_global(state->publish_all_done) != 0) {
             *dispatch_done = 1;
@@ -1526,7 +1526,7 @@ __device__ __forceinline__ int scheduler_compute_all_until_publish_done(
     return result;
 }
 
-__device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, int expert_id, int start_slot, int num_tokens, int is_flush, int source) {
+__device__ __forceinline__ void scheduler_publish_task(GigaMoEState* state, int expert_id, int start_slot, int num_tokens, int is_flush, int source) {
     int tail = atomicAdd(state->compute_task_reserve_tail, 1);
     if (tail >= state->max_compute_tasks) {
         printf("MK compute task queue overflow, rank=%d tail=%d max=%d\n", state->rank, tail, state->max_compute_tasks);
@@ -1541,7 +1541,7 @@ __device__ __forceinline__ void scheduler_publish_task(MegaKernelState* state, i
 
 // source: 1=normal scheduler, 2=priority scheduler, 3=tail flush.
 __device__ __forceinline__ bool scheduler_try_enqueue_batch(
-    MegaKernelState* state, int expert_id, int batch_id, int start_slot, int num_tokens, int is_flush, int source) {
+    GigaMoEState* state, int expert_id, int batch_id, int start_slot, int num_tokens, int is_flush, int source) {
     if (batch_id < 0 || batch_id >= state->max_batches_per_expert) {
         printf("MK scheduler batch id overflow, rank=%d expert=%d batch=%d max=%d\n",
                state->rank, expert_id, batch_id, state->max_batches_per_expert);
@@ -1555,7 +1555,7 @@ __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     return true;
 }
 
-__device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* state) {
+__device__ __forceinline__ void scheduler_scan_gather_tokens(GigaMoEState* state) {
     const int tid = threadIdx.x;
     if (tid < GATHER_SCHED_TID_BEGIN)
         return;
@@ -1599,7 +1599,7 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(MegaKernelState* st
     }
 }
 
-__device__ void compute_scheduler_worker(MegaKernelState* state, int scheduler_id, int num_schedulers) {
+__device__ void compute_scheduler_worker(GigaMoEState* state, int scheduler_id, int num_schedulers) {
     const int tid = threadIdx.x;
     const int num_threads = min(NORMAL_SCHED_THREADS, static_cast<int>(blockDim.x));
     const int num_local_experts = state->num_local_experts;
@@ -1754,7 +1754,7 @@ __device__ __forceinline__ void compute_worker_core(
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
-    MegaKernelState* state,
+    GigaMoEState* state,
     int group_id_base,
     uint8_t* smem_buffer
 ) {
@@ -2120,7 +2120,7 @@ __device__ __forceinline__ void compute_worker(
     int sm_id,
     int compute_sm_idx,
     int num_compute_sms,
-    MegaKernelState* state,
+    GigaMoEState* state,
     uint8_t* smem_buffer
 ) {
     compute_worker_core<kComputeDType, false>(
@@ -2138,7 +2138,7 @@ __device__ __forceinline__ void compute_worker(
 template <int kNumRDMARanks, int kStage>
 __device__ void combine_worker(
     int combine_sm_idx,       // 0-based index among combine SMs
-    MegaKernelState* state
+    GigaMoEState* state
 ) {
     using namespace internode;
     using dtype_t = nv_bfloat16;
@@ -3076,7 +3076,7 @@ __device__ void combine_precompute_worker(
     int sm_id,
     int combine_sm_idx,
     int num_combine_sms,
-    MegaKernelState* state,
+    GigaMoEState* state,
     uint8_t* smem_buffer
 ) {
     const int post_group_count =
@@ -3106,7 +3106,7 @@ __device__ __forceinline__ void gather_accum_int4(float2* acc, int4 raw) {
         gather_accum_bf162(acc[p], bv2[p]);
 }
 
-__device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
+__device__ void gather_worker(GigaMoEState* state, int gather_sm_idx) {
     const int tid = threadIdx.x;
     const int total_tokens = state->combine_num_tokens;
     if (total_tokens == 0) return;
@@ -3244,7 +3244,7 @@ __device__ void gather_worker(MegaKernelState* state, int gather_sm_idx) {
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) gigamoe_fused_forward_kernel(
-    MegaKernelState* state
+    GigaMoEState* state
 ) {
     const int sm_id = blockIdx.x;
     const int num_dispatch_sms = state->num_dispatch_sms;
@@ -3315,8 +3315,8 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 static void launch_gigamoe_fused_forward_case(
-    MegaKernelState* device_state,
-    const MegaKernelState& host_state,
+    GigaMoEState* device_state,
+    const GigaMoEState& host_state,
     int total_sms,
     int smem_size,
     cudaStream_t stream
@@ -3363,18 +3363,18 @@ static void launch_gigamoe_fused_forward_case(
 }
 
 void launch_gigamoe_fused_forward_impl(
-    MegaKernelState* device_state,
-    const MegaKernelState* host_state,
+    GigaMoEState* device_state,
+    const GigaMoEState* host_state,
     int total_sms,
     int smem_size,
     int stage,
     ComputeDType compute_dtype,
     cudaStream_t stream
 ) {
-    MegaKernelState copied_host_state;
-    const MegaKernelState* launcher_host_state = host_state;
+    GigaMoEState copied_host_state;
+    const GigaMoEState* launcher_host_state = host_state;
     if (launcher_host_state == nullptr) {
-        CUDA_CHECK(cudaMemcpy(&copied_host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&copied_host_state, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
         launcher_host_state = &copied_host_state;
     }
     const int num_ranks = launcher_host_state->num_ranks;
@@ -3461,10 +3461,10 @@ __global__ void fused_fill_kernel(
         words[i] = desc.word;
 }
 
-static void initialize_megakernel_launch_state(const MegaKernelState& state, cudaStream_t stream);
+static void initialize_megakernel_launch_state(const GigaMoEState& state, cudaStream_t stream);
 
 // --- TMA descriptor cache (persistent across iterations; the cache is the SOLE owner
-// of these device buffers — no MegaKernelState ever frees them). A small bounded,
+// of these device buffers — no GigaMoEState ever frees them). A small bounded,
 // round-robin set of entries lets the forward key and backward key coexist so both
 // paths hit across iterations. Buffers are only freed when an entry slot is evicted,
 // which is safe because the kernel that used them has already completed (synchronous
@@ -3565,7 +3565,7 @@ static inline cudaError_t free_arena_chunks(void** chunks, int count) {
 // Undefine it and use a local variable / function parameter instead.
 #undef COMPUTE_BATCH_SIZE
 
-MegaKernelState* allocate_gigamoe_fused_state(
+GigaMoEState* allocate_gigamoe_fused_state(
     // --- Dispatch input data (from PyTorch tensors) ---
     const int4* x,
     const uint32_t* x_scales,
@@ -3631,7 +3631,7 @@ MegaKernelState* allocate_gigamoe_fused_state(
     int* external_fwd_slot_map,
     int4* external_combined_x,
     float* external_combined_topk_weights,
-    MegaKernelState* host_state_out,
+    GigaMoEState* host_state_out,
     int* rdma_reuse_dispatch_quiet_done,
     int* rdma_reuse_combine_clear_done,
     int rdma_reuse_prelude_enable,
@@ -4125,7 +4125,7 @@ MegaKernelState* allocate_gigamoe_fused_state(
     CUDA_CHECK(cudaMemset(recv_gbl_channel_token_count, 0, num_ranks * num_logical_channels * sizeof(int)));
 
     // Build host-side state and copy to device
-    MegaKernelState host_state;
+    GigaMoEState host_state;
     memset(&host_state, 0, sizeof(host_state));
 
     // NVSHMEM infra
@@ -4404,13 +4404,13 @@ MegaKernelState* allocate_gigamoe_fused_state(
 
     // Copy state + fill descs to device in one async batch on the current stream.
     cudaStream_t init_stream = c10::cuda::getCurrentCUDAStream().stream();
-    MegaKernelState* device_state;
-    CUDA_CHECK(cudaMalloc(&device_state, sizeof(MegaKernelState)));
+    GigaMoEState* device_state;
+    CUDA_CHECK(cudaMalloc(&device_state, sizeof(GigaMoEState)));
     store_arena_chunks(persistent_arena, host_state.persistent_arena_chunks, &host_state.persistent_arena_chunk_count);
     store_arena_chunks(transient_arena, host_state.transient_arena_chunks, &host_state.transient_arena_chunk_count);
     if (host_state_out != nullptr)
         *host_state_out = host_state;
-    CUDA_CHECK(cudaMemcpyAsync(device_state, &host_state, sizeof(MegaKernelState), cudaMemcpyHostToDevice, init_stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_state, &host_state, sizeof(GigaMoEState), cudaMemcpyHostToDevice, init_stream));
     if (mk_num_descs > 0) {
         CUDA_CHECK(cudaMemcpyAsync(fill_desc_buf, host_descs.data(),
                               static_cast<size_t>(mk_num_descs) * sizeof(FusedFillDesc),
@@ -4437,14 +4437,14 @@ MegaKernelState* allocate_gigamoe_fused_state(
     return device_state;
 }
 
-void free_gigamoe_fused_state(MegaKernelState* device_state, const MegaKernelState* cached_host_state) {
+void free_gigamoe_fused_state(GigaMoEState* device_state, const GigaMoEState* cached_host_state) {
 #define cudaFree(p) gigamoe_caching_free(p)
-    MegaKernelState host_state_copy;
-    MegaKernelState* hs = &host_state_copy;
+    GigaMoEState host_state_copy;
+    GigaMoEState* hs = &host_state_copy;
     if (cached_host_state != nullptr) {
         *hs = *cached_host_state;
     } else {
-        CUDA_CHECK(cudaMemcpy(hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hs, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     }
 #define host_state (*hs)
 
@@ -4547,11 +4547,11 @@ void free_gigamoe_fused_state(MegaKernelState* device_state, const MegaKernelSta
 // by the backward, so releasing them now removes them from the forward->backward resident
 // set. Each freed pointer is nulled so the eventual free_gigamoe_fused_state skips it
 // (gigamoe_caching_free is null-safe), avoiding a double free.
-void free_megakernel_forward_transient(MegaKernelState* device_state) {
+void free_megakernel_forward_transient(GigaMoEState* device_state) {
     if (device_state == nullptr)
         return;
-    MegaKernelState hs;
-    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    GigaMoEState hs;
+    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     if (hs.transient_arena_chunk_count > 0) {
         CUDA_CHECK(free_arena_chunks(hs.transient_arena_chunks, hs.transient_arena_chunk_count));
         hs.transient_arena_chunk_count = 0;
@@ -4568,7 +4568,7 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
             hs.combined_x = nullptr;
         if (hs.owns_combined_topk_weights)
             hs.combined_topk_weights = nullptr;
-        CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(GigaMoEState), cudaMemcpyHostToDevice));
         return;
     }
     auto free_and_null = [](auto*& ptr) {
@@ -4588,7 +4588,7 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
         free_and_null(hs.combined_x);
     if (hs.owns_combined_topk_weights)
         free_and_null(hs.combined_topk_weights);
-    CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(MegaKernelState), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_state, &hs, sizeof(GigaMoEState), cudaMemcpyHostToDevice));
 }
 
 // Host-only version: uses the cached host_state snapshot directly, avoiding
@@ -4596,7 +4596,7 @@ void free_megakernel_forward_transient(MegaKernelState* device_state) {
 // re-creates its own v7 state from the host cache, and eventual free_gigamoe_fused_state
 // handles the remaining persistent arena chunks via the device copy). This path removes
 // three memcpy operations from the forward critical path.
-void free_gigamoe_forward_transients_from_host(MegaKernelState* host_state) {
+void free_gigamoe_forward_transients_from_host(GigaMoEState* host_state) {
     if (host_state == nullptr)
         return;
     if (host_state->transient_arena_chunk_count > 0) {
@@ -4627,30 +4627,30 @@ void free_gigamoe_forward_transients_from_host(MegaKernelState* host_state) {
 }
 
 int get_gigamoe_compute_batch_size_default() {
-    return megakernel_config::kComputeBatchSizeDefault;
+    return gigamoe_config::kComputeBatchSizeDefault;
 }
 
 void get_megakernel_expert_counts(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int* expert_counts,
     int num_local_experts
 ) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    GigaMoEState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(expert_counts, host_state.expert_count,
                           (size_t)num_local_experts * sizeof(int), cudaMemcpyDeviceToHost));
 }
 
 void get_megakernel_backward_dimensions(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int* num_tokens,
     int* hidden,
     int* intermediate,
     int* num_topk,
     int* num_local_experts
 ) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    GigaMoEState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     *num_tokens = host_state.num_tokens;
     *hidden = host_state.hidden_dim;
     *intermediate = host_state.intermediate_dim;
@@ -4658,22 +4658,22 @@ void get_megakernel_backward_dimensions(
     *num_local_experts = host_state.num_local_experts;
 }
 
-float* get_output_accum_ptr(MegaKernelState* device_state) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+float* get_output_accum_ptr(GigaMoEState* device_state) {
+    GigaMoEState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     return host_state.output_accum;
 }
-void* get_combined_x_ptr(MegaKernelState* device_state) {
-    MegaKernelState host_state;
-    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+void* get_combined_x_ptr(GigaMoEState* device_state) {
+    GigaMoEState host_state;
+    CUDA_CHECK(cudaMemcpy(&host_state, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     return host_state.combined_x;
 }
 
 // Keep the public fused-forward wrapper adjacent to its implementation so both
 // dispatch paths use the same kernel specialization.
 void launch_gigamoe_fused_forward(
-    MegaKernelState* device_state,
-    const MegaKernelState* host_state,
+    GigaMoEState* device_state,
+    const GigaMoEState* host_state,
     int total_sms,
     int smem_size,
     int stage,
@@ -4688,7 +4688,7 @@ void launch_gigamoe_fused_forward(
 // Fused GigaMOE backward path reusing forward communication state.
 //
 // The backward re-runs the SAME fused megakernel (dispatch + scheduler + gather + combine)
-// on a patched copy of the forward MegaKernelState, swapping ONLY the compute role for a
+// on a patched copy of the forward GigaMoEState, swapping ONLY the compute role for a
 // backward compute worker:
 //   x            := grad_output   (so dispatch scatters grad_output into combine_input =: grad_down)
 //   combined_x   := grad_input    (so combine reduces grad_xperm over a token's hits =: dX)
@@ -4717,8 +4717,8 @@ void launch_gigamoe_fused_forward(
 // ============================================================================
 
 struct MegaKernelBackwardState {
-    MegaKernelState* fwd;                 // original forward state (buffers reused, freed by caller)
-    MegaKernelState* bwd_device_state;    // patched device copy: x=grad_output, combined_x=grad_input
+    GigaMoEState* fwd;                 // original forward state (buffers reused, freed by caller)
+    GigaMoEState* bwd_device_state;    // patched device copy: x=grad_output, combined_x=grad_input
 
     const __nv_bfloat16* bwd_fc1_input;   // fwd.bwd_fc1_input [max_total_recv_tokens, hidden] (X by recv_token)
     const __nv_bfloat16* bwd_preact;      // fwd.bwd_preact [max_total_recv_tokens, num_topk, 2I]
@@ -4738,7 +4738,7 @@ struct MegaKernelBackwardState {
 
 struct MegaKernelBackwardHostContext {
     MegaKernelBackwardState backward_state;
-    MegaKernelState bwd_state;
+    GigaMoEState bwd_state;
     umma::ComputeBackwardTmaAtoms compute_bwd_tma_atoms;
     std::vector<CUtensorMap> wgrad_dgu_a_tma;
 };
@@ -4795,7 +4795,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
     int group_id_base,
     uint8_t* smem_buffer
 ) {
-    MegaKernelState* state = bs->bwd_device_state;
+    GigaMoEState* state = bs->bwd_device_state;
     const int thread_id = threadIdx.x;
     const int local_warp_id = thread_id / 32;
     if (num_compute_sms <= 0 || compute_sm_idx < 0 || compute_sm_idx >= num_compute_sms)
@@ -5165,7 +5165,7 @@ __device__ __forceinline__ void combine_precompute_backward_worker(
     int num_combine_sms,
     uint8_t* smem_buffer
 ) {
-    MegaKernelState* state = bs->bwd_device_state;
+    GigaMoEState* state = bs->bwd_device_state;
     const int post_group_count =
         (state->num_compute_sms + state->num_dispatch_sms + COMPUTE_GROUP_SIZE - 1) / COMPUTE_GROUP_SIZE;
     compute_backward_worker_core<kComputeDType, true>(
@@ -5179,7 +5179,7 @@ template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) gigamoe_fused_backward_kernel(
     MegaKernelBackwardState* bs
 ) {
-    MegaKernelState* state = bs->bwd_device_state;
+    GigaMoEState* state = bs->bwd_device_state;
     const int sm_id = blockIdx.x;
     const int num_dispatch_sms = state->num_dispatch_sms;
     const int num_combine_sms = state->num_combine_sms;
@@ -5239,7 +5239,7 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
 // Host-side backward allocation uses fs.compute_batch_size from the forward state directly.
 #undef COMPUTE_BATCH_SIZE
 MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
-    MegaKernelState* fwd_device_state,
+    GigaMoEState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
     void* grad_w_gateup,
@@ -5253,16 +5253,16 @@ MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
     int total_sms,
     MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream,
-    const MegaKernelState* cached_fwd_host_state
+    const GigaMoEState* cached_fwd_host_state
 ) {
-    MegaKernelState fs;
+    GigaMoEState fs;
     if (cached_fwd_host_state != nullptr) {
         // Fast path: use the host-cached forward state snapshot directly,
         // avoiding a synchronous D2H cudaMemcpy that stalls the pipeline.
         fs = *cached_fwd_host_state;
     } else {
         // Fallback: synchronous D2H (legacy path, should not be hit in training).
-        CUDA_CHECK(cudaMemcpy(&fs, fwd_device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&fs, fwd_device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     }
 
     const int hidden = fs.hidden_dim;
@@ -5296,7 +5296,7 @@ MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
                                    cudaMemcpyHostToDevice, stream));
     }
 
-    MegaKernelState* bwd_device_state = ::gigamoe::allocate_gigamoe_fused_state(
+    GigaMoEState* bwd_device_state = ::gigamoe::allocate_gigamoe_fused_state(
         reinterpret_cast<const int4*>(grad_output), nullptr,
         fs.topk_idx, fs.topk_weights, fs.is_token_in_rank,
         fs.rdma_channel_prefix_matrix, fs.recv_rdma_rank_prefix_sum,
@@ -5426,7 +5426,7 @@ void free_gigamoe_backward_host_context(MegaKernelBackwardHostContext* host_cont
 // Establish the post-allocation state for every launch. Routing inputs, weights and the
 // saved forward activation are immutable across replay and are intentionally preserved.
 static void prepare_gigamoe_backward_communication_replay_host(
-    const MegaKernelState& hs,
+    const GigaMoEState& hs,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream
@@ -5435,13 +5435,13 @@ static void prepare_gigamoe_backward_communication_replay_host(
 
     // Use the megakernel notify entry so ordinary DeepEP keeps the stock cached_notify path.
     // Besides the cross-rank barriers, this owns the same RDMA/NVL metadata layout and cleanup sizes.
-    ::gigamoe::mk_cached_notfy(
+    ::gigamoe::gigamoe_cached_notify(
         hs.hidden_int4, hs.num_scales, hs.num_topk + 1, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, 0, nullptr, nullptr, nullptr, nullptr,
         hs.rdma_buffer_ptr, hs.num_max_rdma_chunked_recv_tokens, hs.buffer_ptrs,
         hs.num_max_nvl_chunked_recv_tokens, dispatch_barrier_signal_ptrs, hs.rank,
         stream, hs.num_rdma_bytes, hs.num_nvl_bytes, true, false);
-    ::gigamoe::mk_cached_notfy(
+    ::gigamoe::gigamoe_cached_notify(
         combine_hidden_int4, 0, 0, hs.num_topk,
         hs.num_ranks, hs.num_logical_channels, hs.num_tokens,
         hs.send_rdma_head, hs.combine_rdma_channel_prefix_matrix,
@@ -5453,19 +5453,19 @@ static void prepare_gigamoe_backward_communication_replay_host(
 }
 
 void prepare_megakernel_communication_replay(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream
 ) {
-    MegaKernelState hs;
-    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(MegaKernelState), cudaMemcpyDeviceToHost));
+    GigaMoEState hs;
+    CUDA_CHECK(cudaMemcpy(&hs, device_state, sizeof(GigaMoEState), cudaMemcpyDeviceToHost));
     prepare_gigamoe_backward_communication_replay_host(
         hs, dispatch_barrier_signal_ptrs, combine_barrier_signal_ptrs, stream);
 }
 
 
-static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaStream_t stream) {
+static void initialize_megakernel_launch_state(const GigaMoEState& hs, cudaStream_t stream) {
     const int E = hs.num_local_experts;
     const size_t MTR = (size_t)hs.max_total_recv_tokens;
     const int TK = hs.num_topk;
@@ -5549,7 +5549,7 @@ static void initialize_megakernel_launch_state(const MegaKernelState& hs, cudaSt
     z(hs.recv_gbl_channel_token_count, (size_t)NR * NLC * sizeof(int));
 }
 
-static void reset_megakernel_post_notify_state(const MegaKernelState& hs, cudaStream_t stream) {
+static void reset_megakernel_post_notify_state(const GigaMoEState& hs, cudaStream_t stream) {
     const int kRDMA = hs.num_ranks / NUM_MAX_NVL_PEERS;
     const int NLC = hs.num_logical_channels;
     const int TK = hs.num_topk;
@@ -5633,7 +5633,7 @@ void launch_gigamoe_fused_backward(
     // No separate fused_fill_kernel launch is needed here.
 
     const MegaKernelBackwardState& hbs = host_context->backward_state;
-    const MegaKernelState& hstate = host_context->bwd_state;
+    const GigaMoEState& hstate = host_context->bwd_state;
 
     CUDA_CHECK(cudaGetLastError());
 
@@ -5679,15 +5679,15 @@ void launch_gigamoe_fused_backward(
 namespace detail {
 namespace state_cache {
 
-MegaKernelState* alloc_host() {
-    return new MegaKernelState{};
+GigaMoEState* alloc_host() {
+    return new GigaMoEState{};
 }
 
-void copy_host(MegaKernelState* dst, const MegaKernelState* src) {
+void copy_host(GigaMoEState* dst, const GigaMoEState* src) {
     *dst = *src;
 }
 
-void free_host(MegaKernelState* ptr) {
+void free_host(GigaMoEState* ptr) {
     delete ptr;
 }
 

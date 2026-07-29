@@ -364,11 +364,11 @@ enum class ComputeDType {
 namespace gigamoe {
 
 using ComputeDType = ::deep_ep::megakernel::ComputeDType;
-struct MegaKernelState;
+struct GigaMoEState;
 struct MegaKernelBackwardState;
 struct MegaKernelBackwardHostContext;
 
-MegaKernelState* allocate_gigamoe_fused_state(
+GigaMoEState* allocate_gigamoe_fused_state(
     const int4* x,
     const uint32_t* x_scales,
     const ::deep_ep::topk_idx_t* topk_idx,
@@ -432,7 +432,7 @@ MegaKernelState* allocate_gigamoe_fused_state(
     int* external_fwd_slot_map = nullptr,
     int4* external_combined_x = nullptr,
     float* external_combined_topk_weights = nullptr,
-    MegaKernelState* host_state_out = nullptr,
+    GigaMoEState* host_state_out = nullptr,
     // RDMA-buffer-reuse mailboxes (symmetric, indexed by rdma_rank). Borrowed, not owned.
     int* rdma_reuse_dispatch_quiet_done = nullptr,
     int* rdma_reuse_combine_clear_done = nullptr,
@@ -442,33 +442,33 @@ MegaKernelState* allocate_gigamoe_fused_state(
     int compute_batch_size = 4096,
     int combine_start_head_percent = 70);
 
-void free_gigamoe_fused_state(MegaKernelState* device_state, const MegaKernelState* cached_host_state = nullptr);
-void free_megakernel_forward_transient(MegaKernelState* device_state);
-void free_gigamoe_forward_transients_from_host(MegaKernelState* host_state);
+void free_gigamoe_fused_state(GigaMoEState* device_state, const GigaMoEState* cached_host_state = nullptr);
+void free_megakernel_forward_transient(GigaMoEState* device_state);
+void free_gigamoe_forward_transients_from_host(GigaMoEState* host_state);
 void get_megakernel_backward_dimensions(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int* num_tokens,
     int* hidden,
     int* intermediate,
     int* num_topk,
     int* num_local_experts);
 void get_megakernel_expert_counts(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int* expert_counts,
     int num_local_experts);
 int get_gigamoe_compute_batch_size_default();
-float* get_output_accum_ptr(MegaKernelState* device_state);
-void* get_combined_x_ptr(MegaKernelState* device_state);
+float* get_output_accum_ptr(GigaMoEState* device_state);
+void* get_combined_x_ptr(GigaMoEState* device_state);
 void launch_gigamoe_fused_forward(
-    MegaKernelState* device_state,
-    const MegaKernelState* host_state,
+    GigaMoEState* device_state,
+    const GigaMoEState* host_state,
     int total_sms,
     int smem_size,
     int stage,
     ComputeDType compute_dtype,
     cudaStream_t stream);
 MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
-    MegaKernelState* fwd_device_state,
+    GigaMoEState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
     void* grad_w_gateup,
@@ -482,13 +482,13 @@ MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
     int total_sms,
     MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream,
-    const MegaKernelState* cached_fwd_host_state = nullptr);
+    const GigaMoEState* cached_fwd_host_state = nullptr);
 void free_gigamoe_fused_backward_state(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context = nullptr);
 void free_gigamoe_backward_host_context(MegaKernelBackwardHostContext* host_context);
 void prepare_megakernel_communication_replay(
-    MegaKernelState* device_state,
+    GigaMoEState* device_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
@@ -508,14 +508,14 @@ void launch_gigamoe_fused_backward(
 
 namespace detail {
 namespace state_cache {
-MegaKernelState* alloc_host();
-void copy_host(MegaKernelState* dst, const MegaKernelState* src);
-void free_host(MegaKernelState* ptr);
+GigaMoEState* alloc_host();
+void copy_host(GigaMoEState* dst, const GigaMoEState* src);
+void free_host(GigaMoEState* ptr);
 }  // namespace state_cache
 }  // namespace detail
 
 
-void mk_cached_notfy(int hidden_int4,
+void gigamoe_cached_notify(int hidden_int4,
                      int num_scales,
                      int num_topk_idx,
                      int num_topk_weights,

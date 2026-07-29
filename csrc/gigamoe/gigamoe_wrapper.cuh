@@ -10,7 +10,7 @@
 // Assumes hidden == intermediate == 4096 (I.9.0).
 //
 // USAGE (in gigamoe_orchestrator.cu, an nvcc TU):
-//   - MegaKernelState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
+//   - GigaMoEState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
 //   - Host: build_compute_tma_atoms(host_struct, W_gateup, E, I, d); upload.
 //   - Device (compute_worker stage1, per 1-CTA/2-CTA cluster): call
 //       umma_gateup_interleaved_persistent(...).

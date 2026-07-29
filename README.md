@@ -68,6 +68,7 @@ The workers communicate through lightweight readiness signals. Dispatch publishe
 
 ## TODO
 
+- [ ] Support PaddlePaddle
 - [ ] Add FP8 support.
 - [ ] Migrate the communication backend from NVSHMEM to NCCL.
 - [ ] Add SM90 support.
@@ -106,14 +107,46 @@ NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
 - `TORCH_CUDA_ARCH_LIST`: set this to the SM100 target only
 - `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, disable aggressive load/store instructions if needed
 
+## Training API
+
+```python
+import torch
+import torch.distributed as dist
+import gigamoe
+
+group = dist.group.WORLD
+num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+buffer = gigamoe.Buffer(
+    group,
+    int(2e9),
+    int(1e9),
+    low_latency_mode=False,
+    num_qps_per_rank=num_sms,
+    explicitly_destroy=True,
+)
+
+output = buffer.gigamoe_autograd(
+    x,
+    topk_idx,
+    topk_weights,
+    W_gateup,
+    W_down,
+    num_experts,
+    num_dispatch_sms=48,
+    num_combine_sms=48,
+    total_sms=num_sms,
+    stage=1,
+    compute_batch_size=4096,
+    combine_start_head_percent=70,
+)
+output.backward(torch.randn_like(output))
+
+buffer.destroy()
+```
+
 ## Acknowledgement
 
-GigaMOE was inspired by the following projects and papers. We sincerely thank their authors and contributors.
-
-- [DeepEP](https://github.com/deepseek-ai/DeepEP)
-- [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)
-- [UniEP](https://arxiv.org/abs/2604.19241)
-- [SonicMOE](https://github.com/Dao-AILab/sonic-moe)
+GigaMOE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), and is inspired by [UniEP](https://arxiv.org/abs/2604.19241) and [SonicMOE](https://github.com/Dao-AILab/sonic-moe). We sincerely thank the authors and contributors of these projects for their work.
 
 ## License
 
