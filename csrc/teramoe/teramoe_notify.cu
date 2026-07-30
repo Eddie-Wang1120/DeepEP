@@ -10,7 +10,7 @@
 #include "kernels/launch.cuh"
 #include "kernels/utils.cuh"
 
-namespace gigamoe {
+namespace teramoe {
 
 using namespace ::deep_ep;
 using ::deep_ep::internode::get_nvl_clean_meta;
@@ -600,7 +600,7 @@ void cached_notify(int hidden_int4,
 // reserved for original DeepEP. Clean-only megakernel replays use fixed geometry to avoid
 // logical-channel expansion exceeding per-block limits; head-normalization replays use the
 // standard geometry but still go through this separate megakernel entry point.
-void gigamoe_cached_notify(int hidden_int4,
+void teramoe_cached_notify(int hidden_int4,
                      int num_scales,
                      int num_topk_idx,
                      int num_topk_weights,
@@ -671,4 +671,4 @@ void gigamoe_cached_notify(int hidden_int4,
                   NVSHMEM_TEAM_INVALID);
 }
 
-}  // namespace gigamoe
+}  // namespace teramoe

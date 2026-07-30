@@ -35,5 +35,5 @@ ignore = [
     "E902",
 ]
 exclude = [
-    "gigamoe/__init__.py"
+    "teramoe/__init__.py"
 ]

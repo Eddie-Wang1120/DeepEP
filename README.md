@@ -1,9 +1,9 @@
-# GigaMOE
+# TeraMOE
 
 > [!WARNING]
-> This repository contains an experimental version of GigaMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
+> This repository contains an experimental version of TeraMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
 
-GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine. It is designed for large expert-parallel (EP) configurations with high communication volume, sparse expert activation, and a large number of experts.
+TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine. It is designed for large expert-parallel (EP) configurations with high communication volume, sparse expert activation, and a large number of experts.
 
 ## Performance
 
@@ -15,7 +15,7 @@ GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 
 ### Forward
 
-| num_tokens | EP | Megatron (ms) | GigaMOE (ms) | Speedup |
+| num_tokens | EP | Megatron (ms) | TeraMOE (ms) | Speedup |
 |:----------:|:--:|:-------------:|:------------:|:-------:|
 | 8192 | 32 | 7.584 | 6.609 | 1.14x |
 | 16384 | 32 | 11.847 | 10.944 | 1.08x |
@@ -26,7 +26,7 @@ GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 
 ### Backward
 
-| num_tokens | EP | Megatron (ms) | GigaMOE (ms) | Speedup |
+| num_tokens | EP | Megatron (ms) | TeraMOE (ms) | Speedup |
 |:----------:|:--:|:-------------:|:------------:|:-------:|
 | 8192 | 32 | 8.886 | 7.443 | 1.19x |
 | 16384 | 32 | 15.995 | 13.456 | 1.18x |
@@ -37,7 +37,7 @@ GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 
 ### Activation Memory
 
-| num_tokens | EP | Megatron activation memory (MB) | GigaMOE activation memory (MB) | Reduction |
+| num_tokens | EP | Megatron activation memory (MB) | TeraMOE activation memory (MB) | Reduction |
 |:----------:|:--:|:-------------------------------:|:------------------------------:|:---------:|
 | 8192 | 32 | 1126.25 | 810.55 | 28.03% |
 | 16384 | 32 | 2252.48 | 1603.06 | 28.84% |
@@ -48,11 +48,11 @@ GigaMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 
 ## Architecture
 
-GigaMOE uses one persistent kernel to coordinate five types of workers.
+TeraMOE uses one persistent kernel to coordinate five types of workers.
 
 ### SM Role Layout
 
-![GigaMOE SM role timeline](figures/SM_role_v2.png)
+![TeraMOE SM role timeline](figures/SM_role_v2.png)
 
 - **Dispatch**: routes tokens to remote experts, writes received expert inputs, and publishes token-ready signals for downstream compute.
 - **Scheduler**: observes per-expert token readiness, forms compute batches, and flushes the remaining tail work after dispatch completes.
@@ -62,7 +62,7 @@ GigaMOE uses one persistent kernel to coordinate five types of workers.
 
 ### Execution Flow
 
-![GigaMOE signal passing](figures/signal_pass.png)
+![TeraMOE signal passing](figures/signal_pass.png)
 
 The workers communicate through lightweight readiness signals. Dispatch publishes `token ready` signals, the scheduler groups ready tokens into compute batches, and compute publishes results to combine. When a token has multiple local expert hits (`nhit > 1`), gather reduces those partial results before combine consumes them.
 
@@ -86,13 +86,13 @@ The workers communicate through lightweight readiness signals. Dispatch publishe
 
 ### Install NVSHMEM
 
-GigaMOE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
+TeraMOE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
 
 ### Build
 
 ```bash
 NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-ln -s build/lib.linux-x86_64-cpython-38/gigamoe_cpp.cpython-38-x86_64-linux-gnu.so
+ln -s build/lib.linux-x86_64-cpython-38/teramoe_cpp.cpython-38-x86_64-linux-gnu.so
 ```
 
 ### Install
@@ -112,11 +112,11 @@ NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
 ```python
 import torch
 import torch.distributed as dist
-import gigamoe
+import teramoe
 
 group = dist.group.WORLD
 num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-buffer = gigamoe.Buffer(
+buffer = teramoe.Buffer(
     group,
     int(2e9),
     int(1e9),
@@ -125,7 +125,7 @@ buffer = gigamoe.Buffer(
     explicitly_destroy=True,
 )
 
-output = buffer.gigamoe_autograd(
+output = buffer.teramoe_autograd(
     x,
     topk_idx,
     topk_weights,
@@ -146,7 +146,7 @@ buffer.destroy()
 
 ## Acknowledgement
 
-GigaMOE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), and is inspired by [UniEP](https://arxiv.org/abs/2604.19241) and [SonicMOE](https://github.com/Dao-AILab/sonic-moe). We sincerely thank the authors and contributors of these projects for their work.
+TeraMOE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), and is inspired by [UniEP](https://arxiv.org/abs/2604.19241) and [SonicMOE](https://github.com/Dao-AILab/sonic-moe). We sincerely thank the authors and contributors of these projects for their work.
 
 ## License
 

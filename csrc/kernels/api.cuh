@@ -349,7 +349,6 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
-// MegaKernel v7: Fused dispatch + compute + combine (persistent kernel)
 namespace megakernel {
 
 enum class ComputeDType {
@@ -361,14 +360,14 @@ enum class ComputeDType {
 
 }  // namespace deep_ep
 
-namespace gigamoe {
+namespace teramoe {
 
 using ComputeDType = ::deep_ep::megakernel::ComputeDType;
-struct GigaMoEState;
+struct TeraMoEState;
 struct MegaKernelBackwardState;
 struct MegaKernelBackwardHostContext;
 
-GigaMoEState* allocate_gigamoe_fused_state(
+TeraMoEState* allocate_teramoe_fused_state(
     const int4* x,
     const uint32_t* x_scales,
     const ::deep_ep::topk_idx_t* topk_idx,
@@ -432,7 +431,7 @@ GigaMoEState* allocate_gigamoe_fused_state(
     int* external_fwd_slot_map = nullptr,
     int4* external_combined_x = nullptr,
     float* external_combined_topk_weights = nullptr,
-    GigaMoEState* host_state_out = nullptr,
+    TeraMoEState* host_state_out = nullptr,
     // RDMA-buffer-reuse mailboxes (symmetric, indexed by rdma_rank). Borrowed, not owned.
     int* rdma_reuse_dispatch_quiet_done = nullptr,
     int* rdma_reuse_combine_clear_done = nullptr,
@@ -442,33 +441,33 @@ GigaMoEState* allocate_gigamoe_fused_state(
     int compute_batch_size = 4096,
     int combine_start_head_percent = 70);
 
-void free_gigamoe_fused_state(GigaMoEState* device_state, const GigaMoEState* cached_host_state = nullptr);
-void free_megakernel_forward_transient(GigaMoEState* device_state);
-void free_gigamoe_forward_transients_from_host(GigaMoEState* host_state);
+void free_teramoe_fused_state(TeraMoEState* device_state, const TeraMoEState* cached_host_state = nullptr);
+void free_megakernel_forward_transient(TeraMoEState* device_state);
+void free_teramoe_forward_transients_from_host(TeraMoEState* host_state);
 void get_megakernel_backward_dimensions(
-    GigaMoEState* device_state,
+    TeraMoEState* device_state,
     int* num_tokens,
     int* hidden,
     int* intermediate,
     int* num_topk,
     int* num_local_experts);
 void get_megakernel_expert_counts(
-    GigaMoEState* device_state,
+    TeraMoEState* device_state,
     int* expert_counts,
     int num_local_experts);
-int get_gigamoe_compute_batch_size_default();
-float* get_output_accum_ptr(GigaMoEState* device_state);
-void* get_combined_x_ptr(GigaMoEState* device_state);
-void launch_gigamoe_fused_forward(
-    GigaMoEState* device_state,
-    const GigaMoEState* host_state,
+int get_teramoe_compute_batch_size_default();
+float* get_output_accum_ptr(TeraMoEState* device_state);
+void* get_combined_x_ptr(TeraMoEState* device_state);
+void launch_teramoe_fused_forward(
+    TeraMoEState* device_state,
+    const TeraMoEState* host_state,
     int total_sms,
     int smem_size,
     int stage,
     ComputeDType compute_dtype,
     cudaStream_t stream);
-MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
-    GigaMoEState* fwd_device_state,
+MegaKernelBackwardState* allocate_teramoe_fused_backward_state(
+    TeraMoEState* fwd_device_state,
     const void* grad_output,
     void* grad_input,
     void* grad_w_gateup,
@@ -482,22 +481,22 @@ MegaKernelBackwardState* allocate_gigamoe_fused_backward_state(
     int total_sms,
     MegaKernelBackwardHostContext** host_context,
     cudaStream_t stream,
-    const GigaMoEState* cached_fwd_host_state = nullptr);
-void free_gigamoe_fused_backward_state(
+    const TeraMoEState* cached_fwd_host_state = nullptr);
+void free_teramoe_fused_backward_state(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context = nullptr);
-void free_gigamoe_backward_host_context(MegaKernelBackwardHostContext* host_context);
+void free_teramoe_backward_host_context(MegaKernelBackwardHostContext* host_context);
 void prepare_megakernel_communication_replay(
-    GigaMoEState* device_state,
+    TeraMoEState* device_state,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
-void prepare_gigamoe_backward_communication_replay(
+void prepare_teramoe_backward_communication_replay(
     const MegaKernelBackwardHostContext* host_context,
     int** dispatch_barrier_signal_ptrs,
     int** combine_barrier_signal_ptrs,
     cudaStream_t stream);
-void launch_gigamoe_fused_backward(
+void launch_teramoe_fused_backward(
     MegaKernelBackwardState* backward_state,
     const MegaKernelBackwardHostContext* host_context,
     int total_sms,
@@ -508,14 +507,14 @@ void launch_gigamoe_fused_backward(
 
 namespace detail {
 namespace state_cache {
-GigaMoEState* alloc_host();
-void copy_host(GigaMoEState* dst, const GigaMoEState* src);
-void free_host(GigaMoEState* ptr);
+TeraMoEState* alloc_host();
+void copy_host(TeraMoEState* dst, const TeraMoEState* src);
+void free_host(TeraMoEState* ptr);
 }  // namespace state_cache
 }  // namespace detail
 
 
-void gigamoe_cached_notify(int hidden_int4,
+void teramoe_cached_notify(int hidden_int4,
                      int num_scales,
                      int num_topk_idx,
                      int num_topk_weights,
@@ -538,4 +537,4 @@ void gigamoe_cached_notify(int hidden_int4,
                      bool is_cached_dispatch,
                      bool skip_rdma_clean);
 
-}  // namespace gigamoe
+}  // namespace teramoe

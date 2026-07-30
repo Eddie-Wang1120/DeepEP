@@ -1,4 +1,4 @@
-// gigamoe_wrapper.cuh — S4.4 (route B2): Blackwell UMMA (tcgen05) + TMEM
+// teramoe_wrapper.cuh — S4.4 (route B2): Blackwell UMMA (tcgen05) + TMEM
 // fused gate+up+SwiGLU compute for the megakernel, with 2CTA weight multicast TMA.
 //
 // Built on the VERIFIED standalone kernel compute_ref/umma_swiglu_2cta.cu (stage 3').
@@ -9,8 +9,8 @@
 // Ref: MEGAKERNEL_COMPUTE_DESIGN.md I.9 (tile schedule), I.9.10 (route B2).
 // Assumes hidden == intermediate == 4096 (I.9.0).
 //
-// USAGE (in gigamoe_orchestrator.cu, an nvcc TU):
-//   - GigaMoEState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
+// USAGE (in teramoe_orchestrator.cu, an nvcc TU):
+//   - TeraMoEState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
 //   - Host: build_compute_tma_atoms(host_struct, W_gateup, E, I, d); upload.
 //   - Device (compute_worker stage1, per 1-CTA/2-CTA cluster): call
 //       umma_gateup_interleaved_persistent(...).
@@ -39,7 +39,7 @@
 // sm100_store_swiglu_from_gate lives only in the standalone reference (it is the
 // SwiGLU-fused store epilogue). Pull it in directly so the migrated GEMM body
 // can reuse the verified store path verbatim.
-#include "gigamoe_sm100_bf16_compute.cuh"
+#include "teramoe_sm100_bf16_compute.cuh"
 
 #include <cuda_bf16.h>
 
@@ -73,7 +73,7 @@ struct DownScatterParams {
 using ElemAB  = cutlass::bfloat16_t;
 using ElemAcc = float;
 
-// DeepGEMM reference config from csrc/kernels/sm100_bf16_gigamoe_dg_copy.cuh:
+// DeepGEMM reference config from csrc/kernels/sm100_bf16_teramoe_dg_copy.cuh:
 // BLOCK_M=128, BLOCK_N=128, BLOCK_K=64. A compute group covers the full
 // M=256 batch by having each 2-CTA cluster iterate over multiple 128x128 tiles.
 static constexpr int kTileM = 128;
@@ -87,7 +87,7 @@ using MmaAtom_t = SM100_MMA_F16BF16_2x1SM_SS<ElemAB, ElemAB, ElemAcc, kTileM, kT
 using TiledMMA_t = decltype(make_tiled_mma(MmaAtom_t{}));
 using ClusterShape_t = decltype(make_shape(Int<2>{}, Int<1>{}, Int<1>{}));
 // ===========================================================================
-// DeepGEMM-verbatim port (compute_ref/umma_swiglu_ws_dg.cu + sm100_bf16_gigamoe_dg_copy.cuh)
+// DeepGEMM-verbatim port (compute_ref/umma_swiglu_ws_dg.cu + sm100_bf16_teramoe_dg_copy.cuh)
 //
 // We drop the CuTe `make_tma_atom_*` atoms in favor of raw CUtensorMap TMA
 // descriptors built exactly like umma_swiglu_ws_dg.cu's make_a_desc/make_b_desc/
@@ -577,7 +577,7 @@ CUTLASS_DEVICE void sm100_store_cd_row_scatter(
 // MegaTileScheduler and loop over all tiles this cluster owns, with ZERO
 // cluster sync between tiles — TMA pipeline rolls continuously across tiles.
 //
-// This mirrors csrc/gigamoe/gigamoe_sm100_bf16_compute.cuh's `while(get_next_block)`
+// This mirrors csrc/teramoe/teramoe_sm100_bf16_compute.cuh's `while(get_next_block)`
 // structure, the difference being the scheduler enumerates THIS cluster's tiles
 // (cluster_idx/num_clusters) instead of grid-global blocks, and there is no
 // `cudaGridDependencySynchronize` (device-function context).

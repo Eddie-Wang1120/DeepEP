@@ -6,4 +6,4 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
-deep_ep.egg-info
+teramoe.egg-info

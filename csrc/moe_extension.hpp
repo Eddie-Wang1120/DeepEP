@@ -19,7 +19,7 @@
 #include "kernels/exception.cuh"
 
 #ifndef TORCH_EXTENSION_NAME
-#define TORCH_EXTENSION_NAME gigamoe_cpp
+#define TORCH_EXTENSION_NAME teramoe_cpp
 #endif
 
 namespace shared_memory {
@@ -50,24 +50,24 @@ private:
 };
 }  // namespace shared_memory
 
-namespace gigamoe {
-struct GigaMoEState;
+namespace teramoe {
+struct TeraMoEState;
 }
 
 namespace deep_ep {
 
-class GigaMoEAutogradContext {
+class TeraMoEAutogradContext {
 public:
-    GigaMoEAutogradContext(::gigamoe::GigaMoEState* state,
+    TeraMoEAutogradContext(::teramoe::TeraMoEState* state,
                               int num_tokens,
                               int hidden_dim,
                               int intermediate_dim,
                               int num_topk,
                               int num_local_experts,
                               std::vector<int> expert_counts);
-    ~GigaMoEAutogradContext();
+    ~TeraMoEAutogradContext();
 
-    ::gigamoe::GigaMoEState* state() const;
+    ::teramoe::TeraMoEState* state() const;
     int num_tokens() const;
     int hidden_dim() const;
     int intermediate_dim() const;
@@ -75,23 +75,23 @@ public:
     int num_local_experts() const;
     const std::vector<int>& expert_counts() const;
 
-    // Host-side snapshot of the forward GigaMoEState, captured at forward-end.
+    // Host-side snapshot of the forward TeraMoEState, captured at forward-end.
     // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
     // the device state, eliminating the most expensive host stall in the backward path.
-    const ::gigamoe::GigaMoEState& cached_host_state() const;
-    void set_cached_host_state(const ::gigamoe::GigaMoEState& hs);
+    const ::teramoe::TeraMoEState& cached_host_state() const;
+    void set_cached_host_state(const ::teramoe::TeraMoEState& hs);
 
     // Keep the notify_dispatch-produced layout tensors alive for the whole lifetime of the
-    // training state. The GigaMoEState stores only raw data_ptr()s into these tensors, and
+    // training state. The TeraMoEState stores only raw data_ptr()s into these tensors, and
     // the backward re-runs dispatch/combine off the same state. Without retaining them here they
     // are freed when the forward returns; the caching allocator may then hand their blocks to the
     // backward's own allocations (e.g. torch::zeros for grad_w_*), zeroing rdma_channel_prefix_matrix
-    // and stalling the backward NVL dispatch. See gigamoe_backward reuse of fs.*_matrix.
+    // and stalling the backward NVL dispatch. See teramoe_backward reuse of fs.*_matrix.
     void retain_layout_tensors(std::vector<torch::Tensor> tensors);
 
 private:
-    ::gigamoe::GigaMoEState* state_;
-    ::gigamoe::GigaMoEState* cached_host_state_ = nullptr;
+    ::teramoe::TeraMoEState* state_;
+    ::teramoe::TeraMoEState* cached_host_state_ = nullptr;
     int num_tokens_;
     int hidden_dim_;
     int intermediate_dim_;
@@ -359,7 +359,7 @@ public:
 
     void low_latency_clean_mask_buffer();
 
-    torch::Tensor gigamoe_forward(
+    torch::Tensor teramoe_forward(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -380,7 +380,7 @@ public:
         int compute_batch_size,
         int combine_start_head_percent);
 
-    std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> gigamoe_forward_train(
+    std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> teramoe_forward_train(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,
@@ -397,14 +397,14 @@ public:
         int combine_start_head_percent);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> gigamoe_backward(
-        const std::shared_ptr<GigaMoEAutogradContext>& context,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> teramoe_backward(
+        const std::shared_ptr<TeraMoEAutogradContext>& context,
         const torch::Tensor& grad_output,
         const std::optional<torch::Tensor>& grad_topk_weights,
         int total_sms,
         int stage);
 
-    std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> gigamoe_fused_forward_impl(
+    std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> teramoe_fused_forward_impl(
         const torch::Tensor& x,
         const torch::Tensor& topk_idx,
         const torch::Tensor& topk_weights,

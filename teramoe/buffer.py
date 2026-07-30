@@ -4,9 +4,9 @@ import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
-import gigamoe_cpp
+import teramoe_cpp
 # noinspection PyUnresolvedReferences
-from gigamoe_cpp import Config, EventHandle
+from teramoe_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
 
@@ -89,7 +89,7 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
-        self.runtime = gigamoe_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
+        self.runtime = teramoe_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
 
         # Synchronize device IDs
@@ -148,7 +148,7 @@ class Buffer:
 
     @staticmethod
     def is_sm90_compiled():
-        return gigamoe_cpp.is_sm90_compiled()
+        return teramoe_cpp.is_sm90_compiled()
 
     @staticmethod
     def set_num_sms(new_num_sms: int) -> None:
@@ -186,7 +186,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return gigamoe_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return teramoe_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     def get_comm_stream(self) -> torch.Stream:
         """
@@ -298,7 +298,7 @@ class Buffer:
         Calculate the layout required for later communication.
 
         Arguments:
-            topk_idx: `[num_tokens, num_topk]`, dtype must be `gigamoe.topk_idx_t` (typically `torch.int64`), the expert
+            topk_idx: `[num_tokens, num_topk]`, dtype must be `teramoe.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by each token, `-1` means no selections.
             num_experts: the number of experts.
             previous_event: the event to wait before actually executing the kernel.
@@ -347,7 +347,7 @@ class Buffer:
                 rank (with the same GPU index), return `None` for intranode settings.
             is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
             num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
-            topk_idx: `[num_tokens, num_topk]` with `gigamoe.topk_idx_t` (typically `torch.int64`), the expert indices
+            topk_idx: `[num_tokens, num_topk]` with `teramoe.topk_idx_t` (typically `torch.int64`), the expert indices
                 selected by each token, `-1` means no selections.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token to dispatch.
             expert_alignment: align the number of tokens received by each local expert to this variable.
@@ -566,7 +566,7 @@ class Buffer:
         Arguments:
             x: `torch.Tensor` with `torch.bfloat16`, shaped as `[num_tokens, hidden]`, only several hidden shapes are
                 supported. The number of tokens to be dispatched must be less than `num_max_dispatch_tokens_per_rank`.
-            topk_idx: `torch.Tensor` with `gigamoe.topk_idx_t` (typically `torch.int64`), shaped as `[num_tokens, num_topk]`,
+            topk_idx: `torch.Tensor` with `teramoe.topk_idx_t` (typically `torch.int64`), shaped as `[num_tokens, num_topk]`,
                 only several top-k shapes are supported. `-1` indices (not selecting any expert) are supported.
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
             num_experts: the number of all experts.
@@ -633,7 +633,7 @@ class Buffer:
         Arguments:
             x: `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`,
                 the local calculated tokens to be sent to this original rank and reduced.
-            topk_idx: `[num_combined_tokens, num_topk]` with `gigamoe.topk_idx_t` (typically `torch.int64`), the expert
+            topk_idx: `[num_combined_tokens, num_topk]` with `teramoe.topk_idx_t` (typically `torch.int64`), the expert
                 indices selected by the dispatched tokens. `-1` indices (not selecting any expert) are supported. Note that,
                 `num_combined_tokens` equals to the number of dispatched tokens.
             topk_weights: `[num_combined_tokens, num_topk]` with `torch.float`, the expert weights selected by the dispatched
@@ -707,13 +707,13 @@ class Buffer:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
-    class _GigaMoEAutogradFunction(torch.autograd.Function):
+    class _TeraMoEAutogradFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, runtime, x, topk_idx, topk_weights, W_gateup, W_down,
                     num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
                     dispatch_config, combine_config, grad_topk_weights,
                     compute_batch_size, combine_start_head_percent):
-            output, handle = runtime.gigamoe_forward_train(
+            output, handle = runtime.teramoe_forward_train(
                 x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
                 num_dispatch_sms, num_combine_sms, total_sms, stage,
                 dispatch_config, combine_config,
@@ -726,7 +726,7 @@ class Buffer:
             # - x: NOT needed. The forward kernel saves permuted X into bwd_fc1_input;
             #   backward re-runs dispatch with grad_output, not x.
             # - topk_idx / topk_weights: kept alive by retain_layout_tensors in C++
-            #   (stored in ctx.handle / GigaMoEAutogradContext).
+            #   (stored in ctx.handle / TeraMoEAutogradContext).
             # - W_gateup / W_down: backward state reads fs.W_gateup / fs.W_down raw
             #   pointers, so the PyTorch tensors must outlive forward->backward.
             ctx.save_for_backward(W_gateup, W_down)
@@ -739,14 +739,14 @@ class Buffer:
         def backward(ctx, grad_output):
             (grad_x, grad_w_gateup, grad_w_down, grad_topk_weights,
              scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k) = (
-                ctx.runtime.gigamoe_backward(
+                ctx.runtime.teramoe_backward(
                     ctx.handle, grad_output.contiguous(), ctx.grad_topk_weights,
                     ctx.total_sms, ctx.stage))
             try:
                 from quack.gemm_interface import gemm as _quack_gemm
             except Exception as exc:
                 raise RuntimeError(
-                    "QuACK is required for GigaMOE backward weight gradients") from exc
+                    "QuACK is required for TeraMOE backward weight gradients") from exc
             if scratch_x.shape[0] > 0:
                 _quack_gemm(
                     scratch_dgu.transpose(0, 1), scratch_x,
@@ -761,7 +761,7 @@ class Buffer:
             return (None, grad_x, None, grad_topk_weights, grad_w_gateup, grad_w_down,
                     None, None, None, None, None, None, None, None, None, None)
 
-    def gigamoe_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
+    def teramoe_autograd(self, x: torch.Tensor, topk_idx: torch.Tensor,
                                   topk_weights: torch.Tensor, W_gateup: torch.Tensor,
                                   W_down: torch.Tensor, num_experts: int,
                                   num_dispatch_sms: int = 24, num_combine_sms: int = 24,
@@ -771,25 +771,25 @@ class Buffer:
                                   grad_topk_weights: Optional[torch.Tensor] = None,
                                   compute_batch_size: int = 4096,
                                   combine_start_head_percent: int = 70) -> torch.Tensor:
-        """Run the BF16 GigaMOE fused path with autograd backward."""
+        """Run the BF16 TeraMOE fused path with autograd backward."""
         assert compute_batch_size in (1024, 2048, 4096), \
             f"compute_batch_size must be 1024, 2048, or 4096, got {compute_batch_size}"
         assert 0 <= combine_start_head_percent <= 100, \
             f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         if x.dtype != torch.bfloat16:
-            raise ValueError("GigaMOE autograd currently supports BF16 only")
+            raise ValueError("TeraMOE autograd currently supports BF16 only")
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
         if grad_topk_weights is None:
             grad_topk_weights = torch.zeros(
                 (x.size(0), topk_weights.size(1)), dtype=torch.float32, device=topk_weights.device)
-        return self._GigaMoEAutogradFunction.apply(
+        return self._TeraMoEAutogradFunction.apply(
             self.runtime, x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms, total_sms, stage,
             dispatch_config, combine_config, grad_topk_weights,
             compute_batch_size, combine_start_head_percent)
 
-    def gigamoe_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+    def teramoe_forward(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                                  W_gateup: torch.Tensor, W_down: torch.Tensor,
                                  num_experts: int, num_dispatch_sms: int = 24, num_combine_sms: int = 24,
                                  total_sms: int = 148, stage: int = 1,
@@ -809,7 +809,7 @@ class Buffer:
             f"combine_start_head_percent must be in [0, 100], got {combine_start_head_percent}"
         dispatch_config = dispatch_config or self.get_dispatch_config(self.group_size)
         combine_config = combine_config or self.get_combine_config(self.group_size)
-        return self.runtime.gigamoe_forward(
+        return self.runtime.teramoe_forward(
             x, topk_idx, topk_weights, W_gateup, W_down,
             num_experts, num_dispatch_sms, num_combine_sms,
             total_sms, stage, dispatch_config, combine_config,

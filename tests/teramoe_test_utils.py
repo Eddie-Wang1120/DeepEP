@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from packaging import version
 
-import gigamoe
+import teramoe
 
 os.environ.setdefault('NVTE_CUTEDSL_FUSED_GROUPED_MLP', '1')
 os.environ.setdefault('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '1')
@@ -252,11 +252,11 @@ def finish_memory_measurement(start_allocated, activation_retained, phase):
     return activation_retained, peak_allocated, peak_reserved
 
 
-def report_memory_comparison(baseline_memory, gigamoe_memory, baseline_name):
+def report_memory_comparison(baseline_memory, teramoe_memory, baseline_name):
     names = ('forward activation retained', 'peak allocated increment (fwd+bwd)', 'peak reserved')
-    print(f'  [Memory comparison] GigaMOE - {baseline_name}:', flush=True)
-    for name, baseline_value, gigamoe_value in zip(names, baseline_memory, gigamoe_memory):
-        delta = gigamoe_value - baseline_value
+    print(f'  [Memory comparison] TeraMOE - {baseline_name}:', flush=True)
+    for name, baseline_value, teramoe_value in zip(names, baseline_memory, teramoe_memory):
+        delta = teramoe_value - baseline_value
         ratio = 100.0 * delta / baseline_value if baseline_value else float('nan')
         print(f'    {name}: {delta / 1024 ** 2:+.2f} MiB ({ratio:+.2f}%)', flush=True)
 
@@ -389,4 +389,4 @@ def make_megatron_router_inputs(num_tokens, num_experts, topk, num_groups, group
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f'Unsupported router score function: {score_function}')
-    return topk_weights.contiguous(), topk_idx.to(gigamoe.topk_idx_t).contiguous()
+    return topk_weights.contiguous(), topk_idx.to(teramoe.topk_idx_t).contiguous()

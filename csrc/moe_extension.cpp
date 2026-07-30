@@ -1887,7 +1887,7 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-GigaMoEAutogradContext::GigaMoEAutogradContext(::gigamoe::GigaMoEState* state,
+TeraMoEAutogradContext::TeraMoEAutogradContext(::teramoe::TeraMoEState* state,
                                                      int num_tokens,
                                                      int hidden_dim,
                                                      int intermediate_dim,
@@ -1902,61 +1902,61 @@ GigaMoEAutogradContext::GigaMoEAutogradContext(::gigamoe::GigaMoEState* state,
       num_local_experts_(num_local_experts),
       expert_counts_(std::move(expert_counts)) {}
 
-GigaMoEAutogradContext::~GigaMoEAutogradContext() {
+TeraMoEAutogradContext::~TeraMoEAutogradContext() {
 #ifndef DISABLE_NVSHMEM
     if (state_ != nullptr)
-        ::gigamoe::free_gigamoe_fused_state(
+        ::teramoe::free_teramoe_fused_state(
             state_, cached_host_state_);
 #endif
     if (cached_host_state_ != nullptr)
-        ::gigamoe::detail::state_cache::free_host(cached_host_state_);
+        ::teramoe::detail::state_cache::free_host(cached_host_state_);
 }
 
-::gigamoe::GigaMoEState* GigaMoEAutogradContext::state() const {
+::teramoe::TeraMoEState* TeraMoEAutogradContext::state() const {
     return state_;
 }
 
-int GigaMoEAutogradContext::num_tokens() const {
+int TeraMoEAutogradContext::num_tokens() const {
     return num_tokens_;
 }
 
-int GigaMoEAutogradContext::hidden_dim() const {
+int TeraMoEAutogradContext::hidden_dim() const {
     return hidden_dim_;
 }
 
-int GigaMoEAutogradContext::intermediate_dim() const {
+int TeraMoEAutogradContext::intermediate_dim() const {
     return intermediate_dim_;
 }
 
-int GigaMoEAutogradContext::num_topk() const {
+int TeraMoEAutogradContext::num_topk() const {
     return num_topk_;
 }
 
-int GigaMoEAutogradContext::num_local_experts() const {
+int TeraMoEAutogradContext::num_local_experts() const {
     return num_local_experts_;
 }
 
-const std::vector<int>& GigaMoEAutogradContext::expert_counts() const {
+const std::vector<int>& TeraMoEAutogradContext::expert_counts() const {
     return expert_counts_;
 }
 
-void GigaMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
+void TeraMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
     retained_layout_tensors_ = std::move(tensors);
 }
 
-const ::gigamoe::GigaMoEState& GigaMoEAutogradContext::cached_host_state() const {
+const ::teramoe::TeraMoEState& TeraMoEAutogradContext::cached_host_state() const {
     EP_HOST_ASSERT(cached_host_state_ != nullptr);
     return *cached_host_state_;
 }
 
-void GigaMoEAutogradContext::set_cached_host_state(const ::gigamoe::GigaMoEState& hs) {
+void TeraMoEAutogradContext::set_cached_host_state(const ::teramoe::TeraMoEState& hs) {
     if (cached_host_state_ != nullptr)
-        ::gigamoe::detail::state_cache::free_host(cached_host_state_);
-    cached_host_state_ = ::gigamoe::detail::state_cache::alloc_host();
-    ::gigamoe::detail::state_cache::copy_host(cached_host_state_, &hs);
+        ::teramoe::detail::state_cache::free_host(cached_host_state_);
+    cached_host_state_ = ::teramoe::detail::state_cache::alloc_host();
+    ::teramoe::detail::state_cache::copy_host(cached_host_state_, &hs);
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigamoe_fused_forward_impl(
+std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teramoe_fused_forward_impl(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2065,10 +2065,10 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
     }
 
     // SM allocation: dispatch -> combine -> scheduler -> compute groups -> gather, leaving any remainder reserved.
-    constexpr int compute_group_size = gigamoe_config::kComputeGroupSize;
-    constexpr int compute_cluster_dim = gigamoe_config::kComputeClusterDim;
-    constexpr int compute_scheduler_sms = gigamoe_config::kComputeSchedulerSms;
-    constexpr int gather_sms = gigamoe_config::kGatherSms;
+    constexpr int compute_group_size = teramoe_config::kComputeGroupSize;
+    constexpr int compute_cluster_dim = teramoe_config::kComputeClusterDim;
+    constexpr int compute_scheduler_sms = teramoe_config::kComputeSchedulerSms;
+    constexpr int gather_sms = teramoe_config::kGatherSms;
     const int compute_available_sms = total_sms - num_dispatch_sms - num_combine_sms - compute_scheduler_sms;
     const int num_compute_groups = compute_available_sms / compute_group_size;
     const int num_compute_sms = num_compute_groups * compute_group_size;
@@ -2201,7 +2201,7 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
         // RDMA reuse: combine now shares the single RDMA region. This clean-only cached_notify skips
         // RDMA metadata clean so the in-kernel combine prelude is the single owner of that clear.
         void* combine_rdma_ptr = rdma_buffer_ptr;
-        ::gigamoe::gigamoe_cached_notify(hidden_int4,
+        ::teramoe::teramoe_cached_notify(hidden_int4,
                                  0,          // num_scales (combine payload carries no scales)
                                  0,          // num_topk_idx
                                  num_topk,   // num_topk_weights
@@ -2223,7 +2223,7 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
                                  num_nvl_bytes,
                                  true,       // is_cached_dispatch: clean-only. Makes cached_notify's
                                              // sm_id==1/>=2 head-normalization warps return early
-                                            // (gigamoe_notify.cu cached_notify), so the null head/prefix
+                                            // (teramoe_notify.cu cached_notify), so the null head/prefix
                                             // pointers are never dereferenced. Only sm_id==0 runs,
                                              // which does the NVL clean + cross-rank barrier.
                                              // get_nvl_clean_meta ignores this flag, so the combine
@@ -2261,11 +2261,11 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
     auto result = torch::empty(
         {num_tokens, hidden_dim}, x.options().dtype(torch::kBFloat16));
 
-    // host_state_out receives the complete host-side GigaMoEState snapshot from
-    // allocate_gigamoe_fused_state. The backward uses this directly (via context) instead
+    // host_state_out receives the complete host-side TeraMoEState snapshot from
+    // allocate_teramoe_fused_state. The backward uses this directly (via context) instead
     // of a synchronous D2H cudaMemcpy from the device state.
-    ::gigamoe::GigaMoEState* fwd_host_state_ptr =
-        ::gigamoe::detail::state_cache::alloc_host();
+    ::teramoe::TeraMoEState* fwd_host_state_ptr =
+        ::teramoe::detail::state_cache::alloc_host();
     auto allocate_state = [&](auto allocator) {
         return allocator(
         reinterpret_cast<const int4*>(x.data_ptr()),
@@ -2331,7 +2331,7 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
         combine_start_head_percent);
     };
 
-    void* state = static_cast<void*>(allocate_state(::gigamoe::allocate_gigamoe_fused_state));
+    void* state = static_cast<void*>(allocate_state(::teramoe::allocate_teramoe_fused_state));
 
     AT_CUDA_CHECK(cudaGetLastError());
 
@@ -2352,18 +2352,18 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
         // internode::barrier();
     }
 
-    ::gigamoe::launch_gigamoe_fused_forward(
-        static_cast<::gigamoe::GigaMoEState*>(state),
+    ::teramoe::launch_teramoe_fused_forward(
+        static_cast<::teramoe::TeraMoEState*>(state),
         fwd_host_state_ptr,
         active_total_sms, smem_size, stage, compute_dtype, stream);
     AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::shared_ptr<GigaMoEAutogradContext> context;
+    std::shared_ptr<TeraMoEAutogradContext> context;
     if (retain_state) {
-        EP_HOST_ASSERT(!use_fp8_compute && "GigaMOE training state currently requires BF16 mode");
-        context = std::make_shared<GigaMoEAutogradContext>(
-            static_cast<::gigamoe::GigaMoEState*>(state),
+        EP_HOST_ASSERT(!use_fp8_compute && "TeraMOE training state currently requires BF16 mode");
+        context = std::make_shared<TeraMoEAutogradContext>(
+            static_cast<::teramoe::TeraMoEState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
             mk_expert_counts);
         // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
@@ -2373,13 +2373,13 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
         // heads, ...) now so they don't stay resident across the forward->backward gap.
         // The returned Torch tensor owns combined_x and is not released with the state.
         // Free transient BEFORE caching and freeing fwd_host_state_ptr.
-        ::gigamoe::free_gigamoe_forward_transients_from_host(fwd_host_state_ptr);
+        ::teramoe::free_teramoe_forward_transients_from_host(fwd_host_state_ptr);
         // Cache the host-side state snapshot (with transient pointers already freed) so
         // backward can skip the synchronous D2H.
         context->set_cached_host_state(*fwd_host_state_ptr);
-        ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
+        ::teramoe::detail::state_cache::free_host(fwd_host_state_ptr);
         fwd_host_state_ptr = nullptr;
-        // The GigaMoEState keeps only raw data_ptr()s into these notify_dispatch-produced
+        // The TeraMoEState keeps only raw data_ptr()s into these notify_dispatch-produced
         // layout tensors, and the backward re-runs dispatch/combine off that state. Retain them so
         // they outlive this forward call (otherwise the backward reads dangling/zeroed memory —
         // notably rdma_channel_prefix_matrix, which stalls the backward NVL dispatch).
@@ -2393,21 +2393,21 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
             topk_weights,
         });
     } else {
-        ::gigamoe::free_gigamoe_fused_state(
-            static_cast<::gigamoe::GigaMoEState*>(state),
+        ::teramoe::free_teramoe_fused_state(
+            static_cast<::teramoe::TeraMoEState*>(state),
             fwd_host_state_ptr);
         if (fwd_host_state_ptr != nullptr)
-            ::gigamoe::detail::state_cache::free_host(fwd_host_state_ptr);
+            ::teramoe::detail::state_cache::free_host(fwd_host_state_ptr);
     }
 
     return {result, context};
 #else
-    EP_HOST_ASSERT(false && "gigamoe_forward requires NVSHMEM support");
+    EP_HOST_ASSERT(false && "teramoe_forward requires NVSHMEM support");
     return {torch::Tensor(), nullptr};
 #endif
 }
 
-torch::Tensor Buffer::gigamoe_forward(
+torch::Tensor Buffer::teramoe_forward(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2427,7 +2427,7 @@ torch::Tensor Buffer::gigamoe_forward(
     const pybind11::object& W_down_fp8_sf_obj,
     int compute_batch_size,
     int combine_start_head_percent) {
-    return std::get<0>(gigamoe_fused_forward_impl(
+    return std::get<0>(teramoe_fused_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage, dispatch_config,
         combine_config, hidden_states_scales_obj, W_gateup_fp8_obj,
@@ -2435,7 +2435,7 @@ torch::Tensor Buffer::gigamoe_forward(
         compute_batch_size, combine_start_head_percent));
 }
 
-std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigamoe_forward_train(
+std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teramoe_forward_train(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
     const torch::Tensor& topk_weights,
@@ -2451,7 +2451,7 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
     int compute_batch_size,
     int combine_start_head_percent) {
     pybind11::object none = pybind11::none();
-    return gigamoe_fused_forward_impl(
+    return teramoe_fused_forward_impl(
         x, topk_idx, topk_weights, W_gateup, W_down, num_experts,
         num_dispatch_sms, num_combine_sms, total_sms, stage,
         dispatch_config, combine_config, none, none, none, none, none, true,
@@ -2460,8 +2460,8 @@ std::tuple<torch::Tensor, std::shared_ptr<GigaMoEAutogradContext>> Buffer::gigam
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-Buffer::gigamoe_backward(
-    const std::shared_ptr<GigaMoEAutogradContext>& context,
+Buffer::teramoe_backward(
+    const std::shared_ptr<TeraMoEAutogradContext>& context,
     const torch::Tensor& grad_output,
     const std::optional<torch::Tensor>& grad_topk_weights,
     int total_sms,
@@ -2507,7 +2507,7 @@ Buffer::gigamoe_backward(
     }
     const size_t alloc_slots = std::max<size_t>(total_slots, 1);
     const int two_i = 2 * intermediate;
-    const int compute_batch_size = ::gigamoe::get_gigamoe_compute_batch_size_default();
+    const int compute_batch_size = ::teramoe::get_teramoe_compute_batch_size_default();
     auto stream = at::cuda::getCurrentCUDAStream();
     auto cu_options = torch::TensorOptions().dtype(torch::kInt32).device(grad_output.device());
     auto cu_seqlens_k = torch::empty({num_local_experts + 1}, cu_options);
@@ -2523,15 +2523,15 @@ Buffer::gigamoe_backward(
     auto scratch_act = scratch_act_backing.narrow(0, 0, total_slots);
     auto scratch_dz = scratch_dz_backing.narrow(0, 0, total_slots);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, total_slots);
-    ::gigamoe::MegaKernelBackwardHostContext* backward_host_context = nullptr;
-    auto* backward_state = ::gigamoe::allocate_gigamoe_fused_backward_state(
+    ::teramoe::MegaKernelBackwardHostContext* backward_host_context = nullptr;
+    auto* backward_state = ::teramoe::allocate_teramoe_fused_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights_out.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
         scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
         &backward_host_context, stream,
         &context->cached_host_state());
-    ::gigamoe::prepare_gigamoe_backward_communication_replay(
+    ::teramoe::prepare_teramoe_backward_communication_replay(
         backward_host_context, barrier_signal_ptrs_gpu,
         combine_barrier_signal_ptrs_gpu, stream);
     const int smem_size = std::max(NUM_MAX_NVL_PEERS * 16384, 24 * 9248);
@@ -2547,17 +2547,17 @@ Buffer::gigamoe_backward(
         // internode::barrier();
     }
 
-    ::gigamoe::launch_gigamoe_fused_backward(
+    ::teramoe::launch_teramoe_fused_backward(
         backward_state, backward_host_context, total_sms, smem_size, stage,
-        ::gigamoe::ComputeDType::kBF16, stream);
+        ::teramoe::ComputeDType::kBF16, stream);
 
     // The backward kernel writes wgrad scratch operands directly into the caller-owned
     // torch tensors (scratch_x/act/dz/dgu). No host-device synchronization is needed here
     // because the caller (QuACK wgrad) launches on the same CUDA stream, so stream ordering
     // guarantees the backward kernel completes before the wgrad GEMMs read the scratch data.
     // Free the backward state using the host-cached copy (no D2H required).
-    ::gigamoe::free_gigamoe_fused_backward_state(backward_state, backward_host_context);
-    ::gigamoe::free_gigamoe_backward_host_context(backward_host_context);
+    ::teramoe::free_teramoe_fused_backward_state(backward_state, backward_host_context);
+    ::teramoe::free_teramoe_backward_host_context(backward_host_context);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights_out,
             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
 #else
@@ -2571,7 +2571,7 @@ Buffer::gigamoe_backward(
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "GigaMOE: a cross-node Mixture-of-Experts (MoE) training engine";
+    m.doc() = "TeraMOE: a cross-node Mixture-of-Experts (MoE) training engine";
 
     pybind11::class_<deep_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),
@@ -2588,9 +2588,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<>())
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
-    pybind11::class_<deep_ep::GigaMoEAutogradContext,
-                     std::shared_ptr<deep_ep::GigaMoEAutogradContext>>(
-        m, "GigaMoEAutogradContext");
+    pybind11::class_<deep_ep::TeraMoEAutogradContext,
+                     std::shared_ptr<deep_ep::TeraMoEAutogradContext>>(
+        m, "TeraMoEAutogradContext");
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
@@ -2617,7 +2617,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer)
-        .def("gigamoe_forward", &deep_ep::Buffer::gigamoe_forward,
+        .def("teramoe_forward", &deep_ep::Buffer::teramoe_forward,
              py::arg("x"),
              py::arg("topk_idx"),
              py::arg("topk_weights"),
@@ -2637,7 +2637,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("W_down_fp8_sf") = py::none(),
              py::arg("compute_batch_size") = 4096,
              py::arg("combine_start_head_percent") = 70)
-        .def("gigamoe_forward_train", &deep_ep::Buffer::gigamoe_forward_train,
+        .def("teramoe_forward_train", &deep_ep::Buffer::teramoe_forward_train,
              py::arg("x"), py::arg("topk_idx"), py::arg("topk_weights"),
              py::arg("W_gateup"), py::arg("W_down"), py::arg("num_experts"),
              py::arg("num_dispatch_sms") = 24, py::arg("num_combine_sms") = 24,
@@ -2646,7 +2646,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("combine_config") = deep_ep::Config(20, 4, 256, 6, 128),
              py::arg("compute_batch_size") = 4096,
              py::arg("combine_start_head_percent") = 70)
-        .def("gigamoe_backward", &deep_ep::Buffer::gigamoe_backward,
+        .def("teramoe_backward", &deep_ep::Buffer::teramoe_backward,
              py::arg("context"), py::arg("grad_output"), py::arg("grad_topk_weights") = py::none(),
              py::arg("total_sms") = 148, py::arg("stage") = 1)
         ;

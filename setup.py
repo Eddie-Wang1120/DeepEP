@@ -38,12 +38,10 @@ if __name__ == '__main__':
     _repo_root = os.path.dirname(os.path.abspath(__file__))
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/moe_extension.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/gigamoe/gigamoe_orchestrator.cu']
+    sources = ['csrc/moe_extension.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu', 'csrc/teramoe/teramoe_orchestrator.cu']
     include_dirs = [os.path.join(_repo_root, 'csrc')]
     _third_party_root = os.path.join(_repo_root, 'third-party')
 
-    # CUTLASS / CuTe headers for Blackwell UMMA (tcgen05) + TMA in megakernel compute.
-    # Header-only; only adds include paths from the vendored third-party tree.
     _cutlass_root = os.path.join(_third_party_root, 'cutlass')
     if os.path.isdir(os.path.join(_cutlass_root, 'include')):
         include_dirs.append(os.path.join(_cutlass_root, 'include'))
@@ -69,7 +67,7 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu', 'csrc/gigamoe/gigamoe_notify.cu'])
+        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu', 'csrc/teramoe/teramoe_notify.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
         # CCCL (libcudacxx) headers needed by nvshmem_tensor.h for cuda/std/tuple
         cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
@@ -91,8 +89,6 @@ if __name__ == '__main__':
         # Disable internode and low-latency kernels
         assert disable_nvshmem
     else:
-        # Prefer H800 series (SM90) and Blackwell B200/B300 (SM100).
-        # SM100 (10.0) is required for the megakernel compute UMMA (tcgen05.mma) + TMEM path.
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0;10.0')
 
         # CUDA 12 flags
@@ -114,8 +110,6 @@ if __name__ == '__main__':
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
-    # MK_COMPUTE_KERNEL selects megakernel compute at compile time:
-    #   1 = 1-CTA UMMA (default), 2 = 2-CTA UMMA. (WMMA path removed.)
     mk_compute_kernel = int(os.getenv('MK_COMPUTE_KERNEL', '1'))
     assert mk_compute_kernel in (1, 2), 'MK_COMPUTE_KERNEL must be 1 or 2 (WMMA path removed)'
     cxx_flags.append(f'-DMK_COMPUTE_KERNEL={mk_compute_kernel}')
@@ -151,11 +145,11 @@ if __name__ == '__main__':
     except Exception as _:
         revision = ''
 
-    setuptools.setup(name='gigamoe',
+    setuptools.setup(name='teramoe',
                      version='0.0.1' + revision,
-                     packages=setuptools.find_packages(include=['gigamoe']),
+                     packages=setuptools.find_packages(include=['teramoe']),
                      ext_modules=[
-                         CUDAExtension(name='gigamoe_cpp',
+                         CUDAExtension(name='teramoe_cpp',
                                        include_dirs=include_dirs,
                                        library_dirs=library_dirs,
                                        sources=sources,

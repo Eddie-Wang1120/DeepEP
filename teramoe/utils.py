@@ -4,7 +4,7 @@ import torch.distributed as dist
 from typing import Any, Optional, Tuple
 
 # noinspection PyUnresolvedReferences
-from gigamoe_cpp import EventHandle
+from teramoe_cpp import EventHandle
 
 
 class EventOverlap:

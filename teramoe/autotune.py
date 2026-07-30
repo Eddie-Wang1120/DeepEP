@@ -1,7 +1,7 @@
-"""Autotune compute_batch_size and combine_start_head_percent for GigaMOE.
+"""Autotune compute_batch_size and combine_start_head_percent for TeraMOE.
 
 Usage:
-    best, all_results = autotune_gigamoe(buffer, x, topk_idx, topk_weights,
+    best, all_results = autotune_teramoe(buffer, x, topk_idx, topk_weights,
                                             W_gateup, W_down, num_experts, ...)
     # best = AutotuneResult(compute_batch_size=2048, combine_start_head_percent=60, time_ms=1.23)
     # all_results = [(1024, 40, 1.50), (1024, 50, 1.45), ...]
@@ -20,7 +20,7 @@ COMPUTE_BATCH_SIZES = [1024, 2048, 4096]
 COMBINE_START_HEAD_PERCENTS = [40, 50, 60, 70, 80, 90]
 
 
-def _run_autotune_gigamoe_forward(
+def _run_autotune_teramoe_forward(
     buffer: Buffer,
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -35,7 +35,7 @@ def _run_autotune_gigamoe_forward(
     batch_size: int,
     percent: int,
 ) -> torch.Tensor:
-    return buffer.gigamoe_autograd(
+    return buffer.teramoe_autograd(
         x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts,
         num_dispatch_sms=num_dispatch_sms,
@@ -56,7 +56,7 @@ class AutotuneResult:
     backward_ms: Optional[float] = None
 
 
-def autotune_gigamoe(
+def autotune_teramoe(
     buffer: Buffer,
     x: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -80,8 +80,8 @@ def autotune_gigamoe(
 
     Args:
         buffer: DeepEP Buffer instance (already initialized).
-        x, topk_idx, topk_weights, W_gateup, W_down, num_experts: GigaMOE inputs.
-        num_dispatch_sms, num_combine_sms, total_sms, stage: GigaMOE launch parameters.
+        x, topk_idx, topk_weights, W_gateup, W_down, num_experts: TeraMOE inputs.
+        num_dispatch_sms, num_combine_sms, total_sms, stage: TeraMOE launch parameters.
         num_iters: Number of timed iterations per configuration (default 1000).
         warmup_iters: Warmup iterations before timing (default 10).
         verbose: Print per-config timing results.
@@ -110,7 +110,7 @@ def autotune_gigamoe(
 
         # Warmup
         for wi in range(warmup_iters):
-            _run_autotune_gigamoe_forward(
+            _run_autotune_teramoe_forward(
                 buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                 num_experts,
                 num_dispatch_sms=num_dispatch_sms,
@@ -132,7 +132,7 @@ def autotune_gigamoe(
 
         start_event.record()
         for ti in range(num_iters):
-            _run_autotune_gigamoe_forward(
+            _run_autotune_teramoe_forward(
                 buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                 num_experts,
                 num_dispatch_sms=num_dispatch_sms,

@@ -1,9 +1,9 @@
-"""GigaMOE performance and memory test harness.
+"""TeraMOE performance and memory test harness.
 
-The baseline is DeepEP + TE. The GigaMOE section autotunes
+The baseline is DeepEP + TE. The TeraMOE section autotunes
 compute_batch_size x combine_start_head_percent and reports the fastest
 measured forward/backward configuration. Memory is measured separately with
-the default GigaMOE config.
+the default TeraMOE config.
 """
 
 import argparse
@@ -23,14 +23,14 @@ import torch.distributed as dist
 
 from utils import init_dist
 
-import gigamoe
-from gigamoe.autotune import (
+import teramoe
+from teramoe.autotune import (
     AutotuneResult,
     COMPUTE_BATCH_SIZES,
     COMBINE_START_HEAD_PERCENTS,
 )
 
-from gigamoe_test_utils import (
+from teramoe_test_utils import (
     build_te_grouped_experts,
     clear_parameter_grads,
     make_megatron_router_inputs,
@@ -59,10 +59,10 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=2),
-    # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
+    test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
-    test(num_tokens=16384, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
-    test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
+    # test(num_tokens=16384, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
+    # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
 ]
 
@@ -184,7 +184,7 @@ def make_baseline_functions(x, topk_idx, topk_weights, grad_output, num_experts,
     return forward, backward
 
 
-def make_gigamoe_functions(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
+def make_teramoe_functions(buffer, x, topk_idx, topk_weights, grad_output, num_experts, args,
                                W_gateup, W_down, num_sms, compute_batch_size, combine_start_head_percent):
     # Pre-allocate weight tensors outside the timed loop to avoid measuring
     # clone bandwidth that has no baseline equivalent.
@@ -196,17 +196,17 @@ def make_gigamoe_functions(buffer, x, topk_idx, topk_weights, grad_output, num_e
         mk_topk_weights = topk_weights.detach().clone().requires_grad_(True)
         mk_w_gateup.grad = None
         mk_w_down.grad = None
-        mk_output = buffer.gigamoe_autograd(
+        mk_output = buffer.teramoe_autograd(
             mk_x, topk_idx, mk_topk_weights, mk_w_gateup, mk_w_down, num_experts,
-            num_dispatch_sms=args.gigamoe_comm_sms,
-            num_combine_sms=args.gigamoe_comm_sms,
+            num_dispatch_sms=args.teramoe_comm_sms,
+            num_combine_sms=args.teramoe_comm_sms,
             total_sms=num_sms,
             stage=args.stage,
             compute_batch_size=compute_batch_size,
             combine_start_head_percent=combine_start_head_percent,
         )
         if not mk_output.requires_grad:
-            raise AssertionError('GigaMOE output is not connected to autograd')
+            raise AssertionError('TeraMOE output is not connected to autograd')
         return mk_output
 
     def backward(output):
@@ -215,7 +215,7 @@ def make_gigamoe_functions(buffer, x, topk_idx, topk_weights, grad_output, num_e
     return forward, backward
 
 
-def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
+def autotune_teramoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                         num_experts, args, num_sms, grad_output, rank,
                         group=None, verbose=True):
     best_time = float('inf')
@@ -233,7 +233,7 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
                   f'Starting: compute_batch_size={batch_size}, combine_start_head_percent={percent}%',
                   flush=True)
 
-        forward, backward = make_gigamoe_functions(
+        forward, backward = make_teramoe_functions(
             buffer, x, topk_idx, topk_weights, grad_output,
             num_experts, args, W_gateup, W_down, num_sms, batch_size, percent,
         )
@@ -279,7 +279,7 @@ def autotune_gigamoe(buffer, x, topk_idx, topk_weights, W_gateup, W_down,
 
 def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, case, case_idx):
     if args.stage not in (1, 2):
-        raise ValueError('gigamoe debug backward currently supports stage 1 or 2')
+        raise ValueError('teramoe debug backward currently supports stage 1 or 2')
     if args.warmup < 0:
         raise ValueError(f'--warmup must be >= 0, got {args.warmup}')
     if args.repeat <= 0:
@@ -300,7 +300,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         )
         print(
             f'  warmup={args.warmup}, repeat={args.repeat}, stage={args.stage}, '
-            f'baseline_sms={args.baseline_sms}, gigamoe_comm_sms={args.gigamoe_comm_sms}',
+            f'baseline_sms={args.baseline_sms}, teramoe_comm_sms={args.teramoe_comm_sms}',
             flush=True,
         )
         print(
@@ -346,8 +346,8 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
     torch.cuda.synchronize()
 
     if rank == 0:
-        print('  [perf] Autotuning gigamoe...', flush=True)
-    best_result, _all_results = autotune_gigamoe(
+        print('  [perf] Autotuning teramoe...', flush=True)
+    best_result, _all_results = autotune_teramoe(
         buffer, x, topk_idx, topk_weights, W_gateup, W_down,
         num_experts=num_experts,
         args=args,
@@ -357,16 +357,16 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
         group=group,
         verbose=True,
     )
-    gigamoe_forward_ms = best_result.forward_ms
-    gigamoe_backward_ms = best_result.backward_ms
-    gigamoe_time_ms = best_result.time_ms
+    teramoe_forward_ms = best_result.forward_ms
+    teramoe_backward_ms = best_result.backward_ms
+    teramoe_time_ms = best_result.time_ms
     if rank == 0:
         print(
-            f'  [perf] GigaMOE best autotune result: '
+            f'  [perf] TeraMOE best autotune result: '
             f'compute_batch_size={best_result.compute_batch_size}, '
             f'combine_start_head_percent={best_result.combine_start_head_percent}%, '
-            f'forward={gigamoe_forward_ms:.4f} ms, '
-            f'backward={gigamoe_backward_ms:.4f} ms, total={gigamoe_time_ms:.4f} ms/iter',
+            f'forward={teramoe_forward_ms:.4f} ms, '
+            f'backward={teramoe_backward_ms:.4f} ms, total={teramoe_time_ms:.4f} ms/iter',
             flush=True,
         )
 
@@ -403,42 +403,42 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 
     if rank == 0:
         print(
-            f'  [memory] Measuring gigamoe with default config '
+            f'  [memory] Measuring teramoe with default config '
             f'(compute_batch_size={args.compute_batch_size}, '
             f'combine_start_head_percent={args.combine_start_head_percent})...',
             flush=True,
         )
     # Pre-allocate weight clones outside the measurement interval so that
     # weight memory does not pollute the activation/peak comparison.
-    gigamoe_w_gateup = W_gateup.detach().clone().requires_grad_(True)
-    gigamoe_w_down = W_down.detach().clone().requires_grad_(True)
-    gigamoe_mem_start = start_memory_measurement()
-    gigamoe_x = x.detach().clone().requires_grad_(True)
-    gigamoe_topk_weights = topk_weights.detach().clone().requires_grad_(True)
-    gigamoe_output = buffer.gigamoe_autograd(
-        gigamoe_x, topk_idx, gigamoe_topk_weights, gigamoe_w_gateup, gigamoe_w_down,
+    teramoe_w_gateup = W_gateup.detach().clone().requires_grad_(True)
+    teramoe_w_down = W_down.detach().clone().requires_grad_(True)
+    teramoe_mem_start = start_memory_measurement()
+    teramoe_x = x.detach().clone().requires_grad_(True)
+    teramoe_topk_weights = topk_weights.detach().clone().requires_grad_(True)
+    teramoe_output = buffer.teramoe_autograd(
+        teramoe_x, topk_idx, teramoe_topk_weights, teramoe_w_gateup, teramoe_w_down,
         num_experts,
-        num_dispatch_sms=args.gigamoe_comm_sms,
-        num_combine_sms=args.gigamoe_comm_sms,
+        num_dispatch_sms=args.teramoe_comm_sms,
+        num_combine_sms=args.teramoe_comm_sms,
         total_sms=num_sms,
         stage=args.stage,
         compute_batch_size=args.compute_batch_size,
         combine_start_head_percent=args.combine_start_head_percent,
     )
-    if not gigamoe_output.requires_grad:
-        raise AssertionError('GigaMOE output is not connected to autograd')
-    gigamoe_activation_retained = record_forward_memory(gigamoe_mem_start)
-    gigamoe_output.backward(grad_output)
-    gigamoe_memory = finish_memory_measurement(
-        gigamoe_mem_start, gigamoe_activation_retained, 'GigaMOE')
+    if not teramoe_output.requires_grad:
+        raise AssertionError('TeraMOE output is not connected to autograd')
+    teramoe_activation_retained = record_forward_memory(teramoe_mem_start)
+    teramoe_output.backward(grad_output)
+    teramoe_memory = finish_memory_measurement(
+        teramoe_mem_start, teramoe_activation_retained, 'TeraMOE')
     if rank == 0:
-        report_memory_comparison(baseline_memory, gigamoe_memory, baseline_name)
+        report_memory_comparison(baseline_memory, teramoe_memory, baseline_name)
         print(
             f'  [summary] case {case_idx + 1}: '
             f'baseline(fwd={baseline_forward_ms:.4f}, bwd={baseline_backward_ms:.4f}, '
             f'total={baseline_time_ms:.4f}) ms/iter, '
-            f'gigamoe(best, fwd={gigamoe_forward_ms:.4f}, '
-            f'bwd={gigamoe_backward_ms:.4f}, total={gigamoe_time_ms:.4f}) ms/iter',
+            f'teramoe(best, fwd={teramoe_forward_ms:.4f}, '
+            f'bwd={teramoe_backward_ms:.4f}, total={teramoe_time_ms:.4f}) ms/iter',
             flush=True,
         )
 
@@ -446,7 +446,7 @@ def run_case(local_rank, num_local_ranks, rank, num_ranks, buffer, group, args, 
 def run_worker(local_rank, num_local_ranks, args):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    buffer = gigamoe.Buffer(
+    buffer = teramoe.Buffer(
         group, int(2e9), int(1e9), low_latency_mode=False,
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
@@ -483,7 +483,7 @@ def run_mpirun(args):
     torch.cuda.set_device(0)
     group = dist.new_group(list(range(world_size)))
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    buffer = gigamoe.Buffer(
+    buffer = teramoe.Buffer(
         group, int(2e9), int(1e9), low_latency_mode=False,
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
@@ -505,7 +505,7 @@ def run_mpirun(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Measure and autotune gigamoe performance and memory against DeepEP + TE')
+        description='Measure and autotune teramoe performance and memory against DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--warmup', '--warmup-iters', dest='warmup', type=int, default=10,
                         help='Warmup iterations before each timed benchmark')
@@ -513,7 +513,7 @@ def parse_args():
                         help='Timed iterations for each benchmark')
     parser.add_argument('--stage', type=int, default=1)
     parser.add_argument('--baseline-sms', type=int, default=48)
-    parser.add_argument('--gigamoe-comm-sms', type=int, default=48)
+    parser.add_argument('--teramoe-comm-sms', type=int, default=48)
     parser.add_argument(
         '--router-score-function', choices=['sigmoid', 'softmax', 'sqrtsoftplus'],
         default='sigmoid')
@@ -527,9 +527,9 @@ def parse_args():
                         help='Logit bias added to hotspot experts before top-k selection')
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
-                        help='Default gigamoe compute batch size used for the memory test')
+                        help='Default teramoe compute batch size used for the memory test')
     parser.add_argument('--combine-start-head-percent', type=int, default=70,
-                        help='Default gigamoe combine threshold used for the memory test')
+                        help='Default teramoe combine threshold used for the memory test')
     parser.add_argument('--case-seed-offset', type=int, default=0,
                         help='Extra seed offset for repeated benchmark runs')
     parser.add_argument('--mpirun', action='store_true')
