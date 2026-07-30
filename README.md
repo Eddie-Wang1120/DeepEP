@@ -3,7 +3,7 @@
 > [!WARNING]
 > This repository contains an experimental version of TeraMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
 
-TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine.
+TeraMOE is a cross-node expert-parallel MoE training library that uses a cooperative persistent kernel to overlap dispatch, expert compute, and combine.
 
 ## Performance
 
