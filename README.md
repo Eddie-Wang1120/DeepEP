@@ -3,37 +3,11 @@
 > [!WARNING]
 > This repository contains an experimental version of TeraMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
 
-TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine. It is designed for large expert-parallel (EP) configurations with high communication volume, sparse expert activation, and a large number of experts.
+TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on a fused persistent execution path for dispatch, compute, and combine.
 
 ## Performance
 
-### Configuration
-
-| MOE type | hidden_size | intermediate_size | expert_num | topk | dtype |
-|:---------|:-----------:|:-----------------:|:----------:|:----:|:-----:|
-| MOE_A | 2048 | 3072 | 256 | 6 | bf16 |
-
-### Forward
-
-| num_tokens | EP | Megatron (ms) | TeraMOE (ms) | Speedup |
-|:----------:|:--:|:-------------:|:------------:|:-------:|
-| 8192 | 32 | 7.584 | 6.609 | 1.14x |
-| 16384 | 32 | 11.847 | 10.944 | 1.08x |
-| 32768 | 32 | 21.907 | 19.672 | 1.11x |
-| 8192 | 64 | 7.158 | 5.770 | 1.24x |
-| 16384 | 64 | 11.682 | 10.360 | 1.12x |
-| 32768 | 64 | 21.759 | 19.677 | 1.10x |
-
-### Backward
-
-| num_tokens | EP | Megatron (ms) | TeraMOE (ms) | Speedup |
-|:----------:|:--:|:-------------:|:------------:|:-------:|
-| 8192 | 32 | 8.886 | 7.443 | 1.19x |
-| 16384 | 32 | 15.995 | 13.456 | 1.18x |
-| 32768 | 32 | 30.493 | 24.702 | 1.23x |
-| 8192 | 64 | 8.440 | 7.171 | 1.17x |
-| 16384 | 64 | 15.819 | 12.622 | 1.25x |
-| 32768 | 64 | 29.245 | 24.980 | 1.18x |
+![TeraMOE Performance](figures/teramoe_3x3.png)
 
 ### Activation Memory
 
@@ -45,6 +19,12 @@ TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 | 8192 | 64 | 1122.52 | 810.59 | 27.79% |
 | 16384 | 64 | 2249.35 | 1601.98 | 28.78% |
 | 32768 | 64 | 4491.68 | 3207.10 | 28.6% |
+
+### Highlights
+
+- Gains are largest in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
+- Speedup holds under expert load imbalance (peak-to-mean up to 3.0).
+- Activation memory is reduced by roughly 28% across EP sizes and token counts, which noticeably relieves end-to-end memory pressure.
 
 ## Architecture
 
@@ -78,7 +58,7 @@ The workers communicate through lightweight readiness signals. Dispatch publishe
 ### Requirements
 
 - SM100 GPUs
-- Python 3.8 and above
+- Python 3.12 and above
 - CUDA toolchain with SM100 support
 - PyTorch 2.1 and above
 - RDMA-capable network for cross-node communication
@@ -88,24 +68,11 @@ The workers communicate through lightweight readiness signals. Dispatch publishe
 
 TeraMOE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
 
-### Build
-
-```bash
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-ln -s build/lib.linux-x86_64-cpython-38/teramoe_cpp.cpython-38-x86_64-linux-gnu.so
-```
-
 ### Install
 
 ```bash
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
+MK_COMPUTE_KERNEL=1 python -m pip install -v .
 ```
-
-### Environment variables
-
-- `NVSHMEM_DIR`: path to NVSHMEM, required for cross-node communication
-- `TORCH_CUDA_ARCH_LIST`: set this to the SM100 target only
-- `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, disable aggressive load/store instructions if needed
 
 ## Training API
 
@@ -150,4 +117,4 @@ TeraMOE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) an
 
 ## License
 
-This code repository is released under [the MIT License](LICENSE), except for code that references NVSHMEM (including `csrc/kernels/ibgda_device.cuh` and `third-party/nvshmem.patch`), which is subject to the [NVSHMEM SLA](https://docs.nvidia.com/nvshmem/api/sla.html).
+This code repository is released under [the MIT License](LICENSE), except for code that references NVSHMEM (including `csrc/kernels/ibgda_device.cuh` and `third-party/nvshmem.patch`), which is subject to the [NVSHMEM SLA](https://docs.nvidia.com/nvshmem/api/sla.html). Code derived from [DeepEP](https://github.com/deepseek-ai/DeepEP) in `csrc/kernels` is subject to the license in the DeepEP repository.
