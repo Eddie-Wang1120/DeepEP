@@ -20,11 +20,12 @@ TeraMOE is a cross-node Mixture-of-Experts (MoE) training engine that focuses on
 | 16384 | 64 | 2249.35 | 1601.98 | 28.78% |
 | 32768 | 64 | 4491.68 | 3207.10 | 28.6% |
 
-### Highlights
-
-- Gains are largest in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
-- Speedup holds under expert load imbalance (peak-to-mean up to 3.0).
-- Activation memory is reduced by roughly 28% across EP sizes and token counts, which noticeably relieves end-to-end memory pressure.
+## Highlights
+> [!IMPORTANT]
+> 
+> - TeraMOE delivers up to **1.30x** speedup in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
+> - Speedup holds under expert load imbalance: at a peak-to-mean ratio of **3.0**, TeraMOE still delivers up to **1.24x** speedup.
+> - Activation memory is reduced by **27.79%-28.84%** across EP sizes and token counts, noticeably relieving end-to-end memory pressure.
 
 ## Architecture
 
