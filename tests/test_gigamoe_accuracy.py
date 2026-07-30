@@ -316,7 +316,7 @@ def run_worker(local_rank, num_local_ranks, args):
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
     try:
-        for case_idx, case in enumerate(TEST_CASES[:args.num_cases]):
+        for case_idx, case in enumerate(TEST_CASES):
             run_case(
                 local_rank, num_local_ranks, rank, num_ranks,
                 buffer, group, args, case, case_idx,
@@ -351,7 +351,7 @@ def run_mpirun(args):
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
     try:
-        for case_idx, case in enumerate(TEST_CASES[:args.num_cases]):
+        for case_idx, case in enumerate(TEST_CASES):
             run_case(
                 local_rank, local_world_size, global_rank, world_size,
                 buffer, group, args, case, case_idx,
@@ -365,7 +365,6 @@ def run_mpirun(args):
 def parse_args():
     parser = argparse.ArgumentParser(description='Compare gigamoe forward/backward with DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
-    parser.add_argument('--num-cases', type=int, default=1)
     parser.add_argument('--warmup', type=int, default=100,
                         help='Number of warmup iterations for the gigamoe before the measured repeats')
     parser.add_argument('--repeat', type=int, default=10000,
@@ -402,8 +401,6 @@ def parse_args():
     parser.add_argument('--mpirun', action='store_true')
     args = parser.parse_args()
 
-    if args.num_cases <= 0 or args.num_cases > len(TEST_CASES):
-        raise ValueError(f'--num-cases must be in [1, {len(TEST_CASES)}]')
     if args.warmup < 0:
         raise ValueError(f'--warmup must be >= 0, got {args.warmup}')
     if args.repeat <= 0:

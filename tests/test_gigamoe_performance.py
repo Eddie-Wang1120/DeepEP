@@ -59,8 +59,10 @@ def test(**kwargs):
 TEST_CASES = [
     # test(num_tokens=4096, hidden=2048, intermediate=2048, experts_per_rank=16, num_topk=8),
     # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=2),
-    # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
-    test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
+    # test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=16, num_topk=6)
+    # test(num_tokens=32768, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
+    test(num_tokens=16384, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
+    test(num_tokens=8192, hidden=2048, intermediate=3072, experts_per_rank=4, num_topk=6, num_topk_groups=3),
     # test(num_tokens=8192, hidden=4096, intermediate=4096, experts_per_rank=16, num_topk=8),
 ]
 
@@ -449,7 +451,7 @@ def run_worker(local_rank, num_local_ranks, args):
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
     try:
-        for case_idx, case in enumerate(TEST_CASES[:args.num_cases]):
+        for case_idx, case in enumerate(TEST_CASES):
             run_case(
                 local_rank, num_local_ranks, rank, num_ranks,
                 buffer, group, args, case, case_idx,
@@ -486,7 +488,7 @@ def run_mpirun(args):
         num_qps_per_rank=num_sms, explicitly_destroy=True,
     )
     try:
-        for case_idx, case in enumerate(TEST_CASES[:args.num_cases]):
+        for case_idx, case in enumerate(TEST_CASES):
             run_case(
                 local_rank, local_world_size, global_rank, world_size,
                 buffer, group, args, case, case_idx,
@@ -505,7 +507,6 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Measure and autotune gigamoe performance and memory against DeepEP + TE')
     parser.add_argument('--num-processes', type=int, default=8)
-    parser.add_argument('--num-cases', type=int, default=1)
     parser.add_argument('--warmup', '--warmup-iters', dest='warmup', type=int, default=10,
                         help='Warmup iterations before each timed benchmark')
     parser.add_argument('--repeat', '--num-iters', dest='repeat', type=int, default=1000,
@@ -518,11 +519,11 @@ def parse_args():
         default='sigmoid')
     parser.add_argument('--router-num-groups', type=int, default=0)
     parser.add_argument('--router-group-topk', type=int, default=0)
-    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.015625,
+    parser.add_argument('--router-hotspot-expert-fraction', type=float, default=0.0,
                         help='Fraction of consecutive experts biased as a communication hotspot')
     parser.add_argument('--router-hotspot-expert-start', type=int, default=0,
                         help='First expert id in the hotspot range')
-    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.13,
+    parser.add_argument('--router-hotspot-logit-bias', type=float, default=0.0,
                         help='Logit bias added to hotspot experts before top-k selection')
     parser.add_argument('--compute-batch-size', type=int, default=4096,
                         choices=[1024, 2048, 4096],
@@ -534,8 +535,6 @@ def parse_args():
     parser.add_argument('--mpirun', action='store_true')
     args = parser.parse_args()
 
-    if args.num_cases <= 0 or args.num_cases > len(TEST_CASES):
-        raise ValueError(f'--num-cases must be in [1, {len(TEST_CASES)}]')
     if args.warmup < 0:
         raise ValueError(f'--warmup must be >= 0, got {args.warmup}')
     if args.repeat <= 0:
